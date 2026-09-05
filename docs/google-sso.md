@@ -57,7 +57,7 @@ Google matches redirect URIs exactly. Scheme, host, port, path, case, and traili
 
 | Environment | Canonical callback | Registration policy |
 |---|---|---|
-| Local Host | `http://127.0.0.1:<PORT>/auth/google/callback` | Register the actual configured loopback port for the local web page. Prefer a fixed documented port; if the port is dynamic, create the local client entry per chosen port before testing. Do not use a LAN address. |
+| Local Host | `http://127.0.0.1:<PORT>/oauth/google/callback` | Register the actual configured loopback port for the local agent. Prefer a fixed documented port; if the port is dynamic, create the local client entry per chosen port before testing. Do not use a LAN address. |
 | Staging Host | `https://staging.<approved-local-scale-domain>/auth/google/callback` | Use the staging hostname and HTTPS certificate. Register no production or localhost callback on this client. |
 | Production Host | `https://<approved-local-scale-domain>/auth/google/callback` | Use the one canonical HTTPS origin. If an Onion service is supported, it must not silently change the callback origin; route the browser back through this canonical HTTPS endpoint or obtain a separately reviewed client and exact callback. |
 
