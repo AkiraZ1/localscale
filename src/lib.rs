@@ -178,7 +178,7 @@ fn response_for_request_with_state(request: &str, state: &AgentState) -> String 
     if !is_loopback_host(host) {
         return http_response("403 Forbidden", "text/plain; charset=utf-8", "local requests only");
     }
-    if matches!(path, "/oauth/google/start" | "/oauth/google/callback" | "/auth/session" | "/auth/logout") {
+    if matches!(path, "/oauth/google/start" | "/oauth/google/callback" | "/auth/session" | "/auth/session/bridge" | "/auth/logout") {
         let Some(auth) = &state.auth else {
             return http_response("503 Service Unavailable", "text/plain; charset=utf-8", "authentication unavailable");
         };

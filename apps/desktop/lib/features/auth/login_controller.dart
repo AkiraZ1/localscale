@@ -10,11 +10,16 @@ class LoginModel {
   final AuthState state;
   final AuthException? error;
 
-  bool get canLogin => state == AuthState.signedOut || state == AuthState.expired || state == AuthState.error;
+  bool get canLogin =>
+      state == AuthState.signedOut ||
+      state == AuthState.expired ||
+      state == AuthState.error;
 }
 
 class LoginController extends ChangeNotifier {
-  LoginController({required BrowserOAuthClient oauth, required SecureSessionStorage storage})
+  LoginController(
+      {required BrowserOAuthClient oauth,
+      required SecureSessionStorage storage})
       : _oauth = oauth,
         _storage = storage;
 
@@ -29,8 +34,10 @@ class LoginController extends ChangeNotifier {
     if (session == null) return;
     if (session.isExpired((now ?? DateTime.now)())) {
       await _storage.clear();
-      _model = const LoginModel(state: AuthState.expired,
-          error: AuthException(AuthErrorCode.sessionExpired, 'Session expired'));
+      _model = const LoginModel(
+          state: AuthState.expired,
+          error:
+              AuthException(AuthErrorCode.sessionExpired, 'Session expired'));
     } else {
       _model = const LoginModel(state: AuthState.signedIn);
     }
@@ -46,10 +53,14 @@ class LoginController extends ChangeNotifier {
       await _storage.write(session);
       _model = const LoginModel(state: AuthState.signedIn);
     } on AuthException catch (error) {
-      _model = LoginModel(state: error.code == AuthErrorCode.sessionExpired
-          ? AuthState.expired : AuthState.error, error: error);
+      _model = LoginModel(
+          state: error.code == AuthErrorCode.sessionExpired
+              ? AuthState.expired
+              : AuthState.error,
+          error: error);
     } catch (error) {
-      _model = LoginModel(state: AuthState.error,
+      _model = LoginModel(
+          state: AuthState.error,
           error: AuthException(AuthErrorCode.exchangeFailed, '$error'));
     }
     notifyListeners();

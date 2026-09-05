@@ -15,6 +15,11 @@ abstract interface class AuthCallbackReceiver {
   Future<Uri?> waitForCallback();
 }
 
+abstract interface class DynamicAuthCallbackReceiver
+    implements AuthCallbackReceiver {
+  Future<Uri> callbackUri();
+}
+
 abstract interface class PkceGenerator {
   String verifier();
   String challenge(String verifier);
@@ -58,19 +63,22 @@ class OAuthAuthorizationStart {
 }
 
 class OAuthCallback {
-  const OAuthCallback._({this.code, this.error, this.errorDescription});
+  const OAuthCallback._(
+      {this.code, this.handoff, this.error, this.errorDescription});
 
   factory OAuthCallback.fromUri(Uri uri) => OAuthCallback._(
         code: uri.queryParameters['code'],
+        handoff: uri.queryParameters['handoff'],
         error: uri.queryParameters['error'],
         errorDescription: uri.queryParameters['error_description'],
       );
 
   final String? code;
+  final String? handoff;
   final String? error;
   final String? errorDescription;
 
-  bool get isSuccess => code != null && error == null;
+  bool get isSuccess => (code != null || handoff != null) && error == null;
 }
 
 enum AuthErrorCode {
@@ -95,7 +103,8 @@ class AuthException implements Exception {
 }
 
 abstract interface class AuthorizationCodeExchanger {
-  Future<SecureSession> exchange({required String code, required String verifier});
+  Future<SecureSession> exchange(
+      {required String code, required String verifier});
 }
 
 class BrowserOAuthClient {
@@ -119,6 +128,9 @@ class BrowserOAuthClient {
   Future<SecureSession> authorize() async {
     final verifier = _pkce.verifier();
     final state = _stateGenerator();
+    final appCallback = callbackReceiver is DynamicAuthCallbackReceiver
+        ? await (callbackReceiver as DynamicAuthCallbackReceiver).callbackUri()
+        : request.redirectUri;
     final url = request.authorizationEndpoint.replace(queryParameters: {
       ...request.authorizationEndpoint.queryParameters,
       'response_type': 'code',
@@ -128,37 +140,46 @@ class BrowserOAuthClient {
       'state': state,
       'code_challenge': _pkce.challenge(verifier),
       'code_challenge_method': 'S256',
+      'app_callback': appCallback.toString(),
     });
     await browserLauncher.launch(url);
     final callback = await callbackReceiver.waitForCallback();
     if (callback == null) {
-      throw const AuthException(AuthErrorCode.cancelled, 'Authentication cancelled');
+      throw const AuthException(
+          AuthErrorCode.cancelled, 'Authentication cancelled');
     }
     final callbackState = callback.queryParameters['state'];
     if (callbackState != state) {
-      throw const AuthException(AuthErrorCode.stateMismatch, 'Authentication state mismatch');
+      throw const AuthException(
+          AuthErrorCode.stateMismatch, 'Authentication state mismatch');
     }
     final result = OAuthCallback.fromUri(callback);
     if (result.error != null) {
       if (result.error == 'access_denied') {
-        throw const AuthException(AuthErrorCode.providerDenied, 'Authorization was denied');
+        throw const AuthException(
+            AuthErrorCode.providerDenied, 'Authorization was denied');
       }
       throw AuthException(AuthErrorCode.providerError,
           result.errorDescription ?? result.error!);
     }
     if (!result.isSuccess) {
-      throw const AuthException(AuthErrorCode.callbackMissingCode, 'Callback did not contain an authorization code');
+      throw const AuthException(AuthErrorCode.callbackMissingCode,
+          'Callback did not contain an authorization code');
     }
     try {
-      return await exchanger.exchange(code: result.code!, verifier: verifier);
+      return await exchanger.exchange(
+          code: result.handoff ?? result.code!, verifier: verifier);
     } catch (error) {
-      throw AuthException(AuthErrorCode.exchangeFailed, 'Authorization exchange failed: $error');
+      throw AuthException(AuthErrorCode.exchangeFailed,
+          'Authorization exchange failed: $error');
     }
   }
 
   static String _randomState() {
     final random = Random.secure();
-    return base64Url.encode(List<int>.generate(24, (_) => random.nextInt(256))).replaceAll('=', '');
+    return base64Url
+        .encode(List<int>.generate(24, (_) => random.nextInt(256)))
+        .replaceAll('=', '');
   }
 }
 

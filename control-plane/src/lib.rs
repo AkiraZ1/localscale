@@ -421,22 +421,25 @@ pub struct AuthResponse { pub status: u16, pub headers: Vec<(String, String)>, p
 impl AuthResponse { fn new(status: u16) -> Self { Self { status, ..Default::default() } } pub fn header(&self, name: &str) -> Option<&str> { self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()) } }
 
 #[derive(Debug, Clone)] struct Session { issuer: String, subject: String, expires_at: std::time::SystemTime, revoked: bool }
-pub struct AuthService<P> { provider: P, transactions: google_oidc::PkceTransactionStore, sessions: HashMap<String, Session>, session_ttl: std::time::Duration, _redirect_uri: String }
+pub struct AuthService<P> { provider: P, transactions: google_oidc::PkceTransactionStore, sessions: HashMap<String, Session>, pending_callbacks: HashMap<String, String>, handoffs: HashMap<String, String>, session_ttl: std::time::Duration }
 impl<P: AuthProvider> AuthService<P> {
-    pub fn new(provider: P, session_ttl: std::time::Duration, redirect_uri: &str) -> Self { Self { provider, transactions: google_oidc::PkceTransactionStore::new(), sessions: HashMap::new(), session_ttl, _redirect_uri: redirect_uri.into() } }
+    pub fn new(provider: P, session_ttl: std::time::Duration, _redirect_uri: &str) -> Self { Self { provider, transactions: google_oidc::PkceTransactionStore::new(), sessions: HashMap::new(), pending_callbacks: HashMap::new(), handoffs: HashMap::new(), session_ttl } }
     pub fn handle(&mut self, request: AuthRequest) -> AuthResponse { self.handle_at(request, std::time::SystemTime::now()) }
     pub fn handle_at(&mut self, request: AuthRequest, now: std::time::SystemTime) -> AuthResponse {
         self.sessions.retain(|_, session| session.expires_at > now && !session.revoked);
         match (request.method.as_str(), request.path.as_str()) {
-            ("GET", "/oauth/google/start") => self.start(now),
+            ("GET", "/oauth/google/start") => self.start(&request, now),
             ("GET", "/oauth/google/callback") => self.callback(request, now),
             ("GET", "/auth/session") => self.session(&request, now),
+            ("GET", "/auth/session/bridge") => self.bridge(&request, now),
             ("POST", "/auth/logout") => self.logout(&request, now),
             _ => AuthResponse::new(404),
         }
     }
-    fn start(&mut self, now: std::time::SystemTime) -> AuthResponse {
+    fn start(&mut self, request: &AuthRequest, now: std::time::SystemTime) -> AuthResponse {
+        let callback = request.query.get("app_callback").filter(|u| valid_loopback_callback(u)).cloned();
         let tx = match self.transactions.begin_with_ttl(self.provider.transaction_ttl(), "/", now) { Ok(t) => t, Err(_) => return AuthResponse::new(500) };
+        if let Some(callback) = callback { self.pending_callbacks.insert(tx.state().to_owned(), callback); }
         match self.provider.authorization_url(&tx) { Ok(url) => AuthResponse { status: 302, headers: vec![("Location".into(), url)], body: String::new() }, Err(_) => AuthResponse::new(502) }
     }
     fn callback(&mut self, request: AuthRequest, now: std::time::SystemTime) -> AuthResponse {
@@ -449,13 +452,32 @@ impl<P: AuthProvider> AuthService<P> {
         let identity = match self.provider.validate_id_token(&token.id_token, tx.nonce(), now_secs) { Ok(i) => i, Err(_) => return AuthResponse::new(401) };
         let sid = random_opaque();
         self.sessions.insert(sid.clone(), Session { issuer: identity.issuer, subject: identity.subject, expires_at: now + self.session_ttl, revoked: false });
-        AuthResponse { status: 303, headers: vec![("Location".into(), "/".into()), ("Set-Cookie".into(), format!("localscale_session={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict", sid, self.session_ttl.as_secs()))], body: String::new() }
+        let location = self.pending_callbacks.remove(state);
+        let location = if let Some(location) = location {
+            let handoff = random_opaque();
+            self.handoffs.insert(handoff.clone(), sid.clone());
+            let separator = if location.contains('?') { '&' } else { '?' };
+            format!("{location}{separator}handoff={handoff}")
+        } else { "/".to_owned() };
+        AuthResponse { status: 303, headers: vec![("Location".into(), location), ("Set-Cookie".into(), format!("localscale_session={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict", sid, self.session_ttl.as_secs()))], body: String::new() }
+    }
+    fn bridge(&mut self, request: &AuthRequest, now: std::time::SystemTime) -> AuthResponse {
+        let Some(token) = request.query.get("handoff") else { return AuthResponse::new(400) };
+        let Some(sid) = self.handoffs.remove(token) else { return AuthResponse::new(401) };
+        let Some(session) = self.sessions.get(&sid).filter(|s| s.expires_at > now && !s.revoked) else { return AuthResponse::new(401) };
+        let expires = session.expires_at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        AuthResponse { status: 200, headers: vec![("Content-Type".into(), "application/json".into())], body: format!("{{\"session_id\":\"{sid}\",\"expires_at\":{expires}}}") }
     }
     fn session(&mut self, request: &AuthRequest, now: std::time::SystemTime) -> AuthResponse { match self.session_id(request).and_then(|id| self.sessions.get(&id)).filter(|s| !s.revoked && s.expires_at > now) { Some(s) => AuthResponse { status: 200, body: format!("{{\"authenticated\":true,\"issuer\":\"{}\",\"subject\":\"{}\"}}", s.issuer, s.subject), ..Default::default() }, None => AuthResponse::new(401) } }
     fn logout(&mut self, request: &AuthRequest, now: std::time::SystemTime) -> AuthResponse { let Some(id) = self.session_id(request) else { return AuthResponse::new(401) }; let Some(csrf) = request.headers.get("X-CSRF-Token") else { return AuthResponse::new(403) }; if !constant_time_eq(&id, csrf) { return AuthResponse::new(403) } if let Some(s) = self.sessions.get_mut(&id) { if s.expires_at <= now || s.revoked { return AuthResponse::new(401) } s.revoked = true; return AuthResponse { status: 204, headers: vec![("Set-Cookie".into(), "localscale_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict".into())], ..Default::default() }; } AuthResponse::new(401) }
     fn session_id(&self, request: &AuthRequest) -> Option<String> { request.headers.get("Cookie")?.split(';').map(str::trim).find_map(|v| v.strip_prefix("localscale_session=")).filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')).map(str::to_owned) }
 }
 fn random_opaque() -> String { use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine}; use rand::RngCore; let mut b = [0u8; 32]; rand::rngs::OsRng.fill_bytes(&mut b); URL_SAFE_NO_PAD.encode(b) }
+fn valid_loopback_callback(value: &str) -> bool {
+    (value.starts_with("http://127.0.0.1:") || value.starts_with("http://localhost:"))
+        && !value.contains(['?', '#', '\\'])
+        && value.rsplit_once(':').and_then(|(_, port)| port.parse::<u16>().ok()).is_some_and(|p| p != 0)
+}
 fn constant_time_eq(a: &str, b: &str) -> bool { let aa = a.as_bytes(); let bb = b.as_bytes(); let mut diff = (aa.len() ^ bb.len()) as u8; for i in 0..aa.len().max(bb.len()) { let x = aa.get(i).copied().unwrap_or(0); let y = bb.get(i).copied().unwrap_or(0); diff |= x ^ y; } diff == 0 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ Flutter Web is the primary control surface. The same project reserves desktop sh
 
 ## Prerequisites
 
-The current environment does **not** have `flutter` or `dart` on PATH. No SDK was installed because installing system-wide tooling would require an explicit package-management decision. Install Flutter (stable, 3.19 or newer) and add `flutter/bin` to PATH before running the commands below.
+Install Flutter (stable, 3.19 or newer) and add `flutter/bin` to PATH before running the commands below.
 
 ## Generate desktop shells
 
@@ -26,7 +26,9 @@ flutter test
 flutter build web --release --base-href /
 ```
 
-The output is `build/web/`. The UI currently uses `FakeLocalAgentTransport`; it makes no OAuth or network calls. Replace it at the application composition root with a transport backed by the Rust local API when that API contract is ready.
+The output is `build/web/`. Desktop authentication uses a system-browser OAuth flow against the loopback agent. The agent redirects the browser to a one-shot loopback callback carrying only a short-lived opaque handoff; Flutter exchanges that handoff at `/auth/session/bridge` and stores only the resulting opaque local session. HttpOnly cookies remain server-owned. Web deliberately fails closed because it has no desktop loopback/browser adapter.
+
+`lib/core/device_directory.dart` is the shared, injectable seam for device registration and authorized peer discovery. The current backend does not yet expose those endpoints, so no peer addresses are fabricated and the directory is not wired into the UI. A future implementation must use the stable `issuer|sub` identity key, an independently generated device ID/public key, and server-side authorization/revocation checks.
 
 ## Package into the Rust agent
 
@@ -55,8 +57,9 @@ Responses are JSON objects with `mode`, `state`, and optional `onion_endpoint`. 
 
 ## Tooling status
 
-- Flutter SDK: unavailable in the implementation environment.
-- Dart SDK: unavailable in the implementation environment.
-- Flutter tests and Web build: not runnable here; run the exact commands above after SDK installation.
-- Rust packaging: not run because `build/web/` cannot be produced without Flutter.
-- OAuth and real network transport: deliberately not implemented in this vertical slice.
+- Flutter SDK: available in the implementation environment.
+- Dart SDK: available in the implementation environment.
+- Flutter tests and Web build: pass in this checkout.
+- Rust packaging: not run as part of this slice.
+- OAuth/session bridge: implemented for desktop adapters; the default Rust binary remains unconfigured and returns 503 until an AuthHandler is injected.
+- Device registration and authorized peer discovery: shared contract only; backend endpoints remain a backlog item.
