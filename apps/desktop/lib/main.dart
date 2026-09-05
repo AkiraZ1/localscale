@@ -6,6 +6,9 @@ import 'features/auth/login_controller.dart';
 import 'local_agent_api.dart';
 import 'local_agent_transport.dart';
 
+final int localAgentPort =
+    defaultTargetPlatform == TargetPlatform.macOS ? 18765 : 8765;
+
 void main() {
   final api = LocalAgentApiClient(
       kIsWeb ? FakeLocalAgentTransport() : defaultLocalAgentTransport());
@@ -15,20 +18,20 @@ void main() {
         authorizationEndpoint: Uri(
             scheme: 'http',
             host: '127.0.0.1',
-            port: 8765,
+            port: localAgentPort,
             path: '/oauth/google/start'),
         clientId: 'local-agent',
         redirectUri: Uri(
             scheme: 'http',
             host: '127.0.0.1',
-            port: 8765,
+            port: localAgentPort,
             path: '/oauth/google/callback'),
         scopes: <String>[],
       ),
       browserLauncher: systemBrowserLauncher(),
       callbackReceiver: loopbackCallbackReceiver(),
       exchanger: localSessionBridge(
-          Uri(scheme: 'http', host: '127.0.0.1', port: 8765)),
+          Uri(scheme: 'http', host: '127.0.0.1', port: localAgentPort)),
     ),
     storage: MemorySessionStorage(),
   );

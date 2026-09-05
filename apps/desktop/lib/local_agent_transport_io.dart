@@ -4,7 +4,9 @@ import 'local_agent_api.dart';
 
 class HttpLocalAgentTransport implements LocalAgentTransport {
   HttpLocalAgentTransport({Uri? base})
-      : base = base ?? Uri(scheme: 'http', host: '127.0.0.1', port: 8765);
+      : base = base ??
+            Uri(scheme: 'http', host: '127.0.0.1',
+                port: Platform.isMacOS ? 18765 : 8765);
   final Uri base;
   Future<String> _request(String method, String path,
       [Map<String, dynamic>? body]) async {
