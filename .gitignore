@@ -1,0 +1,9 @@
+target/
+
+# Generated Flutter and Python artifacts
+**/.dart_tool/
+**/build/
+**/.idea/
+**/Flutter/ephemeral/
+**/__pycache__/
+*.iml

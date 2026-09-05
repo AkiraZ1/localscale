@@ -3,6 +3,9 @@ name = "localscale-agent"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+localscale-control-plane = { path = "control-plane" }
+
 [lib]
 name = "localscale_agent"
 path = "src/lib.rs"

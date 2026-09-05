@@ -1,0 +1,18 @@
+[package]
+name = "localscale-control-plane"
+version = "0.1.0"
+edition = "2021"
+description = "LocalScale control-plane vertical slice"
+license = "MIT"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+base64 = "=0.22.1"
+form_urlencoded = "=1.2.2"
+rand = "=0.8.8"
+sha2 = "=0.10.9"
+jsonwebtoken = "=9.3.1"
+serde = { version = "=1.0.219", features = ["derive"] }
+serde_json = "=1.0.140"

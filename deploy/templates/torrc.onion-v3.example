@@ -1,0 +1,11 @@
+# LocalScale Onion v3 host service template.
+# Copy to a dedicated, root-readable Tor instance configuration; do not edit
+# the system Tor service. The service directory is created and owned by Tor.
+SocksPort 0
+ClientOnly 0
+HiddenServiceDir /var/lib/localscale/onion
+HiddenServiceVersion 3
+HiddenServicePort 80 127.0.0.1:8080
+
+# Optional client-side onion authorization directory (not used by host mode).
+# ClientOnionAuthDir /var/lib/localscale/onion-client-auth

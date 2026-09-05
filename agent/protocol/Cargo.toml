@@ -1,0 +1,14 @@
+[package]
+name = "localscale-agent-protocol"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+chacha20poly1305 = { version = "=0.10.1", features = ["std"] }
+rand = "=0.8.5"
+zeroize = { version = "=1.8.1", features = ["zeroize_derive"] }
+
+[dev-dependencies]
