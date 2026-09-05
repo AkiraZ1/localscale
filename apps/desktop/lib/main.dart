@@ -8,6 +8,10 @@ import 'local_agent_transport.dart';
 
 final int localAgentPort =
     defaultTargetPlatform == TargetPlatform.macOS ? 18765 : 8765;
+const String googleClientId = String.fromEnvironment(
+  'LOCALSCALE_GOOGLE_CLIENT_ID',
+  defaultValue: 'local-agent',
+);
 
 void main() {
   final api = LocalAgentApiClient(
@@ -20,13 +24,13 @@ void main() {
             host: '127.0.0.1',
             port: localAgentPort,
             path: '/oauth/google/start'),
-        clientId: 'local-agent',
+        clientId: googleClientId,
         redirectUri: Uri(
             scheme: 'http',
             host: '127.0.0.1',
             port: localAgentPort,
             path: '/oauth/google/callback'),
-        scopes: <String>[],
+        scopes: <String>['openid', 'email', 'profile'],
       ),
       browserLauncher: systemBrowserLauncher(),
       callbackReceiver: loopbackCallbackReceiver(),
