@@ -1,0 +1,13 @@
+# Modelo não secreto para ~/.ssh/config
+Host localscale-linux
+    HostName 100.65.65.60
+    User jemerson
+    Port 22
+    IdentitiesOnly yes
+    PreferredAuthentications publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    ConnectTimeout 5
+
+# A chave privada deve ser instalada separadamente pelo operador.
+# Não colocar senha, chave privada ou token neste arquivo.
