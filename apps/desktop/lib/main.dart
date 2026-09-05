@@ -22,7 +22,7 @@ void main() {
             scheme: 'http',
             host: '127.0.0.1',
             port: 8765,
-            path: '/oauth/callback'),
+            path: '/oauth/google/callback'),
         scopes: <String>[],
       ),
       browserLauncher: systemBrowserLauncher(),

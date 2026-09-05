@@ -53,11 +53,19 @@ class HttpLocalSessionBridge implements AuthorizationCodeExchanger {
   final Uri agentBase;
   @override
   Future<SecureSession> exchange(
-      {required String code, required String verifier}) async {
+      {required String handoff,
+      required String verifier,
+      required Uri callbackUri,
+      required String state}) async {
     final client = HttpClient();
     try {
       final uri = agentBase.replace(
-          path: '/auth/session/bridge', queryParameters: {'handoff': code});
+          path: '/auth/session/bridge',
+          queryParameters: {
+            'handoff': handoff,
+            'callback': callbackUri.toString(),
+            'state': state,
+          });
       final response = await (await client.getUrl(uri)).close();
       final body = await utf8.decoder.bind(response).join();
       if (response.statusCode != 200) {

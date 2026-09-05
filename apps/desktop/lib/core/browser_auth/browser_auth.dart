@@ -104,7 +104,10 @@ class AuthException implements Exception {
 
 abstract interface class AuthorizationCodeExchanger {
   Future<SecureSession> exchange(
-      {required String code, required String verifier});
+      {required String handoff,
+      required String verifier,
+      required Uri callbackUri,
+      required String state});
 }
 
 class BrowserOAuthClient {
@@ -140,7 +143,8 @@ class BrowserOAuthClient {
       'state': state,
       'code_challenge': _pkce.challenge(verifier),
       'code_challenge_method': 'S256',
-      'app_callback': appCallback.toString(),
+      if (callbackReceiver is DynamicAuthCallbackReceiver)
+        'app_callback': appCallback.toString(),
     });
     await browserLauncher.launch(url);
     final callback = await callbackReceiver.waitForCallback();
@@ -154,6 +158,11 @@ class BrowserOAuthClient {
           AuthErrorCode.stateMismatch, 'Authentication state mismatch');
     }
     final result = OAuthCallback.fromUri(callback);
+    if (callbackReceiver is DynamicAuthCallbackReceiver &&
+        !_sameCallbackEndpoint(callback, appCallback)) {
+      throw const AuthException(
+          AuthErrorCode.invalidCallback, 'Unexpected authentication callback');
+    }
     if (result.error != null) {
       if (result.error == 'access_denied') {
         throw const AuthException(
@@ -162,18 +171,27 @@ class BrowserOAuthClient {
       throw AuthException(AuthErrorCode.providerError,
           result.errorDescription ?? result.error!);
     }
-    if (!result.isSuccess) {
+    if (result.handoff == null) {
       throw const AuthException(AuthErrorCode.callbackMissingCode,
-          'Callback did not contain an authorization code');
+          'Callback did not contain a validated handoff');
     }
     try {
       return await exchanger.exchange(
-          code: result.handoff ?? result.code!, verifier: verifier);
+          handoff: result.handoff!,
+          verifier: verifier,
+          callbackUri: appCallback,
+          state: state);
     } catch (error) {
       throw AuthException(AuthErrorCode.exchangeFailed,
           'Authorization exchange failed: $error');
     }
   }
+
+  static bool _sameCallbackEndpoint(Uri a, Uri b) =>
+      a.scheme == b.scheme &&
+      a.host == b.host &&
+      a.port == b.port &&
+      a.path == b.path;
 
   static String _randomState() {
     final random = Random.secure();

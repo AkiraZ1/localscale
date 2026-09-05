@@ -421,12 +421,14 @@ pub struct AuthResponse { pub status: u16, pub headers: Vec<(String, String)>, p
 impl AuthResponse { fn new(status: u16) -> Self { Self { status, ..Default::default() } } pub fn header(&self, name: &str) -> Option<&str> { self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()) } }
 
 #[derive(Debug, Clone)] struct Session { issuer: String, subject: String, expires_at: std::time::SystemTime, revoked: bool }
-pub struct AuthService<P> { provider: P, transactions: google_oidc::PkceTransactionStore, sessions: HashMap<String, Session>, pending_callbacks: HashMap<String, String>, handoffs: HashMap<String, String>, session_ttl: std::time::Duration }
+#[derive(Debug, Clone)] struct Handoff { session_id: String, callback: String, state: String, expires_at: std::time::SystemTime }
+pub struct AuthService<P> { provider: P, transactions: google_oidc::PkceTransactionStore, sessions: HashMap<String, Session>, pending_callbacks: HashMap<String, String>, handoffs: HashMap<String, Handoff>, session_ttl: std::time::Duration }
 impl<P: AuthProvider> AuthService<P> {
     pub fn new(provider: P, session_ttl: std::time::Duration, _redirect_uri: &str) -> Self { Self { provider, transactions: google_oidc::PkceTransactionStore::new(), sessions: HashMap::new(), pending_callbacks: HashMap::new(), handoffs: HashMap::new(), session_ttl } }
     pub fn handle(&mut self, request: AuthRequest) -> AuthResponse { self.handle_at(request, std::time::SystemTime::now()) }
     pub fn handle_at(&mut self, request: AuthRequest, now: std::time::SystemTime) -> AuthResponse {
         self.sessions.retain(|_, session| session.expires_at > now && !session.revoked);
+        self.handoffs.retain(|_, handoff| handoff.expires_at > now);
         match (request.method.as_str(), request.path.as_str()) {
             ("GET", "/oauth/google/start") => self.start(&request, now),
             ("GET", "/oauth/google/callback") => self.callback(request, now),
@@ -438,6 +440,7 @@ impl<P: AuthProvider> AuthService<P> {
     }
     fn start(&mut self, request: &AuthRequest, now: std::time::SystemTime) -> AuthResponse {
         let callback = request.query.get("app_callback").filter(|u| valid_loopback_callback(u)).cloned();
+        if request.query.contains_key("app_callback") && callback.is_none() { return AuthResponse::new(400); }
         let tx = match self.transactions.begin_with_ttl(self.provider.transaction_ttl(), "/", now) { Ok(t) => t, Err(_) => return AuthResponse::new(500) };
         if let Some(callback) = callback { self.pending_callbacks.insert(tx.state().to_owned(), callback); }
         match self.provider.authorization_url(&tx) { Ok(url) => AuthResponse { status: 302, headers: vec![("Location".into(), url)], body: String::new() }, Err(_) => AuthResponse::new(502) }
@@ -453,17 +456,24 @@ impl<P: AuthProvider> AuthService<P> {
         let sid = random_opaque();
         self.sessions.insert(sid.clone(), Session { issuer: identity.issuer, subject: identity.subject, expires_at: now + self.session_ttl, revoked: false });
         let location = self.pending_callbacks.remove(state);
+        let has_handoff = location.is_some();
         let location = if let Some(location) = location {
             let handoff = random_opaque();
-            self.handoffs.insert(handoff.clone(), sid.clone());
+            self.handoffs.insert(handoff.clone(), Handoff { session_id: sid.clone(), callback: location.clone(), state: state.to_owned(), expires_at: now + self.session_ttl });
             let separator = if location.contains('?') { '&' } else { '?' };
-            format!("{location}{separator}handoff={handoff}")
+            let encoded_handoff = form_urlencoded::byte_serialize(handoff.as_bytes()).collect::<String>();
+            let encoded_state = form_urlencoded::byte_serialize(state.as_bytes()).collect::<String>();
+            format!("{location}{separator}handoff={encoded_handoff}&state={encoded_state}")
         } else { "/".to_owned() };
-        AuthResponse { status: 303, headers: vec![("Location".into(), location), ("Set-Cookie".into(), format!("localscale_session={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict", sid, self.session_ttl.as_secs()))], body: String::new() }
+        let headers = if has_handoff { Vec::new() } else { vec![("Set-Cookie".into(), format!("localscale_session={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict", sid, self.session_ttl.as_secs()))] };
+        AuthResponse { status: 303, headers: { let mut h = headers; h.insert(0, ("Location".into(), location)); h }, body: String::new() }
     }
     fn bridge(&mut self, request: &AuthRequest, now: std::time::SystemTime) -> AuthResponse {
-        let Some(token) = request.query.get("handoff") else { return AuthResponse::new(400) };
-        let Some(sid) = self.handoffs.remove(token) else { return AuthResponse::new(401) };
+        let (Some(token), Some(callback), Some(state)) = (request.query.get("handoff"), request.query.get("callback"), request.query.get("state")) else { return AuthResponse::new(400) };
+        let Some(handoff) = self.handoffs.get(token).cloned() else { return AuthResponse::new(401) };
+        if handoff.expires_at <= now || handoff.callback != *callback || handoff.state != *state || !valid_loopback_callback(callback) { return AuthResponse::new(401); }
+        let handoff = self.handoffs.remove(token).expect("handoff checked above");
+        let sid = handoff.session_id;
         let Some(session) = self.sessions.get(&sid).filter(|s| s.expires_at > now && !s.revoked) else { return AuthResponse::new(401) };
         let expires = session.expires_at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
         AuthResponse { status: 200, headers: vec![("Content-Type".into(), "application/json".into())], body: format!("{{\"session_id\":\"{sid}\",\"expires_at\":{expires}}}") }
@@ -474,9 +484,13 @@ impl<P: AuthProvider> AuthService<P> {
 }
 fn random_opaque() -> String { use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine}; use rand::RngCore; let mut b = [0u8; 32]; rand::rngs::OsRng.fill_bytes(&mut b); URL_SAFE_NO_PAD.encode(b) }
 fn valid_loopback_callback(value: &str) -> bool {
-    (value.starts_with("http://127.0.0.1:") || value.starts_with("http://localhost:"))
-        && !value.contains(['?', '#', '\\'])
-        && value.rsplit_once(':').and_then(|(_, port)| port.parse::<u16>().ok()).is_some_and(|p| p != 0)
+    let rest = value.strip_prefix("http://127.0.0.1:")
+        .or_else(|| value.strip_prefix("http://[::1]:"));
+    let valid_port_and_path = rest
+        .and_then(|rest| rest.split_once('/'))
+        .and_then(|(port, path)| port.parse::<u16>().ok().map(|port| (port, path)))
+        .is_some_and(|(port, path)| port != 0 && path == "oauth/callback");
+    valid_port_and_path && !value.contains(['?', '#', '\\'])
 }
 fn constant_time_eq(a: &str, b: &str) -> bool { let aa = a.as_bytes(); let bb = b.as_bytes(); let mut diff = (aa.len() ^ bb.len()) as u8; for i in 0..aa.len().max(bb.len()) { let x = aa.get(i).copied().unwrap_or(0); let y = bb.get(i).copied().unwrap_or(0); diff |= x ^ y; } diff == 0 }
 
@@ -562,6 +576,42 @@ mod phase3_red_tests {
         let login = service.handle_at(AuthRequest::get("/oauth/google/callback").query("code", "c").query("state", state), now());
         let cookie = login.header("Set-Cookie").unwrap().split(';').next().unwrap();
         assert_eq!(service.handle_at(AuthRequest::get("/auth/session").header("Cookie", cookie), now() + Duration::from_secs(61)).status, 401);
+    }
+
+    #[test]
+    fn dynamic_loopback_handoff_contract_is_bound_and_token_free() {
+        let mut service = service();
+        let callback = "http://127.0.0.1:43123/oauth/callback";
+        let start = service.handle_at(AuthRequest::get("/oauth/google/start").query("app_callback", callback), now());
+        let state = start.header("Location").unwrap().split("state=").nth(1).unwrap().to_owned();
+        let login = service.handle_at(AuthRequest::get("/oauth/google/callback").query("code", "provider-code").query("state", &state), now());
+        assert_eq!(login.status, 303);
+        let location = login.header("Location").unwrap();
+        assert!(location.starts_with(callback));
+        assert!(location.contains("handoff=") && location.contains("state="));
+        assert!(!location.contains("provider-code") && !location.contains("access-secret") && !location.contains("id-secret"));
+        assert!(login.header("Set-Cookie").is_none());
+        let query = location.split('?').nth(1).unwrap();
+        let params: std::collections::HashMap<_, _> = query.split('&').filter_map(|pair| pair.split_once('=')).collect();
+        let handoff = params.get("handoff").unwrap().to_string();
+        let exchange = AuthRequest::get("/auth/session/bridge").query("handoff", &handoff).query("callback", callback).query("state", &state);
+        let response = service.handle_at(exchange, now());
+        assert_eq!(response.status, 200);
+        assert!(!response.body.contains("access-secret") && !response.body.contains("id-secret"));
+        assert_eq!(service.handle_at(AuthRequest::get("/auth/session/bridge").query("handoff", &handoff).query("callback", callback).query("state", &state), now()).status, 401);
+    }
+
+    #[test]
+    fn handoff_rejects_wrong_callback_and_expiry() {
+        let mut service = service();
+        let callback = "http://127.0.0.1:43124/oauth/callback";
+        let start = service.handle_at(AuthRequest::get("/oauth/google/start").query("app_callback", callback), now());
+        let state = start.header("Location").unwrap().split("state=").nth(1).unwrap().to_owned();
+        let login = service.handle_at(AuthRequest::get("/oauth/google/callback").query("code", "c").query("state", &state), now());
+        let location = login.header("Location").unwrap();
+        let handoff = location.split("handoff=").nth(1).unwrap().split('&').next().unwrap();
+        assert_eq!(service.handle_at(AuthRequest::get("/auth/session/bridge").query("handoff", handoff).query("callback", "http://127.0.0.1:43125/oauth/callback").query("state", &state), now()).status, 401);
+        assert_eq!(service.handle_at(AuthRequest::get("/auth/session/bridge").query("handoff", handoff).query("callback", callback).query("state", &state), now() + Duration::from_secs(61)).status, 401);
     }
 }
 
