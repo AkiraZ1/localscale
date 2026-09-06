@@ -603,6 +603,13 @@ mod tests {
         assert!(validate_approved_peer_record(&record, "cliente").is_err());
     }
 
+    #[test]
+    fn approved_peer_validation_rejects_revoked_record_before_bootstrap() {
+        let mut record = approved_cliente_record();
+        record.revoked = true;
+        assert!(validate_approved_peer_record(&record, "cliente").is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn lifecycle_starts_fake_bundled_tor_and_kills_it_cleanly() {
