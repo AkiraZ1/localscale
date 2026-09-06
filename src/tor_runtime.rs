@@ -142,6 +142,7 @@ pub struct TorRuntime {
     executable: PathBuf,
     data_dir: PathBuf,
     torrc: PathBuf,
+    socks_port: u16,
 }
 
 impl TorRuntime {
@@ -149,12 +150,19 @@ impl TorRuntime {
         let metadata = fs::symlink_metadata(&executable).map_err(TorRuntimeError::Io)?;
         if executable.is_relative() || metadata.file_type().is_symlink() || !metadata.is_file() { return Err(TorRuntimeError::UnsafeBundledExecutable(executable)); }
         prepare_data_directory(&data_dir)?;
+        let socks_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let socks_port = socks_listener.local_addr()?.port();
+        drop(socks_listener);
         let torrc = data_dir.join("torrc");
-        Ok(Self { executable, data_dir, torrc })
+        Ok(Self { executable, data_dir, torrc, socks_port })
+    }
+
+    pub fn socks_endpoint(&self) -> std::net::SocketAddr {
+        (std::net::Ipv4Addr::LOCALHOST, self.socks_port).into()
     }
 
     pub fn write_torrc(&self, mode: &TorMode) -> Result<&Path, TorRuntimeError> {
-        let content = render_torrc(&self.data_dir, mode)?;
+        let content = render_torrc_with_socks_port(&self.data_dir, mode, self.socks_port)?;
         let mut options = OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(unix)] options.mode(0o600);
@@ -199,8 +207,13 @@ impl TorRuntime {
 }
 
 pub fn render_torrc(data_dir: &Path, mode: &TorMode) -> Result<String, TorRuntimeError> {
+    render_torrc_with_socks_port(data_dir, mode, 9150)
+}
+
+fn render_torrc_with_socks_port(data_dir: &Path, mode: &TorMode, socks_port: u16) -> Result<String, TorRuntimeError> {
+    if socks_port == 0 { return Err(TorRuntimeError::InvalidConfig("SOCKS port must be non-zero".into())); }
     if data_dir.is_relative() { return Err(TorRuntimeError::InvalidConfig("data directory must be absolute".into())); }
-    let mut config = format!("DataDirectory {}\nSocksPort 127.0.0.1:0\n", data_dir.display());
+    let mut config = format!("DataDirectory {}\nSocksPort 127.0.0.1:{}\n", data_dir.display(), socks_port);
     match mode {
         TorMode::Host { service_port, upstream } => {
             validate_upstream(upstream)?;
