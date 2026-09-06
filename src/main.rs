@@ -1,4 +1,4 @@
-use localscale_agent::{serve, serve_with_auth, AuthHandler, PeerStore};
+use localscale_agent::{serve_with_auth_and_peer_transport_gate, AuthHandler, PeerStore};
 use localscale_agent::tor_runtime::{resolve_bundled_tor, TorMode, TorProcess, TorRuntime};
 use localscale_control_plane::{
     google_oidc::{ClientSecretRef, GoogleOidcConfig, GoogleOidcProvider, HttpRequest, HttpResponse, HttpTransport, TransportError},
@@ -11,6 +11,7 @@ use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use std::thread;
+use std::sync::{Arc, atomic::AtomicBool};
 
 const CURL_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const CURL_TIMEOUT_SECONDS: u64 = 5;
@@ -137,7 +138,7 @@ fn stop_tor(mut running: RunningTor) {
     let _ = running.process.terminate();
 }
 
-fn start_peer_transport(config: &RuntimeConfig, tor: &RunningTor) -> Result<(), String> {
+fn start_peer_transport(config: &RuntimeConfig, tor: &RunningTor, gate: Arc<AtomicBool>) -> Result<(), String> {
     let store_path = env::var_os("LOCALSCALE_PEER_STORE").map(std::path::PathBuf::from).unwrap_or_else(|| config.data_dir.join("peer-record.json"));
     if env::var_os("LOCALSCALE_PEER_STORE").is_none() { env::set_var("LOCALSCALE_PEER_STORE", &store_path); }
     let store = PeerStore::open(&store_path).map_err(|e| format!("peer store unavailable: {e}"))?;
@@ -152,6 +153,7 @@ fn start_peer_transport(config: &RuntimeConfig, tor: &RunningTor) -> Result<(), 
             let address: std::net::SocketAddr = upstream.parse().map_err(|_| "host upstream must be a socket address".to_string())?;
             let allocator = FileNonceAllocator::open(nonce_path).map_err(|e| e.to_string())?;
             let mut host = HostTransport::bind(address, key, record.node_id.clone(), Box::new(allocator)).map_err(|e| e.to_string())?;
+            host.set_acceptance_gate(gate);
             std::thread::spawn(move || loop { match host.accept() { Ok(_) => {}, Err(error) => eprintln!("LocalScale peer handshake failed: {error}") } });
             Ok(())
         }
@@ -294,13 +296,14 @@ fn auth_provider(port: u16) -> Option<Box<dyn AuthHandler>> {
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let options = parse_args(&args).map_err(std::io::Error::other)?;
+    let peer_transport_enabled = Arc::new(AtomicBool::new(true));
     let running_tor = match RuntimeConfig::from_environment().map_err(std::io::Error::other)? {
         Some(runtime_config) => {
             let bundle_root = env::var_os("LOCALSCALE_BUNDLE_ROOT").map(std::path::PathBuf::from).unwrap_or_else(|| {
                 env::current_exe().ok().and_then(|path| path.parent().map(std::path::Path::to_path_buf)).unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"))
             });
             let running = start_tor(&bundle_root, &runtime_config).map_err(std::io::Error::other)?;
-            match start_peer_transport(&runtime_config, &running) {
+            match start_peer_transport(&runtime_config, &running, peer_transport_enabled.clone()) {
                 Ok(()) => Some(running),
                 Err(error) => { eprintln!("LocalScale peer transport disabled: {error}"); stop_tor(running); None }
             }
@@ -314,8 +317,8 @@ fn main() -> std::io::Result<()> {
 
     let auth = auth_provider(address.port());
     let server = thread::spawn(move || match auth {
-        Some(auth) => serve_with_auth(listener, auth),
-        None => serve(listener),
+        Some(auth) => serve_with_auth_and_peer_transport_gate(listener, auth, peer_transport_enabled),
+        None => localscale_agent::serve_with_peer_transport_gate(listener, peer_transport_enabled),
     });
     let result = wait_until_healthy(address).and_then(|_| {
         if !options.no_open { open_browser(&url); }

@@ -15,6 +15,7 @@ use std::{
     fs::{self, OpenOptions},
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
 };
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -146,6 +147,7 @@ pub struct HostTransport {
     timeout: Duration,
     replay: ReplayGuard,
     allocator: Box<dyn NonceAllocator + Send>,
+    acceptance_gate: Option<Arc<AtomicBool>>,
 }
 impl HostTransport {
     pub fn bind(
@@ -175,6 +177,7 @@ impl HostTransport {
             timeout,
             replay: ReplayGuard::default(),
             allocator,
+            acceptance_gate: None,
         })
     }
 
@@ -182,8 +185,15 @@ impl HostTransport {
         Ok(self.listener.local_addr()?)
     }
 
+    pub fn set_acceptance_gate(&mut self, gate: Arc<AtomicBool>) {
+        self.acceptance_gate = Some(gate);
+    }
+
     pub fn accept(&mut self) -> Result<AuthenticatedStream, TransportError> {
         let (mut stream, _) = self.listener.accept()?;
+        if self.acceptance_gate.as_ref().is_some_and(|gate| !gate.load(Ordering::Acquire)) {
+            return Err(TransportError::Protocol("peer transport revoked"));
+        }
         set_deadline(&stream, self.timeout)?;
         let envelope_bytes = read_frame(&mut stream)?;
         let envelope = HandshakeEnvelope::from_bytes(&envelope_bytes)?;
