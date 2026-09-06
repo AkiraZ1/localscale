@@ -495,9 +495,9 @@ impl<P: AuthProvider> AuthService<P> {
         let sid = handoff.session_id;
         let Some(session) = self.sessions.get(&sid).filter(|s| s.expires_at > now && !s.revoked) else { return AuthResponse::new(401) };
         let expires = session.expires_at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-        AuthResponse { status: 200, headers: vec![("Content-Type".into(), "application/json".into())], body: format!("{{\"session_id\":\"{sid}\",\"expires_at\":{expires}}}") }
+        AuthResponse { status: 200, headers: vec![("Content-Type".into(), "application/json".into())], body: serde_json::json!({ "session_id": sid, "expires_at": expires }).to_string() }
     }
-    fn session(&mut self, request: &AuthRequest, now: std::time::SystemTime) -> AuthResponse { match self.session_id(request).and_then(|id| self.sessions.get(&id)).filter(|s| !s.revoked && s.expires_at > now) { Some(s) => AuthResponse { status: 200, body: format!("{{\"authenticated\":true,\"issuer\":\"{}\",\"subject\":\"{}\"}}", s.issuer, s.subject), ..Default::default() }, None => AuthResponse::new(401) } }
+    fn session(&mut self, request: &AuthRequest, now: std::time::SystemTime) -> AuthResponse { match self.session_id(request).and_then(|id| self.sessions.get(&id)).filter(|s| !s.revoked && s.expires_at > now) { Some(s) => AuthResponse { status: 200, headers: vec![("Content-Type".into(), "application/json".into())], body: serde_json::json!({ "authenticated": true, "issuer": s.issuer, "subject": s.subject }).to_string() }, None => AuthResponse::new(401) } }
     fn logout(&mut self, request: &AuthRequest, now: std::time::SystemTime) -> AuthResponse { let Some(id) = self.session_id(request) else { return AuthResponse::new(401) }; let Some(csrf) = request.headers.get("X-CSRF-Token") else { return AuthResponse::new(403) }; if !constant_time_eq(&id, csrf) { return AuthResponse::new(403) } if let Some(s) = self.sessions.get_mut(&id) { if s.expires_at <= now || s.revoked { return AuthResponse::new(401) } s.revoked = true; return AuthResponse { status: 204, headers: vec![("Set-Cookie".into(), "localscale_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict".into())], ..Default::default() }; } AuthResponse::new(401) }
     fn session_id(&self, request: &AuthRequest) -> Option<String> { request.headers.get("Cookie")?.split(';').map(str::trim).find_map(|v| v.strip_prefix("localscale_session=")).filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')).map(str::to_owned) }
 }
@@ -582,6 +582,26 @@ mod phase3_red_tests {
     #[test]
     fn id_token_validation_failure_redirects_to_exact_pending_loopback_callback() {
         assert_provider_failure_redirects(false, true);
+    }
+
+    #[test]
+    fn session_json_escapes_authenticated_identity_fields() {
+        let mut service = service();
+        let sid = "session-id".to_owned();
+        service.sessions.insert(sid.clone(), Session {
+            issuer: "issuer\"\\".into(),
+            subject: "subject\"\\".into(),
+            expires_at: now() + Duration::from_secs(60),
+            revoked: false,
+        });
+        let response = service.handle_at(
+            AuthRequest::get("/auth/session").header("Cookie", &format!("localscale_session={sid}")),
+            now(),
+        );
+        assert_eq!(response.status, 200);
+        let json: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(json["issuer"], "issuer\"\\");
+        assert_eq!(json["subject"], "subject\"\\");
     }
 
     #[test]
