@@ -282,13 +282,14 @@ pub mod google_oidc {
 
     #[derive(Debug, Clone, PartialEq, Eq)] pub enum Audience<'a> { One(&'a str), Many(Vec<String>) }
     impl<'a> Audience<'a> { fn contains(&self, expected: &str) -> bool { match self { Self::One(a) => *a == expected, Self::Many(a) => a.iter().any(|x| x == expected) } } }
-    #[derive(Clone, PartialEq, Eq)] pub struct IdTokenClaims<'a> { pub issuer: &'a str, pub audience: Audience<'a>, pub expires_at: i64, pub issued_at: i64, pub nonce: &'a str, pub subject: &'a str, pub email_verified: bool }
+    #[derive(Clone, PartialEq, Eq)] pub struct IdTokenClaims<'a> { pub issuer: &'a str, pub audience: Audience<'a>, pub azp: Option<&'a str>, pub expires_at: i64, pub issued_at: i64, pub nonce: &'a str, pub subject: &'a str, pub email_verified: bool }
     impl std::fmt::Debug for IdTokenClaims<'_> { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("IdTokenClaims").field("issuer", &self.issuer).field("audience", &"[REDACTED]").field("expires_at", &self.expires_at).field("issued_at", &self.issued_at).field("nonce", &"[REDACTED]").field("subject", &"[REDACTED]").field("email_verified", &self.email_verified).finish() } }
     #[derive(Debug, Clone, PartialEq, Eq)] pub struct ValidatedIdentity { pub issuer: String, pub subject: String }
     pub struct IdTokenValidator<'a> { config: &'a GoogleOidcConfig }
     impl<'a> IdTokenValidator<'a> { pub fn new(config: &'a GoogleOidcConfig) -> Self { Self { config } } pub fn validate(&self, c: &'a IdTokenClaims<'a>, now: i64, expected_nonce: &str) -> Result<ValidatedIdentity, OidcCoreError> {
         if c.issuer != "https://accounts.google.com" && c.issuer != "accounts.google.com" { return Err(OidcCoreError::InvalidIssuer); }
         if !c.audience.contains(&self.config.audience) { return Err(OidcCoreError::InvalidAudience); }
+        if c.azp.is_some_and(|azp| azp != self.config.audience.as_str()) || matches!(&c.audience, Audience::Many(audiences) if audiences.len() > 1 && c.azp.is_none()) { return Err(OidcCoreError::InvalidAudience); }
         let skew = self.config.clock_skew.as_secs() as i64;
         if c.expires_at <= now - skew { return Err(OidcCoreError::Expired); } if c.issued_at > now + skew { return Err(OidcCoreError::IssuedInFuture); }
         if c.nonce != expected_nonce { return Err(OidcCoreError::NonceMismatch); } if c.subject.is_empty() { return Err(OidcCoreError::MissingSubject); } if !c.email_verified { return Err(OidcCoreError::UnverifiedEmail); }
@@ -317,9 +318,9 @@ pub mod google_oidc {
     #[derive(Debug, Clone, serde::Deserialize)] struct JwksWire { keys: Vec<Jwk> }
     #[derive(Debug, Clone, serde::Deserialize)] struct Jwk { kty: String, kid: Option<String>, alg: Option<String>, n: Option<String>, e: Option<String> }
     #[derive(Debug, Clone, serde::Deserialize)] struct TokenWire { access_token: Option<String>, id_token: Option<String>, token_type: Option<String> }
-    #[derive(Debug, Clone, serde::Deserialize)] struct JwtClaims { iss: String, aud: AudienceWire, exp: i64, iat: i64, nonce: String, sub: String, email_verified: bool }
+    #[derive(Debug, Clone, serde::Deserialize)] struct JwtClaims { iss: String, aud: AudienceWire, azp: Option<String>, exp: i64, iat: i64, nonce: String, sub: String, email_verified: bool }
     #[derive(Debug, Clone, serde::Deserialize)] #[serde(untagged)] enum AudienceWire { One(String), Many(Vec<String>) }
-    impl AudienceWire { fn contains(&self, expected: &str) -> bool { match self { Self::One(v) => v == expected, Self::Many(v) => v.iter().any(|x| x == expected) } } }
+    impl AudienceWire { fn contains(&self, expected: &str) -> bool { match self { Self::One(v) => v == expected, Self::Many(v) => v.iter().any(|x| x == expected) } } fn requires_azp(&self) -> bool { matches!(self, Self::Many(v) if v.len() > 1) } }
 
     pub struct GoogleOidcProvider<T> { config: GoogleOidcConfig, transport: T, discovery: Option<GoogleDiscovery>, jwks: Option<CachedJwks>, cache_ttl: Duration, max_response_bytes: usize }
     impl<T: HttpTransport> GoogleOidcProvider<T> {
@@ -378,7 +379,7 @@ pub mod google_oidc {
             let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256); validation.set_issuer(&["https://accounts.google.com"]); validation.set_audience(&[self.config.audience.as_str()]); validation.validate_exp = false;
             let data = jsonwebtoken::decode::<JwtClaims>(raw, &decoding, &validation).map_err(|_| OidcProviderError::InvalidSignature)?;
             let c = data.claims; let skew = self.config.clock_skew.as_secs() as i64;
-            if c.iss != "https://accounts.google.com" || !c.aud.contains(&self.config.audience) { return Err(OidcProviderError::InvalidToken); }
+            if c.iss != "https://accounts.google.com" || !c.aud.contains(&self.config.audience) || c.azp.as_deref().is_some_and(|azp| azp != self.config.audience.as_str()) || (c.aud.requires_azp() && c.azp.is_none()) { return Err(OidcProviderError::InvalidToken); }
             if c.exp <= now - skew { return Err(OidcProviderError::InvalidToken); } if c.iat > now + skew { return Err(OidcProviderError::InvalidToken); }
             if c.nonce != expected_nonce || c.sub.is_empty() || !c.email_verified { return Err(OidcProviderError::InvalidToken); }
             Ok(ValidatedIdentity { issuer: "https://accounts.google.com".into(), subject: c.sub })
@@ -763,7 +764,7 @@ mod tests {
         assert!(!url.contains("secret-ref"));
     }
 
-    fn claims() -> IdTokenClaims<'static> { IdTokenClaims { issuer: "https://accounts.google.com", audience: Audience::Many(vec!["client-id".into()]), expires_at: 1_700_000_100, issued_at: 1_700_000_000, nonce: "n", subject: "stable-sub", email_verified: true } }
+    fn claims() -> IdTokenClaims<'static> { IdTokenClaims { issuer: "https://accounts.google.com", audience: Audience::Many(vec!["client-id".into()]), azp: None, expires_at: 1_700_000_100, issued_at: 1_700_000_000, nonce: "n", subject: "stable-sub", email_verified: true } }
 
     #[test]
     fn claims_validate_google_issuer_audience_times_nonce_email_and_subject() {
@@ -771,6 +772,21 @@ mod tests {
         let valid = claims();
         assert_eq!(v.validate(&valid, 1_700_000_010, "n").unwrap().subject, "stable-sub");
         let bads = [IdTokenClaims { issuer: "https://accounts.example", ..valid.clone() }, IdTokenClaims { audience: Audience::One("other"), ..valid.clone() }, IdTokenClaims { issued_at: 1_700_000_1000, ..valid.clone() }, IdTokenClaims { expires_at: 1_699_999_000, ..valid.clone() }, IdTokenClaims { nonce: "bad", ..valid.clone() }, IdTokenClaims { email_verified: false, ..valid.clone() }, IdTokenClaims { subject: "", ..valid }]; for bad in bads { assert!(v.validate(&bad, 1_700_000_010, "n").is_err()); }
+    }
+
+    #[test]
+    fn claims_with_multiple_audiences_require_matching_azp() {
+        let cfg = config(); let v = IdTokenValidator::new(&cfg);
+        let valid = IdTokenClaims { audience: Audience::Many(vec!["client-id".into(), "other-client".into()]), azp: Some("client-id"), ..claims() };
+        assert!(v.validate(&valid, 1_700_000_010, "n").is_ok());
+        let missing = IdTokenClaims { azp: None, ..valid.clone() };
+        assert!(matches!(v.validate(&missing, 1_700_000_010, "n"), Err(OidcCoreError::InvalidAudience)));
+        let mismatched = IdTokenClaims { azp: Some("other-client"), ..valid };
+        assert!(matches!(v.validate(&mismatched, 1_700_000_010, "n"), Err(OidcCoreError::InvalidAudience)));
+        let single_mismatched = IdTokenClaims { audience: Audience::One("client-id"), azp: Some("other-client"), ..claims() };
+        assert!(matches!(v.validate(&single_mismatched, 1_700_000_010, "n"), Err(OidcCoreError::InvalidAudience)));
+        let single_matching = IdTokenClaims { audience: Audience::One("client-id"), azp: Some("client-id"), ..claims() };
+        assert!(v.validate(&single_matching, 1_700_000_010, "n").is_ok());
     }
 
     #[test]
