@@ -66,7 +66,7 @@ struct PeerState {
     revoked: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PeerRecord {
     pub role: String,
     pub node_id: String,
@@ -77,13 +77,49 @@ pub struct PeerRecord {
     pub revoked: bool,
 }
 
-#[derive(Clone, Debug)]
+impl std::fmt::Debug for PeerRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("PeerRecord")
+            .field("role", &self.role)
+            .field("node_id", &self.node_id)
+            .field("host_node_id", &self.host_node_id)
+            .field("endpoint", &self.endpoint)
+            .field("invitation_secret", &"[REDACTED]")
+            .field("approved", &self.approved)
+            .field("revoked", &self.revoked)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct PeerStore { path: PathBuf, record: Option<PeerRecord> }
+
+impl std::fmt::Debug for PeerStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("PeerStore")
+            .field("path", &self.path)
+            .field("record", &self.record)
+            .finish()
+    }
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    unsafe extern "C" { fn geteuid() -> u32; }
+    unsafe { geteuid() }
+}
 
 impl PeerStore {
     pub fn open(path: impl Into<PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
-        let record = if path.exists() { Some(Self::read_record(&path)?) } else { None };
+        let record = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                Self::validate_file(&path, &metadata)?;
+                Some(Self::read_record(&path)?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
         Ok(Self { path, record })
     }
     pub fn record(&self) -> Option<&PeerRecord> { self.record.as_ref() }
@@ -98,6 +134,23 @@ impl PeerStore {
         let Some(mut record) = self.record.clone() else { return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "peer is not configured")); };
         record.approved = approved; record.revoked = !approved;
         self.write_record(&record)?; self.record = Some(record); Ok(())
+    }
+    fn validate_file(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
+        if !metadata.file_type().is_file() {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "peer store must be a regular file"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.uid() != effective_uid() {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "peer store has the wrong owner"));
+            }
+            if metadata.mode() & 0o044 != 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "peer store is readable by group or other users"));
+            }
+        }
+        let _ = path;
+        Ok(())
     }
     fn read_record(path: &Path) -> std::io::Result<PeerRecord> {
         let body = std::fs::read_to_string(path)?;
@@ -117,9 +170,13 @@ impl PeerStore {
         std::fs::create_dir_all(parent)?;
         let tmp = self.path.with_extension("tmp");
         let body = format!("{{\"role\":\"{}\",\"node_id\":\"{}\",\"host_node_id\":\"{}\",\"endpoint\":\"{}\",\"invitation_secret\":\"{}\",\"approved\":{},\"revoked\":{}}}", record.role, record.node_id, record.host_node_id.as_deref().unwrap_or(""), record.endpoint, record.invitation_secret, record.approved, record.revoked);
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(body.as_bytes())?; file.sync_all()?;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?; }
+        file.write_all(body.as_bytes())?; file.sync_all()?;
+        #[cfg(unix)] {
+            let metadata = std::fs::symlink_metadata(&tmp)?;
+            Self::validate_file(&tmp, &metadata)?;
+        }
         std::fs::rename(&tmp, &self.path)?;
         if let Ok(dir) = std::fs::File::open(parent) { let _ = dir.sync_all(); }
         Ok(())
@@ -799,6 +856,54 @@ mod tests {
         std::fs::write(&path, "not-json").unwrap();
         assert!(super::PeerStore::open(&path).is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_store_rejects_existing_symlink() {
+        use std::os::unix::fs::symlink;
+        let path = std::env::temp_dir().join(format!("localscale-peer-symlink-{}.json", std::process::id()));
+        let target = std::env::temp_dir().join(format!("localscale-peer-target-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&target);
+        symlink(&target, &path).unwrap();
+        assert!(super::PeerStore::open(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_store_rejects_group_or_other_readable_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("localscale-peer-readable-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, r#"{"role":"cliente","node_id":"client-01","endpoint":"abc.onion","invitation_secret":"secret-value","approved":false,"revoked":true}"#).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(super::PeerStore::open(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_store_creates_regular_user_private_file() {
+        use std::os::unix::fs::MetadataExt;
+        let path = std::env::temp_dir().join(format!("localscale-peer-private-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut store = super::PeerStore::open(&path).unwrap();
+        store.configure(super::PeerRecord { role: "cliente".into(), node_id: "client-01".into(), host_node_id: None, endpoint: "abc.onion".into(), invitation_secret: "secret-value".into(), approved: false, revoked: false }).unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), super::effective_uid());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn peer_debug_output_redacts_invitation_secret() {
+        let record = super::PeerRecord { role: "cliente".into(), node_id: "client-01".into(), host_node_id: None, endpoint: "abc.onion".into(), invitation_secret: "secret-value".into(), approved: false, revoked: false };
+        let store = super::PeerStore { path: std::path::PathBuf::from("peer.json"), record: Some(record.clone()) };
+        assert!(!format!("{record:?}").contains("secret-value"));
+        assert!(!format!("{store:?}").contains("secret-value"));
     }
 
     #[test]
