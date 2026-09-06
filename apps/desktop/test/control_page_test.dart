@@ -62,7 +62,8 @@ void main() {
     await tester.tap(find.byTooltip('Refresh'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Unable to read LocalScale agent: Bad state: status failed'),
+    expect(
+        find.text('Unable to read LocalScale agent: Bad state: status failed'),
         findsOneWidget);
     expect(find.text('Stopped'), findsNothing);
   });
@@ -84,7 +85,8 @@ class ControlledApi implements LocalAgentApi {
   }
 
   @override
-  Future<ServiceStatus> setMode(LocalScaleMode mode) => Future.value(nextStatus);
+  Future<ServiceStatus> setMode(LocalScaleMode mode) =>
+      Future.value(nextStatus);
 
   @override
   Future<ServiceStatus> start() => Future.value(nextStatus);
