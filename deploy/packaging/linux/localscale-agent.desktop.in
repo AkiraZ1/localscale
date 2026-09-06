@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=LocalScale Agent
+Comment=Start the LocalScale agent for this desktop session
+X-GNOME-Autostart-enabled=true
+X-XFCE-Autostart-enabled=true
+X-LocalScale-Managed=true
+Exec=/usr/bin/python3 @START_AGENT@ --no-open
+Path=@BUNDLE_ROOT@
+Terminal=false
+Categories=Network;
