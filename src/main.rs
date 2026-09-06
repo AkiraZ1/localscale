@@ -14,7 +14,7 @@ use std::thread;
 
 const CURL_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const CURL_TIMEOUT_SECONDS: u64 = 5;
-const TOR_READY_TIMEOUT: Duration = Duration::from_secs(120);
+const TOR_READY_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 struct RuntimeConfig {
