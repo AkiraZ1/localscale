@@ -16,8 +16,11 @@ class HttpLocalAgentTransport implements LocalAgentTransport {
           ? await client.getUrl(base.replace(path: path))
           : await client.postUrl(base.replace(path: path));
       if (body != null) {
-        request.headers.contentType = ContentType.json;
-        request.write(jsonEncode(body));
+        final bytes = utf8.encode(jsonEncode(body));
+        request.headers
+          ..contentType = ContentType.json
+          ..contentLength = bytes.length;
+        request.add(bytes);
       }
       final response = await request.close();
       final text = await utf8.decoder.bind(response).join();
