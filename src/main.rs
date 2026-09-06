@@ -1,4 +1,4 @@
-use localscale_agent::{serve, serve_with_auth, AuthHandler};
+use localscale_agent::{serve, serve_with_auth, AuthHandler, PeerStore};
 use localscale_agent::tor_runtime::{resolve_bundled_tor, TorMode, TorProcess, TorRuntime};
 use localscale_control_plane::{
     google_oidc::{ClientSecretRef, GoogleOidcConfig, GoogleOidcProvider, HttpRequest, HttpResponse, HttpTransport, TransportError},
@@ -92,30 +92,31 @@ fn stop_tor(mut running: RunningTor) {
 }
 
 fn start_peer_transport(config: &RuntimeConfig, tor: &RunningTor) -> Result<(), String> {
-    let secret = env::var("LOCALSCALE_INVITATION_SECRET").map_err(|_| "LOCALSCALE_INVITATION_SECRET is required for peer transport".to_string())?;
-    let node_id = env::var("LOCALSCALE_NODE_ID").map_err(|_| "LOCALSCALE_NODE_ID is required for peer transport".to_string())?;
-    if secret.is_empty() || node_id.is_empty() { return Err("peer credentials must not be empty".into()); }
-    let key = key_from_invitation_secret(&secret);
+    let store_path = env::var_os("LOCALSCALE_PEER_STORE").map(std::path::PathBuf::from).unwrap_or_else(|| config.data_dir.join("peer-record.json"));
+    if env::var_os("LOCALSCALE_PEER_STORE").is_none() { env::set_var("LOCALSCALE_PEER_STORE", &store_path); }
+    let store = PeerStore::open(&store_path).map_err(|e| format!("peer store unavailable: {e}"))?;
+    let record = store.record().ok_or("peer is not configured; refusing transport startup")?;
+    if !record.approved || record.revoked { return Err("peer is not approved; refusing transport startup".into()); }
+    let expected_role = match &config.mode { TorMode::Host { .. } => "host", TorMode::Client { .. } => "cliente" };
+    if record.role != expected_role { return Err("peer record role does not match runtime role".into()); }
+    let key = key_from_invitation_secret(&record.invitation_secret);
     let nonce_path = config.data_dir.join("handshake-nonce");
     match &config.mode {
         TorMode::Host { upstream, .. } => {
             let address: std::net::SocketAddr = upstream.parse().map_err(|_| "host upstream must be a socket address".to_string())?;
             let allocator = FileNonceAllocator::open(nonce_path).map_err(|e| e.to_string())?;
-            let mut host = HostTransport::bind(address, key, node_id, Box::new(allocator)).map_err(|e| e.to_string())?;
-            std::thread::spawn(move || loop {
-                match host.accept() { Ok(_) => {}, Err(error) => eprintln!("LocalScale peer handshake failed: {error}") }
-            });
+            let mut host = HostTransport::bind(address, key, record.node_id.clone(), Box::new(allocator)).map_err(|e| e.to_string())?;
+            std::thread::spawn(move || loop { match host.accept() { Ok(_) => {}, Err(error) => eprintln!("LocalScale peer handshake failed: {error}") } });
             Ok(())
         }
         TorMode::Client { hostname } => {
-            let host_node_id = env::var("LOCALSCALE_HOST_NODE_ID").map_err(|_| "LOCALSCALE_HOST_NODE_ID is required for cliente transport".to_string())?;
+            let host_node_id = record.host_node_id.clone().ok_or("approved cliente peer lacks host node id")?;
             let port = env::var("LOCALSCALE_ONION_PORT").ok().map(|v| v.parse::<u16>().map_err(|_| "LOCALSCALE_ONION_PORT must be a valid TCP port".to_string())).transpose()?.unwrap_or(8765);
             let allocator = FileNonceAllocator::open(nonce_path).map_err(|e| e.to_string())?;
-            wait_for_socks(tor.process.socks_endpoint(), TOR_READY_TIMEOUT).map_err(|e| e.to_string())?;
-            let mut client = ClienteTransport::new(Box::new(ProcessTorRuntime { socks: tor.process.socks_endpoint() }), key, node_id, host_node_id, Box::new(allocator));
+            wait_for_socks(tor.process.socks_endpoint(), TOR_READY_TIMEOUT)?;
+            let mut client = ClienteTransport::new(Box::new(ProcessTorRuntime { socks: tor.process.socks_endpoint() }), key, record.node_id.clone(), host_node_id, Box::new(allocator));
             let _stream = client.connect(hostname, port).map_err(|e| format!("cliente peer connection failed: {e}"))?;
-            println!("LocalScale peer: connected through bundled Tor");
-            Ok(())
+            println!("LocalScale peer: connected through bundled Tor"); Ok(())
         }
     }
 }
@@ -253,8 +254,10 @@ fn main() -> std::io::Result<()> {
                 env::current_exe().ok().and_then(|path| path.parent().map(std::path::Path::to_path_buf)).unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"))
             });
             let running = start_tor(&bundle_root, &runtime_config).map_err(std::io::Error::other)?;
-            start_peer_transport(&runtime_config, &running).map_err(std::io::Error::other)?;
-            Some(running)
+            match start_peer_transport(&runtime_config, &running) {
+                Ok(()) => Some(running),
+                Err(error) => { eprintln!("LocalScale peer transport disabled: {error}"); stop_tor(running); None }
+            }
         }
         None => None,
     };

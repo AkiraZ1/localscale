@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
 use localscale_control_plane::{AuthRequest, AuthResponse};
 use localscale_agent_protocol::{ClientConfig, HostInvitation};
 
@@ -50,6 +51,7 @@ struct AgentState {
     service_state: Arc<Mutex<String>>,
     peer: Arc<Mutex<PeerState>>,
     auth: Option<SharedAuth>,
+    peer_store: Option<Arc<Mutex<PeerStore>>>,
 }
 
 #[derive(Clone, Default)]
@@ -59,6 +61,68 @@ struct PeerState {
     host_node_id: Option<String>,
     endpoint: Option<String>,
     transport: &'static str,
+    approved: bool,
+    revoked: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerRecord {
+    pub role: String,
+    pub node_id: String,
+    pub host_node_id: Option<String>,
+    pub endpoint: String,
+    pub invitation_secret: String,
+    pub approved: bool,
+    pub revoked: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerStore { path: PathBuf, record: Option<PeerRecord> }
+
+impl PeerStore {
+    pub fn open(path: impl Into<PathBuf>) -> std::io::Result<Self> {
+        let path = path.into();
+        let record = if path.exists() { Some(Self::read_record(&path)?) } else { None };
+        Ok(Self { path, record })
+    }
+    pub fn record(&self) -> Option<&PeerRecord> { self.record.as_ref() }
+    pub fn ephemeral() -> std::io::Result<Self> {
+        let path = std::env::temp_dir().join(format!("localscale-peer-{}-{}.json", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
+        Self::open(path)
+    }
+    pub fn configure(&mut self, record: PeerRecord) -> std::io::Result<()> {
+        self.write_record(&record)?; self.record = Some(record); Ok(())
+    }
+    pub fn set_approval(&mut self, approved: bool) -> std::io::Result<()> {
+        let Some(mut record) = self.record.clone() else { return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "peer is not configured")); };
+        record.approved = approved; record.revoked = !approved;
+        self.write_record(&record)?; self.record = Some(record); Ok(())
+    }
+    fn read_record(path: &Path) -> std::io::Result<PeerRecord> {
+        let body = std::fs::read_to_string(path)?;
+        let fields = parse_json_fields(&body).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid peer store"))?;
+        let role = fields.get("role").cloned().unwrap_or_default();
+        let node_id = fields.get("node_id").cloned().unwrap_or_default();
+        let endpoint = fields.get("endpoint").cloned().unwrap_or_default();
+        let invitation_secret = fields.get("invitation_secret").cloned().unwrap_or_default();
+        let approved = fields.get("approved").map(|v| v == "true").unwrap_or(false);
+        let revoked = fields.get("revoked").map(|v| v == "true").unwrap_or(true);
+        let host_node_id = fields.get("host_node_id").cloned().filter(|v| !v.is_empty());
+        if role.is_empty() || node_id.is_empty() || endpoint.is_empty() || invitation_secret.is_empty() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "incomplete peer store")); }
+        Ok(PeerRecord { role, node_id, host_node_id, endpoint, invitation_secret, approved, revoked })
+    }
+    fn write_record(&self, record: &PeerRecord) -> std::io::Result<()> {
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let tmp = self.path.with_extension("tmp");
+        let body = format!("{{\"role\":\"{}\",\"node_id\":\"{}\",\"host_node_id\":\"{}\",\"endpoint\":\"{}\",\"invitation_secret\":\"{}\",\"approved\":{},\"revoked\":{}}}", record.role, record.node_id, record.host_node_id.as_deref().unwrap_or(""), record.endpoint, record.invitation_secret, record.approved, record.revoked);
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(body.as_bytes())?; file.sync_all()?;
+        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?; }
+        std::fs::rename(&tmp, &self.path)?;
+        if let Ok(dir) = std::fs::File::open(parent) { let _ = dir.sync_all(); }
+        Ok(())
+    }
 }
 
 impl Default for AgentState {
@@ -68,6 +132,7 @@ impl Default for AgentState {
             service_state: Arc::new(Mutex::new("stopped".to_string())),
             peer: Arc::new(Mutex::new(PeerState { transport: "unavailable", ..PeerState::default() })),
             auth: None,
+            peer_store: PeerStore::ephemeral().ok().map(|s| Arc::new(Mutex::new(s))),
         }
     }
 }
@@ -81,7 +146,15 @@ pub fn serve_with_auth(listener: TcpListener, auth: Box<dyn AuthHandler>) -> std
 }
 
 fn serve_with_auth_handler(listener: TcpListener, auth: Option<SharedAuth>) -> std::io::Result<()> {
-    let state = AgentState { auth, ..AgentState::default() };
+    let peer_store = std::env::var_os("LOCALSCALE_PEER_STORE").map(PeerStore::open).transpose()?;
+    let state = AgentState { auth, peer_store: peer_store.map(|s| Arc::new(Mutex::new(s))), ..AgentState::default() };
+    if let Some(store) = &state.peer_store {
+        if let Some(record) = lock_recover(store).record().cloned() {
+            let mut peer = lock_recover(&state.peer);
+            peer.configured = true; peer.node_id = Some(record.node_id); peer.host_node_id = record.host_node_id; peer.endpoint = Some(record.endpoint);
+            peer.approved = record.approved; peer.revoked = record.revoked;
+        }
+    }
     let active = Arc::new(Mutex::new(0usize));
     for stream in listener.incoming() {
         let stream = match stream {
@@ -211,6 +284,8 @@ fn response_for_request_with_state(request: &str, state: &AgentState) -> String 
         ("GET", "/api/v1/status") => service_status(state),
         ("GET", "/api/v1/peer/status") => peer_status(state),
         ("POST", "/api/v1/peer/config") => set_peer_config(body, state),
+        ("POST", "/api/v1/peer/approve") => set_peer_approval(true, state),
+        ("POST", "/api/v1/peer/revoke") => set_peer_approval(false, state),
         ("POST", "/api/v1/mode") => set_mode(body, state, true),
         ("POST", "/api/v1/service/start") => set_service_state("running", state),
         ("POST", "/api/v1/service/stop") => set_service_state("stopped", state),
@@ -283,8 +358,8 @@ fn service_status(state: &AgentState) -> String {
 
 fn peer_status(state: &AgentState) -> String {
     let peer = lock_recover(&state.peer);
-    let json = format!(r#"{{"configured":{},"node_id":{},"host_node_id":{},"onion_endpoint":{},"transport":"{}","connected":false}}"#,
-        peer.configured, optional_json(&peer.node_id), optional_json(&peer.host_node_id), optional_json(&peer.endpoint), peer.transport);
+    let json = format!(r#"{{"configured":{},"node_id":{},"host_node_id":{},"onion_endpoint":{},"transport":"{}","connected":false,"approved":{},"revoked":{}}}"#,
+        peer.configured, optional_json(&peer.node_id), optional_json(&peer.host_node_id), optional_json(&peer.endpoint), peer.transport, peer.approved, peer.revoked);
     http_response("200 OK", "application/json", &json)
 }
 
@@ -322,10 +397,19 @@ fn set_peer_config(body: &str, state: &AgentState) -> String {
         _ => Err(()),
     };
     let Ok((node_id, host_node_id, endpoint)) = result else { return http_response("400 Bad Request", "application/json", r#"{"error":"invalid_peer_config"}"#) };
+    let Some(store) = &state.peer_store else { return http_response("503 Service Unavailable", "application/json", r#"{"error":"peer_store_unavailable"}"#) };
+    let record = PeerRecord { role: role.to_string(), node_id: node_id.clone(), host_node_id: host_node_id.clone(), endpoint: endpoint.clone(), invitation_secret: fields.get("invitation_secret").cloned().unwrap_or_default(), approved: false, revoked: false };
+    if lock_recover(store).configure(record).is_err() { return http_response("500 Internal Server Error", "application/json", r#"{"error":"peer_store_write_failed"}"#); }
     let mut peer = lock_recover(&state.peer);
-    peer.configured = true; peer.node_id = Some(node_id); peer.host_node_id = host_node_id; peer.endpoint = Some(endpoint); peer.transport = "unavailable";
+    peer.configured = true; peer.node_id = Some(node_id); peer.host_node_id = host_node_id; peer.endpoint = Some(endpoint); peer.transport = "unavailable"; peer.approved = false; peer.revoked = false;
     drop(peer);
     peer_status(state)
+}
+
+fn set_peer_approval(approved: bool, state: &AgentState) -> String {
+    let Some(store) = &state.peer_store else { return http_response("503 Service Unavailable", "application/json", r#"{"error":"peer_store_unavailable"}"#) };
+    if lock_recover(store).set_approval(approved).is_err() { return http_response("404 Not Found", "application/json", r#"{"error":"peer_not_configured"}"#); }
+    let mut peer = lock_recover(&state.peer); peer.approved = approved; peer.revoked = !approved; drop(peer); peer_status(state)
 }
 
 fn parse_json_fields(body: &str) -> Option<std::collections::HashMap<String, String>> {
@@ -335,7 +419,8 @@ fn parse_json_fields(body: &str) -> Option<std::collections::HashMap<String, Str
     for item in body.split(',') {
         let (key, value) = item.split_once(':')?;
         let key = key.trim().strip_prefix('"')?.strip_suffix('"')?;
-        let value = value.trim().strip_prefix('"')?.strip_suffix('"')?;
+        let value = value.trim();
+        let value = if let Some(value) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) { value } else if matches!(value, "true" | "false") { value } else { return None };
         if key.is_empty() || value.bytes().any(|byte| byte < 0x20 || byte == b'\\') { return None; }
         output.insert(key.to_string(), value.to_string());
     }
@@ -612,6 +697,33 @@ mod tests {
         let response = super::response_for_request(
             "POST /api/v1/mode HTTP/1.1\r\nHost: localhost\r\n\r\n{\"mode\":\"client\"}");
         assert!(response.starts_with("HTTP/1.1 400 Bad Request"), "{response}");
+    }
+
+    #[test]
+    fn peer_store_persists_approval_and_revocation_without_status_secret() {
+        let path = std::env::temp_dir().join(format!("localscale-peer-test-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut store = super::PeerStore::open(&path).unwrap();
+        store.configure(super::PeerRecord { role: "cliente".into(), node_id: "client-01".into(), host_node_id: Some("host-01".into()), endpoint: "abc.onion".into(), invitation_secret: "secret-value".into(), approved: false, revoked: false }).unwrap();
+        assert!(!super::PeerStore::open(&path).unwrap().record().unwrap().approved);
+        store.set_approval(true).unwrap();
+        let reloaded = super::PeerStore::open(&path).unwrap();
+        assert!(reloaded.record().unwrap().approved);
+        store.set_approval(false).unwrap();
+        let revoked = super::PeerStore::open(&path).unwrap();
+        assert!(revoked.record().unwrap().revoked);
+        let state = super::AgentState { peer_store: Some(std::sync::Arc::new(std::sync::Mutex::new(revoked))), ..super::AgentState::default() };
+        let status = super::response_for_request_with_state("GET /api/v1/peer/status HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n", &state);
+        assert!(!status.contains("secret-value"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn peer_store_rejects_malformed_startup_state() {
+        let path = std::env::temp_dir().join(format!("localscale-peer-bad-{}.json", std::process::id()));
+        std::fs::write(&path, "not-json").unwrap();
+        assert!(super::PeerStore::open(&path).is_err());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
