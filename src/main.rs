@@ -42,27 +42,34 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
 /// always written to curl's stdin and never appears in its argument list.
 struct CurlTransport;
 
+fn curl_args(request: &HttpRequest, timeout_seconds: &str) -> Vec<String> {
+    let mut args = vec![
+        "--silent".into(),
+        "--show-error".into(),
+        "--request".into(),
+        request.method.clone(),
+        "--connect-timeout".into(),
+        timeout_seconds.into(),
+        "--max-time".into(),
+        timeout_seconds.into(),
+        "--header".into(),
+        "content-type: application/x-www-form-urlencoded".into(),
+        "--write-out".into(),
+        "\n%{http_code}".into(),
+    ];
+    if request.method != "GET" && !request.body.is_empty() {
+        args.extend(["--data-binary".into(), "@-".into()]);
+    }
+    args.extend(["--url".into(), request.url.clone()]);
+    args
+}
+
 impl HttpTransport for CurlTransport {
     fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
         let timeout = request.timeout.min(Duration::from_secs(CURL_TIMEOUT_SECONDS));
         let timeout_seconds = timeout.as_secs_f64().max(0.001).to_string();
         let mut child = Command::new("curl")
-            .args([
-                "--silent",
-                "--show-error",
-                "--request",
-                request.method.as_str(),
-                "--connect-timeout",
-                timeout_seconds.as_str(),
-                "--max-time",
-                timeout_seconds.as_str(),
-                "--header",
-                "content-type: application/x-www-form-urlencoded",
-                "--write-out",
-                "\n%{http_code}",
-                "--url",
-                request.url.as_str(),
-            ])
+            .args(curl_args(&request, &timeout_seconds))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -250,6 +257,24 @@ mod tests {
     fn explicit_loopback_redirect_must_match_port() {
         assert!(!redirect_uri_matches_port("http://127.0.0.1:9999/auth/google/callback", 8765));
         assert!(redirect_uri_matches_port("https://login.example.test/callback", 8765));
+    }
+
+    #[test]
+    fn post_curl_arguments_read_body_from_stdin_without_exposing_it() {
+        let request = HttpRequest {
+            method: "POST".into(),
+            url: "https://oauth2.googleapis.com/token".into(),
+            body: "client_secret=do-not-put-this-in-argv".into(),
+            timeout: Duration::from_secs(5),
+        };
+        let args = curl_args(&request, "5");
+
+        assert!(args.windows(2).any(|pair| pair == ["--data-binary", "@-"]));
+        assert!(!args.iter().any(|arg| arg.contains(&request.body)));
+
+        let get = HttpRequest { method: "GET".into(), body: String::new(), ..request };
+        let get_args = curl_args(&get, "5");
+        assert!(!get_args.iter().any(|arg| arg == "--data-binary" || arg == "@-"));
     }
 
     #[test]
