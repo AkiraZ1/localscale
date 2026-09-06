@@ -213,7 +213,7 @@ pub fn render_torrc(data_dir: &Path, mode: &TorMode) -> Result<String, TorRuntim
 fn render_torrc_with_socks_port(data_dir: &Path, mode: &TorMode, socks_port: u16) -> Result<String, TorRuntimeError> {
     if socks_port == 0 { return Err(TorRuntimeError::InvalidConfig("SOCKS port must be non-zero".into())); }
     if data_dir.is_relative() { return Err(TorRuntimeError::InvalidConfig("data directory must be absolute".into())); }
-    let mut config = format!("DataDirectory {}\nSocksPort 127.0.0.1:{}\n", data_dir.display(), socks_port);
+    let mut config = format!("DataDirectory {}\nLog notice stderr\nSocksPort 127.0.0.1:{}\n", data_dir.display(), socks_port);
     match mode {
         TorMode::Host { service_port, upstream } => {
             validate_upstream(upstream)?;
