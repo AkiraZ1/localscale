@@ -378,15 +378,17 @@ mod tests {
     fn handoff_exchange_is_reachable_through_root_http_adapter() {
         let mut auth = auth_service();
         let app_callback = "http://127.0.0.1:43123/oauth/callback";
-        let start = super::response_for_request_with_auth(&format!("GET /oauth/google/start?app_callback={app_callback} HTTP/1.1\r\nHost: localhost\r\n\r\n"), &mut auth);
-        let state = start.lines().find(|line| line.starts_with("Location: ")).unwrap().split("state=").nth(1).unwrap();
-        let callback = super::response_for_request_with_auth(&format!("GET /oauth/google/callback?code=provider-code&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n"), &mut auth);
+        let flutter_state = "flutter-state-root";
+        let start = super::response_for_request_with_auth(&format!("GET /oauth/google/start?app_callback={app_callback}&state={flutter_state} HTTP/1.1\r\nHost: localhost\r\n\r\n"), &mut auth);
+        let server_state = start.lines().find(|line| line.starts_with("Location: ")).unwrap().split("state=").nth(1).unwrap();
+        assert_ne!(server_state, flutter_state);
+        let callback = super::response_for_request_with_auth(&format!("GET /oauth/google/callback?code=provider-code&state={server_state} HTTP/1.1\r\nHost: localhost\r\n\r\n"), &mut auth);
         let location = callback.lines().find(|line| line.starts_with("Location: ")).unwrap().strip_prefix("Location: ").unwrap();
         assert!(location.starts_with(app_callback));
         let query = location.split('?').nth(1).unwrap();
         let params: std::collections::HashMap<_, _> = query.split('&').filter_map(|pair| pair.split_once('=')).collect();
         let handoff = params.get("handoff").unwrap();
-        let exchange = format!("GET /auth/session/bridge?handoff={handoff}&callback={app_callback}&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let exchange = format!("GET /auth/session/bridge?handoff={handoff}&callback={app_callback}&state={flutter_state} HTTP/1.1\r\nHost: localhost\r\n\r\n");
         let response = super::response_for_request_with_auth(&exchange, &mut auth);
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(!response.contains("access-secret") && !response.contains("id-secret"));

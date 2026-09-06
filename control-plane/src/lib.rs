@@ -421,8 +421,9 @@ pub struct AuthResponse { pub status: u16, pub headers: Vec<(String, String)>, p
 impl AuthResponse { fn new(status: u16) -> Self { Self { status, ..Default::default() } } pub fn header(&self, name: &str) -> Option<&str> { self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()) } }
 
 #[derive(Debug, Clone)] struct Session { issuer: String, subject: String, expires_at: std::time::SystemTime, revoked: bool }
-#[derive(Debug, Clone)] struct Handoff { session_id: String, callback: String, state: String, expires_at: std::time::SystemTime }
-pub struct AuthService<P> { provider: P, transactions: google_oidc::PkceTransactionStore, sessions: HashMap<String, Session>, pending_callbacks: HashMap<String, String>, handoffs: HashMap<String, Handoff>, session_ttl: std::time::Duration }
+#[derive(Debug, Clone)] struct PendingCallback { callback: String, flutter_state: String }
+#[derive(Debug, Clone)] struct Handoff { session_id: String, callback: String, flutter_state: String, expires_at: std::time::SystemTime }
+pub struct AuthService<P> { provider: P, transactions: google_oidc::PkceTransactionStore, sessions: HashMap<String, Session>, pending_callbacks: HashMap<String, PendingCallback>, handoffs: HashMap<String, Handoff>, session_ttl: std::time::Duration }
 impl<P: AuthProvider> AuthService<P> {
     pub fn new(provider: P, session_ttl: std::time::Duration, _redirect_uri: &str) -> Self { Self { provider, transactions: google_oidc::PkceTransactionStore::new(), sessions: HashMap::new(), pending_callbacks: HashMap::new(), handoffs: HashMap::new(), session_ttl } }
     pub fn handle(&mut self, request: AuthRequest) -> AuthResponse { self.handle_at(request, std::time::SystemTime::now()) }
@@ -441,8 +442,10 @@ impl<P: AuthProvider> AuthService<P> {
     fn start(&mut self, request: &AuthRequest, now: std::time::SystemTime) -> AuthResponse {
         let callback = request.query.get("app_callback").filter(|u| valid_loopback_callback(u)).cloned();
         if request.query.contains_key("app_callback") && callback.is_none() { return AuthResponse::new(400); }
+        let flutter_state = request.query.get("state").filter(|state| !state.is_empty()).cloned();
+        if callback.is_some() && flutter_state.is_none() { return AuthResponse::new(400); }
         let tx = match self.transactions.begin_with_ttl(self.provider.transaction_ttl(), "/", now) { Ok(t) => t, Err(_) => return AuthResponse::new(500) };
-        if let Some(callback) = callback { self.pending_callbacks.insert(tx.state().to_owned(), callback); }
+        if let (Some(callback), Some(flutter_state)) = (callback, flutter_state) { self.pending_callbacks.insert(tx.state().to_owned(), PendingCallback { callback, flutter_state }); }
         match self.provider.authorization_url(&tx) { Ok(url) => AuthResponse { status: 302, headers: vec![("Location".into(), url)], body: String::new() }, Err(_) => AuthResponse::new(502) }
     }
     fn callback(&mut self, request: AuthRequest, now: std::time::SystemTime) -> AuthResponse {
@@ -450,40 +453,43 @@ impl<P: AuthProvider> AuthService<P> {
         let (Some(code), Some(state)) = (request.query.get("code"), request.query.get("state")) else { return AuthResponse::new(400) };
         if code.is_empty() || state.is_empty() { return AuthResponse::new(400); }
         let tx = match self.transactions.consume(state, now) { Ok(t) => t, Err(_) => return AuthResponse::new(400) };
-        let pending_callback = self.pending_callbacks.remove(state).filter(|callback| valid_loopback_callback(callback));
+        let pending_callback = self.pending_callbacks.remove(state).filter(|pending| valid_loopback_callback(&pending.callback));
         let token = match self.provider.exchange_code(&tx, code) {
             Ok(t) => t,
-            Err(_) => return Self::provider_failure(pending_callback, state, 502),
+            Err(_) => return Self::provider_failure(pending_callback, 502),
         };
         let now_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
         let identity = match self.provider.validate_id_token(&token.id_token, tx.nonce(), now_secs) {
             Ok(i) => i,
-            Err(_) => return Self::provider_failure(pending_callback, state, 401),
+            Err(_) => return Self::provider_failure(pending_callback, 401),
         };
         let sid = random_opaque();
         self.sessions.insert(sid.clone(), Session { issuer: identity.issuer, subject: identity.subject, expires_at: now + self.session_ttl, revoked: false });
         let location = pending_callback;
         let has_handoff = location.is_some();
-        let location = if let Some(location) = location {
+        let location = if let Some(pending) = location {
+            let callback = pending.callback;
+            let flutter_state = pending.flutter_state;
             let handoff = random_opaque();
-            self.handoffs.insert(handoff.clone(), Handoff { session_id: sid.clone(), callback: location.clone(), state: state.to_owned(), expires_at: now + self.session_ttl });
-            let separator = if location.contains('?') { '&' } else { '?' };
+            self.handoffs.insert(handoff.clone(), Handoff { session_id: sid.clone(), callback: callback.clone(), flutter_state: flutter_state.clone(), expires_at: now + self.session_ttl });
+            let separator = if callback.contains('?') { '&' } else { '?' };
             let encoded_handoff = form_urlencoded::byte_serialize(handoff.as_bytes()).collect::<String>();
-            let encoded_state = form_urlencoded::byte_serialize(state.as_bytes()).collect::<String>();
-            format!("{location}{separator}handoff={encoded_handoff}&state={encoded_state}")
+            let encoded_state = form_urlencoded::byte_serialize(flutter_state.as_bytes()).collect::<String>();
+            format!("{callback}{separator}handoff={encoded_handoff}&state={encoded_state}")
         } else { "/".to_owned() };
         let headers = if has_handoff { Vec::new() } else { vec![("Set-Cookie".into(), format!("localscale_session={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict", sid, self.session_ttl.as_secs()))] };
         AuthResponse { status: 303, headers: { let mut h = headers; h.insert(0, ("Location".into(), location)); h }, body: String::new() }
     }
-    fn provider_failure(callback: Option<String>, state: &str, status: u16) -> AuthResponse {
-        let Some(callback) = callback else { return AuthResponse::new(status); };
-        let encoded_state = form_urlencoded::byte_serialize(state.as_bytes()).collect::<String>();
-        AuthResponse { status: 303, headers: vec![("Location".into(), format!("{callback}?error=authentication_failed&state={encoded_state}"))], body: String::new() }
+    fn provider_failure(pending: Option<PendingCallback>, status: u16) -> AuthResponse {
+        let Some(pending) = pending else { return AuthResponse::new(status); };
+        let separator = if pending.callback.contains('?') { '&' } else { '?' };
+        let encoded_state = form_urlencoded::byte_serialize(pending.flutter_state.as_bytes()).collect::<String>();
+        AuthResponse { status: 303, headers: vec![("Location".into(), format!("{}{separator}error=authentication_failed&state={encoded_state}", pending.callback))], body: String::new() }
     }
     fn bridge(&mut self, request: &AuthRequest, now: std::time::SystemTime) -> AuthResponse {
-        let (Some(token), Some(callback), Some(state)) = (request.query.get("handoff"), request.query.get("callback"), request.query.get("state")) else { return AuthResponse::new(400) };
+        let (Some(token), Some(callback), Some(flutter_state)) = (request.query.get("handoff"), request.query.get("callback"), request.query.get("state")) else { return AuthResponse::new(400) };
         let Some(handoff) = self.handoffs.get(token).cloned() else { return AuthResponse::new(401) };
-        if handoff.expires_at <= now || handoff.callback != *callback || handoff.state != *state || !valid_loopback_callback(callback) { return AuthResponse::new(401); }
+        if handoff.expires_at <= now || handoff.callback != *callback || handoff.flutter_state != *flutter_state || !valid_loopback_callback(callback) { return AuthResponse::new(401); }
         let handoff = self.handoffs.remove(token).expect("handoff checked above");
         let sid = handoff.session_id;
         let Some(session) = self.sessions.get(&sid).filter(|s| s.expires_at > now && !s.revoked) else { return AuthResponse::new(401) };
@@ -553,16 +559,18 @@ mod phase3_red_tests {
     fn assert_provider_failure_redirects(fail_exchange: bool, fail_validation: bool) {
         let mut service = failing_service(fail_exchange, fail_validation);
         let callback = "http://127.0.0.1:43126/oauth/callback";
-        let start = service.handle_at(AuthRequest::get("/oauth/google/start").query("app_callback", callback), now());
-        let state = start.header("Location").unwrap().split("state=").nth(1).unwrap().to_owned();
+        let flutter_state = "flutter-state-1";
+        let start = service.handle_at(AuthRequest::get("/oauth/google/start").query("app_callback", callback).query("state", flutter_state), now());
+        let server_state = start.header("Location").unwrap().split("state=").nth(1).unwrap().to_owned();
+        assert_ne!(server_state, flutter_state);
         let sensitive_code = "provider-code-secret";
-        let response = service.handle_at(AuthRequest::get("/oauth/google/callback").query("code", sensitive_code).query("state", &state), now());
+        let response = service.handle_at(AuthRequest::get("/oauth/google/callback").query("code", sensitive_code).query("state", &server_state), now());
         assert_eq!(response.status, 303);
-        assert_eq!(response.header("Location").unwrap(), format!("{callback}?error=authentication_failed&state={state}"));
+        assert_eq!(response.header("Location").unwrap(), format!("{callback}?error=authentication_failed&state={flutter_state}"));
         assert!(response.body.is_empty());
         let rendered = format!("{:?}{:?}{:?}", response.status, response.headers, response.body);
         assert!(!rendered.contains(sensitive_code) && !rendered.contains("access-secret") && !rendered.contains("id-secret"));
-        assert_eq!(service.handle_at(AuthRequest::get("/oauth/google/callback").query("code", sensitive_code).query("state", &state), now()).status, 400);
+        assert_eq!(service.handle_at(AuthRequest::get("/oauth/google/callback").query("code", sensitive_code).query("state", &server_state), now()).status, 400);
     }
 
     #[test]
@@ -594,6 +602,13 @@ mod phase3_red_tests {
         let response = service.handle_at(AuthRequest::get("/oauth/google/start"), now());
         assert_eq!(response.status, 302);
         assert!(response.header("Location").unwrap().starts_with("https://accounts.google.com/auth?state="));
+    }
+
+    #[test]
+    fn app_handoff_requires_flutter_state() {
+        let mut service = service();
+        assert_eq!(service.handle_at(AuthRequest::get("/oauth/google/start").query("app_callback", "http://127.0.0.1:43126/oauth/callback"), now()).status, 400);
+        assert_eq!(service.handle_at(AuthRequest::get("/oauth/google/start").query("app_callback", "http://127.0.0.1:43126/oauth/callback").query("state", ""), now()).status, 400);
     }
 
     #[test]
@@ -652,36 +667,43 @@ mod phase3_red_tests {
     fn dynamic_loopback_handoff_contract_is_bound_and_token_free() {
         let mut service = service();
         let callback = "http://127.0.0.1:43123/oauth/callback";
-        let start = service.handle_at(AuthRequest::get("/oauth/google/start").query("app_callback", callback), now());
-        let state = start.header("Location").unwrap().split("state=").nth(1).unwrap().to_owned();
-        let login = service.handle_at(AuthRequest::get("/oauth/google/callback").query("code", "provider-code").query("state", &state), now());
+        let flutter_state = "flutter-state-2";
+        let start = service.handle_at(AuthRequest::get("/oauth/google/start").query("app_callback", callback).query("state", flutter_state), now());
+        let server_state = start.header("Location").unwrap().split("state=").nth(1).unwrap().to_owned();
+        assert_ne!(server_state, flutter_state);
+        assert_eq!(service.handle_at(AuthRequest::get("/oauth/google/callback").query("code", "provider-code").query("state", flutter_state), now()).status, 400);
+        let login = service.handle_at(AuthRequest::get("/oauth/google/callback").query("code", "provider-code").query("state", &server_state), now());
         assert_eq!(login.status, 303);
         let location = login.header("Location").unwrap();
         assert!(location.starts_with(callback));
         assert!(location.contains("handoff=") && location.contains("state="));
+        assert!(location.contains(&format!("state={flutter_state}")));
+        assert!(!location.contains(&format!("state={server_state}")));
         assert!(!location.contains("provider-code") && !location.contains("access-secret") && !location.contains("id-secret"));
         assert!(login.header("Set-Cookie").is_none());
         let query = location.split('?').nth(1).unwrap();
         let params: std::collections::HashMap<_, _> = query.split('&').filter_map(|pair| pair.split_once('=')).collect();
         let handoff = params.get("handoff").unwrap().to_string();
-        let exchange = AuthRequest::get("/auth/session/bridge").query("handoff", &handoff).query("callback", callback).query("state", &state);
+        let exchange = AuthRequest::get("/auth/session/bridge").query("handoff", &handoff).query("callback", callback).query("state", flutter_state);
         let response = service.handle_at(exchange, now());
         assert_eq!(response.status, 200);
         assert!(!response.body.contains("access-secret") && !response.body.contains("id-secret"));
-        assert_eq!(service.handle_at(AuthRequest::get("/auth/session/bridge").query("handoff", &handoff).query("callback", callback).query("state", &state), now()).status, 401);
+        assert_eq!(service.handle_at(AuthRequest::get("/auth/session/bridge").query("handoff", &handoff).query("callback", callback).query("state", flutter_state), now()).status, 401);
     }
 
     #[test]
     fn handoff_rejects_wrong_callback_and_expiry() {
         let mut service = service();
         let callback = "http://127.0.0.1:43124/oauth/callback";
-        let start = service.handle_at(AuthRequest::get("/oauth/google/start").query("app_callback", callback), now());
-        let state = start.header("Location").unwrap().split("state=").nth(1).unwrap().to_owned();
-        let login = service.handle_at(AuthRequest::get("/oauth/google/callback").query("code", "c").query("state", &state), now());
+        let flutter_state = "flutter-state-3";
+        let start = service.handle_at(AuthRequest::get("/oauth/google/start").query("app_callback", callback).query("state", flutter_state), now());
+        let server_state = start.header("Location").unwrap().split("state=").nth(1).unwrap().to_owned();
+        let login = service.handle_at(AuthRequest::get("/oauth/google/callback").query("code", "c").query("state", &server_state), now());
         let location = login.header("Location").unwrap();
         let handoff = location.split("handoff=").nth(1).unwrap().split('&').next().unwrap();
-        assert_eq!(service.handle_at(AuthRequest::get("/auth/session/bridge").query("handoff", handoff).query("callback", "http://127.0.0.1:43125/oauth/callback").query("state", &state), now()).status, 401);
-        assert_eq!(service.handle_at(AuthRequest::get("/auth/session/bridge").query("handoff", handoff).query("callback", callback).query("state", &state), now() + Duration::from_secs(61)).status, 401);
+        assert_eq!(service.handle_at(AuthRequest::get("/auth/session/bridge").query("handoff", handoff).query("callback", "http://127.0.0.1:43125/oauth/callback").query("state", flutter_state), now()).status, 401);
+        assert_eq!(service.handle_at(AuthRequest::get("/auth/session/bridge").query("handoff", handoff).query("callback", callback).query("state", "wrong-flutter-state"), now()).status, 401);
+        assert_eq!(service.handle_at(AuthRequest::get("/auth/session/bridge").query("handoff", handoff).query("callback", callback).query("state", flutter_state), now() + Duration::from_secs(61)).status, 401);
     }
 }
 
