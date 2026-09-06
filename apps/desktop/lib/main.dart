@@ -6,6 +6,7 @@ import 'features/auth/login_controller.dart';
 import 'local_agent_api.dart';
 import 'local_agent_transport.dart';
 
+// Native agents keep their installed ports: macOS 18765, other platforms 8765.
 final int localAgentPort =
     defaultTargetPlatform == TargetPlatform.macOS ? 18765 : 8765;
 const String googleClientId = String.fromEnvironment(
