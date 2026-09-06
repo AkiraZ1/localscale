@@ -48,6 +48,24 @@ fn nonce_reuse_is_rejected() {
 }
 
 #[test]
+fn nonce_reuse_remains_rejected_after_more_than_4096_seals() {
+    let key = CryptoKey::generate();
+    let first_nonce = [0u8; 24];
+
+    HandshakeEnvelope::seal_with_nonce(&key, Role::Host, "host-1", first_nonce, b"first").unwrap();
+    for counter in 1u64..=4096 {
+        let mut nonce = [0u8; 24];
+        nonce[..8].copy_from_slice(&counter.to_be_bytes());
+        HandshakeEnvelope::seal_with_nonce(&key, Role::Host, "host-1", nonce, b"payload").unwrap();
+    }
+
+    assert!(matches!(
+        HandshakeEnvelope::seal_with_nonce(&key, Role::Host, "host-1", first_nonce, b"replayed"),
+        Err(CryptoError::NonceReuse)
+    ));
+}
+
+#[test]
 fn raw_key_reload_rejects_unsafe_sealing_after_restart() {
     let bytes = [7u8; 32];
     let nonce = [4u8; 24];

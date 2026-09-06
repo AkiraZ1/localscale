@@ -241,7 +241,7 @@ impl ReplayGuard {
 
 use chacha20poly1305::{aead::{Aead, KeyInit}, Key, XChaCha20Poly1305, XNonce};
 use rand::{rngs::OsRng, RngCore};
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::sync::Mutex;
 use zeroize::Zeroizing;
 
@@ -265,7 +265,9 @@ impl std::error::Error for CryptoError {}
 pub struct CryptoKey {
     secret: Zeroizing<[u8; KEY_LEN]>,
     sealing_allowed: bool,
-    used_nonces: Mutex<(HashSet<[u8; NONCE_LEN]>, VecDeque<[u8; NONCE_LEN]>)>,
+    // This set is intentionally monotonic for the lifetime of the key. Evicting
+    // entries would allow an old nonce to be reused under the same key.
+    used_nonces: Mutex<HashSet<[u8; NONCE_LEN]>>,
 }
 impl CryptoKey {
     pub fn generate() -> Self {
@@ -283,16 +285,11 @@ impl CryptoKey {
     }
     pub fn to_bytes(&self) -> [u8; KEY_LEN] { *self.secret }
     fn from_secret(secret: [u8; KEY_LEN], sealing_allowed: bool) -> Self {
-        Self { secret: Zeroizing::new(secret), sealing_allowed, used_nonces: Mutex::new((HashSet::new(), VecDeque::new())) }
+        Self { secret: Zeroizing::new(secret), sealing_allowed, used_nonces: Mutex::new(HashSet::new()) }
     }
     fn record_nonce(&self, nonce: [u8; NONCE_LEN]) -> Result<(), CryptoError> {
-        const MAX_TRACKED_NONCES: usize = 4096;
         let mut tracked = self.used_nonces.lock().map_err(|_| CryptoError::NonceReuse)?;
-        if !tracked.0.insert(nonce) { return Err(CryptoError::NonceReuse); }
-        tracked.1.push_back(nonce);
-        if tracked.1.len() > MAX_TRACKED_NONCES {
-            if let Some(old) = tracked.1.pop_front() { tracked.0.remove(&old); }
-        }
+        if !tracked.insert(nonce) { return Err(CryptoError::NonceReuse); }
         Ok(())
     }
     fn cipher(&self) -> XChaCha20Poly1305 { XChaCha20Poly1305::new(Key::from_slice(&self.secret[..])) }
