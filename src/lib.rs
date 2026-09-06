@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use localscale_control_plane::{AuthRequest, AuthResponse};
+use localscale_agent_protocol::{ClientConfig, HostInvitation};
 
 pub trait AuthHandler: Send {
     fn handle(&mut self, request: AuthRequest) -> AuthResponse;
@@ -45,7 +46,17 @@ pub fn configuration_html() -> &'static str {
 struct AgentState {
     mode: Arc<Mutex<String>>,
     service_state: Arc<Mutex<String>>,
+    peer: Arc<Mutex<PeerState>>,
     auth: Option<SharedAuth>,
+}
+
+#[derive(Clone, Default)]
+struct PeerState {
+    configured: bool,
+    node_id: Option<String>,
+    host_node_id: Option<String>,
+    endpoint: Option<String>,
+    transport: &'static str,
 }
 
 impl Default for AgentState {
@@ -53,6 +64,7 @@ impl Default for AgentState {
         Self {
             mode: Arc::new(Mutex::new("cliente".to_string())),
             service_state: Arc::new(Mutex::new("stopped".to_string())),
+            peer: Arc::new(Mutex::new(PeerState { transport: "unavailable", ..PeerState::default() })),
             auth: None,
         }
     }
@@ -195,6 +207,8 @@ fn response_for_request_with_state(request: &str, state: &AgentState) -> String 
     }
     match (method, path) {
         ("GET", "/api/v1/status") => service_status(state),
+        ("GET", "/api/v1/peer/status") => peer_status(state),
+        ("POST", "/api/v1/peer/config") => set_peer_config(body, state),
         ("POST", "/api/v1/mode") => set_mode(body, state, true),
         ("POST", "/api/v1/service/start") => set_service_state("running", state),
         ("POST", "/api/v1/service/stop") => set_service_state("stopped", state),
@@ -209,7 +223,7 @@ fn response_for_request_with_state(request: &str, state: &AgentState) -> String 
         }
         ("POST", "/mode") => set_mode(body, state, false),
         ("GET", "/onion") => http_response("200 OK", "application/json", r#"{"enabled":false,"address":null}"#),
-        ("GET", "/diagnostics") => http_response("200 OK", "application/json", r#"{"service":"localscale","loopback":true,"external_network":false}"#),
+        ("GET", "/diagnostics") | ("GET", "/api/v1/diagnostics") => diagnostics_status(state),
         _ => http_response("404 Not Found", "text/plain; charset=utf-8", "not found"),
     }
 }
@@ -259,8 +273,71 @@ fn auth_http_response(response: AuthResponse) -> String {
 fn service_status(state: &AgentState) -> String {
     let mode = lock_recover(&state.mode).clone();
     let service_state = lock_recover(&state.service_state).clone();
+    let peer = lock_recover(&state.peer);
     http_response("200 OK", "application/json", &format!(
-        r#"{{"mode":"{mode}","state":"{service_state}","onion_endpoint":null}}"#))
+        r#"{{"mode":"{mode}","state":"{service_state}","onion_endpoint":null,"peer_configured":{},"peer_transport":"{}"}}"#,
+        peer.configured, peer.transport))
+}
+
+fn peer_status(state: &AgentState) -> String {
+    let peer = lock_recover(&state.peer);
+    let json = format!(r#"{{"configured":{},"node_id":{},"host_node_id":{},"onion_endpoint":{},"transport":"{}","connected":false}}"#,
+        peer.configured, optional_json(&peer.node_id), optional_json(&peer.host_node_id), optional_json(&peer.endpoint), peer.transport);
+    http_response("200 OK", "application/json", &json)
+}
+
+fn diagnostics_status(state: &AgentState) -> String {
+    let peer = lock_recover(&state.peer);
+    let json = format!(r#"{{"service":"localscale","loopback":true,"external_network":false,"peer_configured":{},"peer_transport":"{}","peer_connected":false}}"#, peer.configured, peer.transport);
+    http_response("200 OK", "application/json", &json)
+}
+
+fn optional_json(value: &Option<String>) -> String {
+    value.as_ref().map(|value| format!("\"{}\"", value)).unwrap_or_else(|| "null".into())
+}
+
+fn set_peer_config(body: &str, state: &AgentState) -> String {
+    let fields = match parse_json_fields(body) { Some(fields) => fields, None => return http_response("400 Bad Request", "application/json", r#"{"error":"invalid_peer_config"}"#) };
+    let role = fields.get("role").map(String::as_str).unwrap_or("");
+    let result: Result<(String, Option<String>, String), ()> = match role {
+        "host" => HostInvitation::new(
+            fields.get("node_id").map(String::as_str).unwrap_or(""),
+            fields.get("onion_endpoint").map(String::as_str).unwrap_or(""),
+            fields.get("invitation_secret").map(String::as_str).unwrap_or(""),
+        ).map(|invitation| (invitation.host_node_id().to_string(), None, invitation.public_endpoint().to_string())).map_err(|_| ()),
+        "cliente" => {
+            let invitation = HostInvitation::new(
+                fields.get("host_node_id").map(String::as_str).unwrap_or(""),
+                fields.get("onion_endpoint").map(String::as_str).unwrap_or(""),
+                fields.get("invitation_secret").map(String::as_str).unwrap_or(""),
+            ).map_err(|_| ());
+            match invitation {
+                Ok(invitation) => ClientConfig::from_invitation(&invitation, fields.get("node_id").map(String::as_str).unwrap_or(""))
+                    .map(|config| (fields.get("node_id").cloned().unwrap_or_default(), Some(config.host_node_id().to_string()), config.public_endpoint().to_string())).map_err(|_| ()),
+                Err(error) => Err(error),
+            }
+        }
+        _ => Err(()),
+    };
+    let Ok((node_id, host_node_id, endpoint)) = result else { return http_response("400 Bad Request", "application/json", r#"{"error":"invalid_peer_config"}"#) };
+    let mut peer = lock_recover(&state.peer);
+    peer.configured = true; peer.node_id = Some(node_id); peer.host_node_id = host_node_id; peer.endpoint = Some(endpoint); peer.transport = "unavailable";
+    drop(peer);
+    peer_status(state)
+}
+
+fn parse_json_fields(body: &str) -> Option<std::collections::HashMap<String, String>> {
+    let mut output = std::collections::HashMap::new();
+    let body = body.trim().strip_prefix('{')?.strip_suffix('}')?.trim();
+    if body.is_empty() { return Some(output); }
+    for item in body.split(',') {
+        let (key, value) = item.split_once(':')?;
+        let key = key.trim().strip_prefix('"')?.strip_suffix('"')?;
+        let value = value.trim().strip_prefix('"')?.strip_suffix('"')?;
+        if key.is_empty() || value.bytes().any(|byte| byte < 0x20 || byte == b'\\') { return None; }
+        output.insert(key.to_string(), value.to_string());
+    }
+    Some(output)
 }
 
 fn set_service_state(service_state: &str, state: &AgentState) -> String {
@@ -474,6 +551,32 @@ mod tests {
             "GET /api/v1/status HTTP/1.1\r\nHost: localhost\r\n\r\n", &state);
         assert!(status.contains(r#""mode":"host""#));
         assert!(status.contains(r#""state":"running""#));
+    }
+
+    #[test]
+    fn peer_config_routes_store_safe_host_and_cliente_contract_without_secret_leakage() {
+        let hostname = "abcdefghijklmnopqrstuvwxabcdefghijklmnopqrstuvwxyz234567.onion";
+        let secret = "secret-token-123456";
+        let state = super::AgentState::default();
+        let host = super::response_for_request_with_state(&format!(
+            "POST /api/v1/peer/config HTTP/1.1\r\nHost: localhost\r\n\r\n{{\"role\":\"host\",\"node_id\":\"host-01\",\"onion_endpoint\":\"{hostname}\",\"invitation_secret\":\"{secret}\"}}"), &state);
+        assert!(host.starts_with("HTTP/1.1 200 OK"), "{host}");
+        assert!(host.contains("\"transport\":\"unavailable\""));
+        assert!(!host.contains(secret));
+        let status = super::response_for_request_with_state("GET /api/v1/peer/status HTTP/1.1\r\nHost: localhost\r\n\r\n", &state);
+        assert!(status.contains(hostname));
+        assert!(!status.contains(secret));
+        let cliente = super::response_for_request_with_state(&format!(
+            "POST /api/v1/peer/config HTTP/1.1\r\nHost: localhost\r\n\r\n{{\"role\":\"cliente\",\"node_id\":\"client-01\",\"host_node_id\":\"host-01\",\"onion_endpoint\":\"{hostname}\",\"invitation_secret\":\"{secret}\"}}"), &state);
+        assert!(cliente.starts_with("HTTP/1.1 200 OK"), "{cliente}");
+    }
+
+    #[test]
+    fn peer_config_rejects_invalid_onion_and_non_loopback_admin_requests() {
+        let invalid = super::response_for_request("POST /api/v1/peer/config HTTP/1.1\r\nHost: localhost\r\n\r\n{\"role\":\"cliente\",\"node_id\":\"client-01\",\"host_node_id\":\"host-01\",\"onion_endpoint\":\"/var/lib/tor/hostname\",\"invitation_secret\":\"secret-token-123456\"}");
+        assert!(invalid.starts_with("HTTP/1.1 400 Bad Request"), "{invalid}");
+        let remote = super::response_for_request("GET /api/v1/peer/status HTTP/1.1\r\nHost: example.test\r\n\r\n");
+        assert!(remote.starts_with("HTTP/1.1 403 Forbidden"), "{remote}");
     }
 
     #[test]

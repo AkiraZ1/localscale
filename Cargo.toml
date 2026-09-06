@@ -3,8 +3,12 @@ name = "localscale-agent"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+members = [".", "agent/protocol", "control-plane"]
+
 [dependencies]
 localscale-control-plane = { path = "control-plane" }
+localscale-agent-protocol = { path = "agent/protocol" }
 
 [lib]
 name = "localscale_agent"

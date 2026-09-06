@@ -11,6 +11,85 @@ pub const VERSION: u8 = 1;
 pub const REPLAY_WINDOW_SECS: u64 = 300;
 pub const MIN_MTU: u16 = 576;
 pub const MAX_MTU: u16 = 9_000;
+pub const MAX_FRAME_SIZE: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PeerRole { Host, Cliente }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameError { Incomplete, TooLarge, TrailingBytes, LengthOverflow }
+impl fmt::Display for FrameError { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{self:?}") } }
+impl std::error::Error for FrameError {}
+
+pub fn encode_frame(payload: &[u8]) -> Result<Vec<u8>, FrameError> {
+    if payload.len() > MAX_FRAME_SIZE { return Err(FrameError::TooLarge); }
+    let len = u32::try_from(payload.len()).map_err(|_| FrameError::LengthOverflow)?;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+pub fn decode_frame(frame: &[u8]) -> Result<&[u8], FrameError> {
+    if frame.len() < 4 { return Err(FrameError::Incomplete); }
+    let len = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
+    if len > MAX_FRAME_SIZE { return Err(FrameError::TooLarge); }
+    let end = 4usize.checked_add(len).ok_or(FrameError::LengthOverflow)?;
+    if frame.len() < end { return Err(FrameError::Incomplete); }
+    if frame.len() != end { return Err(FrameError::TrailingBytes); }
+    Ok(&frame[4..end])
+}
+
+fn valid_onion_hostname(value: &str) -> bool {
+    let Some(label) = value.strip_suffix(".onion") else { return false; };
+    label.len() == 56 && label.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7'))
+}
+
+fn valid_invitation_secret(value: &str) -> bool {
+    (16..=128).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostInvitation { host_node_id: String, public_endpoint: String, invitation_secret: zeroize::Zeroizing<String> }
+impl HostInvitation {
+    pub fn new(host_node_id: &str, public_endpoint: &str, invitation_secret: &str) -> Result<Self, ValidationError> {
+        if !valid_node_id(host_node_id) { return Err(ValidationError::InvalidNodeId); }
+        if !valid_onion_hostname(public_endpoint) || !valid_invitation_secret(invitation_secret) { return Err(ValidationError::InvalidNonce); }
+        Ok(Self { host_node_id: host_node_id.into(), public_endpoint: public_endpoint.into(), invitation_secret: zeroize::Zeroizing::new(invitation_secret.into()) })
+    }
+    pub fn host_node_id(&self) -> &str { &self.host_node_id }
+    pub fn public_endpoint(&self) -> &str { &self.public_endpoint }
+    pub(crate) fn secret(&self) -> &str { self.invitation_secret.as_str() }
+    pub fn diagnostics(&self) -> String { format!("configured host={} endpoint={} transport=unavailable", self.host_node_id, self.public_endpoint) }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientConfig { client_node_id: String, host_node_id: String, public_endpoint: String, invitation_secret: zeroize::Zeroizing<String> }
+impl ClientConfig {
+    pub fn from_invitation(invitation: &HostInvitation, client_node_id: &str) -> Result<Self, ValidationError> {
+        Self::client(client_node_id, invitation.host_node_id(), invitation.public_endpoint(), invitation.secret())
+    }
+    pub fn client(client_node_id: &str, host_node_id: &str, public_endpoint: &str, invitation_secret: &str) -> Result<Self, ValidationError> {
+        if !valid_node_id(client_node_id) || !valid_node_id(host_node_id) { return Err(ValidationError::InvalidNodeId); }
+        if !valid_onion_hostname(public_endpoint) || !valid_invitation_secret(invitation_secret) { return Err(ValidationError::InvalidNonce); }
+        Ok(Self { client_node_id: client_node_id.into(), host_node_id: host_node_id.into(), public_endpoint: public_endpoint.into(), invitation_secret: zeroize::Zeroizing::new(invitation_secret.into()) })
+    }
+    pub fn role(&self) -> PeerRole { PeerRole::Cliente }
+    pub fn host_node_id(&self) -> &str { &self.host_node_id }
+    pub fn public_endpoint(&self) -> &str { &self.public_endpoint }
+    pub fn diagnostics(&self) -> String { format!("configured client={} host={} endpoint={} transport=unavailable", self.client_node_id, self.host_node_id, self.public_endpoint) }
+}
+
+pub struct PeerConfig;
+impl PeerConfig {
+    pub fn client(client_node_id: &str, host_node_id: &str, public_endpoint: &str, invitation_secret: &str) -> Result<ClientConfig, ValidationError> {
+        ClientConfig::client(client_node_id, host_node_id, public_endpoint, invitation_secret)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionNonce([u8; 32]);
+impl SessionNonce { pub fn from_bytes(value: [u8; 32]) -> Self { Self(value) } }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role { Host, Cliente }
@@ -130,7 +209,10 @@ fn check_window(timestamp: u64, now: u64) -> Result<(), ValidationError> {
 
 /// Stateful replay protection to be owned by the connection/session layer.
 #[derive(Debug, Default)]
-pub struct ReplayGuard { seen: HashMap<String, u64> }
+pub struct ReplayGuard {
+    seen: HashMap<String, u64>,
+    sessions: HashMap<SessionNonce, (String, PeerRole)>,
+}
 impl ReplayGuard {
     pub fn accept(&mut self, message: &Message, now: u64, role: Role) -> Result<(), ValidationError> {
         validate_message(message, now, role)?;
@@ -143,6 +225,16 @@ impl ReplayGuard {
             if self.seen.contains_key(nonce) { return Err(ValidationError::ReplayDetected); }
             self.seen.insert(nonce.clone(), now);
         }
+        Ok(())
+    }
+
+    pub fn accept_session(&mut self, nonce: &SessionNonce, peer_node_id: &str, role: PeerRole) -> Result<(), ValidationError> {
+        if !valid_node_id(peer_node_id) { return Err(ValidationError::InvalidNodeId); }
+        if let Some((existing_peer, existing_role)) = self.sessions.get(nonce) {
+            if existing_peer != peer_node_id || *existing_role != role { return Err(ValidationError::WrongRole); }
+            return Err(ValidationError::ReplayDetected);
+        }
+        self.sessions.insert(*nonce, (peer_node_id.to_string(), role));
         Ok(())
     }
 }
