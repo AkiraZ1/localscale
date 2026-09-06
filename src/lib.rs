@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 use localscale_control_plane::{AuthRequest, AuthResponse};
 use localscale_agent_protocol::{ClientConfig, HostInvitation};
 
+pub mod tor_runtime;
+
 pub trait AuthHandler: Send {
     fn handle(&mut self, request: AuthRequest) -> AuthResponse;
 }

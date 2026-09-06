@@ -1,9 +1,26 @@
 # LocalScale Onion connectivity
 
 LocalScale can expose a Host through a Tor v3 onion service, or connect as a
-Client to a Host's published `.onion` address. These deployment artifacts are
-configuration contracts only. They do **not** enable, reload, or alter the
-operating system's Tor service.
+Client to a Host's published `.onion` address. The LocalScale runtime uses a Tor executable bundled with the installed agent
+or desktop application. Runtime code never searches `PATH` and never invokes
+system `tor`, `torsocks`, or `arti`; a missing bundled binary is a hard error.
+These deployment artifacts are configuration contracts only and do **not**
+enable, reload, or alter the operating system's Tor service.
+
+## Bundled runtime locations
+
+The packaging step must place the real, platform-signed Tor binary at these
+exact locations relative to the installed application bundle (the repository
+does not contain or fake these binary artifacts):
+
+- Linux: `<bundle>/tor/tor`
+- macOS: `<bundle>/Contents/Resources/tor/tor` (the runtime also accepts
+  `<bundle>/tor/tor` for non-`.app` distributions)
+- Windows: `<bundle>/tor/tor.exe`
+
+**Binary artifacts are currently missing from this source repository.** Release
+packaging must supply and verify the appropriate Tor artifact before shipping;
+development and tests must not fall back to a system installation.
 
 ## Files
 
