@@ -90,6 +90,35 @@ def main():
         valid_mac = run_check("macos-x86_64", mac_bundle)
         assert valid_mac.returncode == 0, valid_mac.stderr
 
+    def run_check(platform, path):
+        return subprocess.run([str(check), platform, str(path)], capture_output=True, text=True)
+
+    def make_executable(path, data):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        path.chmod(0o755)
+
+    # Unix validation must reject a same-path executable in the wrong format.
+    linux_bundle = temp / "linux-bundle"
+    linux_tor = linux_bundle / "tor" / "tor"
+    make_executable(linux_tor, b"not an ELF executable")
+    wrong_linux_format = run_check("linux-x86_64", linux_bundle)
+    assert wrong_linux_format.returncode != 0 and "ELF" in wrong_linux_format.stderr
+    make_executable(linux_tor, b"\x7fELF" + b"\0" * 128)
+    valid_linux = run_check("linux-x86_64", linux_bundle)
+    assert valid_linux.returncode == 0, valid_linux.stderr
+
+    mac_bundle = temp / "mac-bundle"
+    mac_tor = mac_bundle / "Contents" / "Resources" / "tor" / "tor"
+    make_executable(mac_tor, b"not a Mach-O executable")
+    wrong_mac_format = run_check("macos-x86_64", mac_bundle)
+    assert wrong_mac_format.returncode != 0 and "Mach-O" in wrong_mac_format.stderr
+    # Accept the native 64-bit little-endian header and universal/fat headers.
+    for magic in (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
+        make_executable(mac_tor, magic + b"\0" * 128)
+        valid_mac = run_check("macos-x86_64", mac_bundle)
+        assert valid_mac.returncode == 0, valid_mac.stderr
+
     print("tor-runtime static and fixture tests: ok")
 
 if __name__ == "__main__":

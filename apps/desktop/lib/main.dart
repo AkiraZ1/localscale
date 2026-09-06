@@ -14,8 +14,7 @@ const String googleClientId = String.fromEnvironment(
 );
 
 void main() {
-  final api = LocalAgentApiClient(
-      kIsWeb ? FakeLocalAgentTransport() : defaultLocalAgentTransport());
+  final api = LocalAgentApiClient(defaultLocalAgentTransport());
   final auth = LoginController(
     oauth: BrowserOAuthClient(
       request: OAuthAuthorizationRequest(
