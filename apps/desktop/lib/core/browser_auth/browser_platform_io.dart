@@ -66,7 +66,9 @@ class HttpLocalSessionBridge implements AuthorizationCodeExchanger {
             'callback': callbackUri.toString(),
             'state': state,
           });
-      final response = await (await client.getUrl(uri)).close();
+      final response = await (await client.getUrl(uri))
+          .close()
+          .timeout(const Duration(seconds: 5));
       final body = await utf8.decoder.bind(response).join();
       if (response.statusCode != 200) {
         throw StateError(
