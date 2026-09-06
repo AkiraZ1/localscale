@@ -2,7 +2,7 @@
 
 LocalScale is a local-first Host/Cliente service with a Flutter Web control page and a versioned peer protocol. The administrative API stays on loopback. Optional external connectivity uses Tor Onion transport, keeping the control surface separate from peer traffic.
 
-> **Development status:** LocalScale is not production-ready. The Rust agent scaffold and protocol tests exist, but the Flutter app still uses a fake transport and the agent's current HTTP routes are not yet aligned with the Flutter `/api/v1` contract. See [current status](docs/architecture.md#current-development-status).
+> **Development status:** The Rust agent, versioned `/api/v1` contract, real Flutter Web loopback transport, durable peer authorization, authenticated Onion transport, and bundled Tor packaging are implemented and covered by automated tests. Native Windows execution and production Google-account login still require their respective native/runtime environments; they are not claimed as validated here. See [current status](docs/architecture.md#current-development-status).
 
 ## Architecture at a glance
 
