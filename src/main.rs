@@ -72,7 +72,7 @@ impl RuntimeConfig {
             "host" => {
                 let port = env::var("LOCALSCALE_SERVICE_PORT").ok().map(|value| value.parse::<u16>().map_err(|_| "LOCALSCALE_SERVICE_PORT must be a valid TCP port".to_string())).transpose()?.unwrap_or(8765);
                 if port == 0 { return Err("LOCALSCALE_SERVICE_PORT must be non-zero".into()); }
-                let upstream = env::var("LOCALSCALE_UPSTREAM").unwrap_or_else(|_| "127.0.0.1:8765".into());
+                let upstream = env::var("LOCALSCALE_UPSTREAM").unwrap_or_else(|_| "127.0.0.1:8766".into());
                 TorMode::host(port, upstream).map_err(|e| e.to_string())?
             }
             "cliente" => TorMode::client(&record.endpoint).map_err(|e| e.to_string())?,
@@ -469,7 +469,7 @@ mod tests {
         env::remove_var("LOCALSCALE_UPSTREAM");
 
         let config = RuntimeConfig::from_environment().unwrap().unwrap();
-        assert_eq!(config.mode, TorMode::Host { service_port: 8765, upstream: "127.0.0.1:8765".into() });
+        assert_eq!(config.mode, TorMode::Host { service_port: 8765, upstream: "127.0.0.1:8766".into() });
 
         for name in ["LOCALSCALE_PEER_STORE", "LOCALSCALE_TOR_DATA_DIR"] { env::remove_var(name); }
         let _ = std::fs::remove_file(path);
