@@ -222,6 +222,12 @@ pub struct TorProcess { child: Child, readiness: Receiver<String> }
 impl TorProcess {
     pub fn try_exit(&mut self) -> Result<Option<ExitStatus>, TorRuntimeError> { Ok(self.child.try_wait()?) }
     pub fn wait(&mut self) -> Result<ExitStatus, TorRuntimeError> { Ok(self.child.wait()?) }
+    pub fn terminate(&mut self) -> Result<ExitStatus, TorRuntimeError> {
+        if self.child.try_wait()?.is_none() {
+            self.child.kill()?;
+        }
+        Ok(self.child.wait()?)
+    }
     /// Wait for Tor's authenticated bootstrap completion without treating spawn as ready.
     pub fn wait_for_readiness(&mut self, timeout: Duration) -> Result<(), TorRuntimeError> {
         let deadline = Instant::now() + timeout;

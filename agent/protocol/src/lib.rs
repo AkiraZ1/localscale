@@ -318,7 +318,7 @@ impl HandshakeEnvelope {
     pub fn seal_with_nonce(key: &CryptoKey, role: Role, node_id: &str, nonce: [u8; NONCE_LEN], plaintext: &[u8]) -> Result<Self, CryptoError> {
         Self::seal_with_nonce_internal(key, role, node_id, nonce, plaintext, true)
     }
-    pub fn seal_with_allocator<A: NonceAllocator>(key: &CryptoKey, role: Role, node_id: &str, allocator: &mut A, plaintext: &[u8]) -> Result<Self, CryptoError> {
+    pub fn seal_with_allocator<A: NonceAllocator + ?Sized>(key: &CryptoKey, role: Role, node_id: &str, allocator: &mut A, plaintext: &[u8]) -> Result<Self, CryptoError> {
         let nonce = allocator.allocate()?;
         key.record_nonce(nonce)?;
         Self::seal_with_nonce_internal(key, role, node_id, nonce, plaintext, false)

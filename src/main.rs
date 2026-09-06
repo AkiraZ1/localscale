@@ -1,4 +1,5 @@
 use localscale_agent::{serve, serve_with_auth, AuthHandler};
+use localscale_agent::tor_runtime::{resolve_bundled_tor, TorMode, TorProcess, TorRuntime};
 use localscale_control_plane::{
     google_oidc::{ClientSecretRef, GoogleOidcConfig, GoogleOidcProvider, HttpRequest, HttpResponse, HttpTransport, TransportError},
     AuthService,
@@ -12,6 +13,65 @@ use std::thread;
 
 const CURL_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const CURL_TIMEOUT_SECONDS: u64 = 5;
+const TOR_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct RuntimeConfig {
+    mode: TorMode,
+    data_dir: std::path::PathBuf,
+}
+
+impl RuntimeConfig {
+    fn from_environment() -> Result<Option<Self>, String> {
+        let role = env::var("LOCALSCALE_ROLE").ok();
+        if role.is_none() {
+            return Ok(None);
+        }
+        Self::from_values(
+            role.as_deref(),
+            env::var("LOCALSCALE_SERVICE_PORT").ok().as_deref(),
+            env::var("LOCALSCALE_UPSTREAM").ok().as_deref(),
+            env::var("LOCALSCALE_ONION_ENDPOINT").ok().as_deref(),
+        ).map(Some)
+    }
+
+    fn from_values(role: Option<&str>, service_port: Option<&str>, upstream: Option<&str>, hostname: Option<&str>) -> Result<Self, String> {
+        let mode = match role {
+            Some("host") => {
+                let port = service_port.ok_or("host requires LOCALSCALE_SERVICE_PORT")?.parse::<u16>().map_err(|_| "LOCALSCALE_SERVICE_PORT must be a valid TCP port")?;
+                if port == 0 { return Err("LOCALSCALE_SERVICE_PORT must be non-zero".into()); }
+                TorMode::host(port, upstream.ok_or("host requires LOCALSCALE_UPSTREAM")?).map_err(|e| e.to_string())?
+            }
+            Some("cliente") => {
+                if service_port.is_some() { return Err("cliente must not configure LOCALSCALE_SERVICE_PORT".into()); }
+                TorMode::client(hostname.ok_or("cliente requires LOCALSCALE_ONION_ENDPOINT")?).map_err(|e| e.to_string())?
+            }
+            Some(other) => return Err(format!("LOCALSCALE_ROLE must be host or cliente, got {other}")),
+            None => return Err("LOCALSCALE_ROLE is required; refusing an implicit role".into()),
+        };
+        let data_dir = env::var_os("LOCALSCALE_TOR_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
+            env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| env::temp_dir()).join("localscale/tor")
+        });
+        if !data_dir.is_absolute() { return Err("LOCALSCALE_TOR_DATA_DIR must be absolute".into()); }
+        Ok(Self { mode, data_dir })
+    }
+}
+
+struct RunningTor { process: TorProcess }
+
+fn start_tor(bundle_root: &std::path::Path, config: &RuntimeConfig) -> Result<RunningTor, String> {
+    let executable = resolve_bundled_tor(bundle_root).map_err(|e| e.to_string())?;
+    let mut process = TorRuntime::new(executable, config.data_dir.clone()).map_err(|e| e.to_string())?.spawn(&config.mode).map_err(|e| e.to_string())?;
+    if let Err(error) = process.wait_for_readiness(TOR_READY_TIMEOUT) {
+        let _ = process.terminate();
+        return Err(error.to_string());
+    }
+    Ok(RunningTor { process })
+}
+
+fn stop_tor(mut running: RunningTor) {
+    let _ = running.process.terminate();
+}
 
 struct Options {
     port: u16,
@@ -140,6 +200,15 @@ fn auth_provider(port: u16) -> Option<Box<dyn AuthHandler>> {
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let options = parse_args(&args).map_err(std::io::Error::other)?;
+    let running_tor = match RuntimeConfig::from_environment().map_err(std::io::Error::other)? {
+        Some(runtime_config) => {
+            let bundle_root = env::var_os("LOCALSCALE_BUNDLE_ROOT").map(std::path::PathBuf::from).unwrap_or_else(|| {
+                env::current_exe().ok().and_then(|path| path.parent().map(std::path::Path::to_path_buf)).unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"))
+            });
+            Some(start_tor(&bundle_root, &runtime_config).map_err(std::io::Error::other)?)
+        }
+        None => None,
+    };
     let listener = TcpListener::bind(("127.0.0.1", options.port))?;
     let address = listener.local_addr()?;
     let url = format!("http://{address}/");
@@ -150,11 +219,14 @@ fn main() -> std::io::Result<()> {
         Some(auth) => serve_with_auth(listener, auth),
         None => serve(listener),
     });
-    wait_until_healthy(address)?;
-    if !options.no_open {
-        open_browser(&url);
+    let result = wait_until_healthy(address).and_then(|_| {
+        if !options.no_open { open_browser(&url); }
+        server.join().map_err(|_| std::io::Error::other("LocalScale server thread failed"))?
+    });
+    if let Some(running_tor) = running_tor {
+        stop_tor(running_tor);
     }
-    server.join().map_err(|_| std::io::Error::other("LocalScale server thread failed"))?
+    result
 }
 
 fn wait_until_healthy(address: std::net::SocketAddr) -> std::io::Result<()> {
@@ -217,6 +289,58 @@ mod tests {
         ] {
             env::remove_var(name);
         }
+    }
+
+    fn test_temp(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("localscale-main-{name}-{}", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    fn fake_bundled_executable(root: &std::path::Path, exits: bool) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join("tor/tor");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let script = if exits { "#!/bin/sh\n/bin/echo 'Bootstrapped 100%' >&2\nexit 0\n" } else { "#!/bin/sh\n/bin/echo 'Bootstrapped 100%' >&2\ntrap 'exit 0' TERM INT\nwhile :; do /bin/sleep 1; done\n" };
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[test]
+    fn runtime_config_selects_host_and_cliente_without_defaults() {
+        let host = RuntimeConfig::from_values(Some("host"), Some("8080"), Some("127.0.0.1:8765"), None).unwrap();
+        assert_eq!(host.mode, TorMode::Host { service_port: 8080, upstream: "127.0.0.1:8765".into() });
+        let client = RuntimeConfig::from_values(Some("cliente"), None, None, Some(&format!("{}.onion", "a".repeat(56)))).unwrap();
+        assert!(matches!(client.mode, TorMode::Client { .. }));
+        assert!(RuntimeConfig::from_values(None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn runtime_config_rejects_wrong_role_fields_and_invalid_ports() {
+        assert!(RuntimeConfig::from_values(Some("host"), Some("0"), Some("127.0.0.1:8765"), None).is_err());
+        assert!(RuntimeConfig::from_values(Some("cliente"), Some("8080"), None, None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_starts_fake_bundled_tor_and_kills_it_cleanly() {
+        let root = test_temp("lifecycle");
+        let executable = fake_bundled_executable(&root, false);
+        let config = RuntimeConfig { mode: TorMode::Client { hostname: format!("{}.onion", "a".repeat(56)) }, data_dir: root.join("data") };
+        let mut runtime = start_tor(&root, &config).unwrap();
+        assert!(runtime.process.try_exit().unwrap().is_none());
+        stop_tor(runtime);
+        let _ = std::fs::remove_file(executable);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lifecycle_fails_closed_when_bundle_is_absent() {
+        let root = test_temp("missing-bundle");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = RuntimeConfig { mode: TorMode::Client { hostname: format!("{}.onion", "a".repeat(56)) }, data_dir: root.join("data") };
+        assert!(start_tor(&root, &config).is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
