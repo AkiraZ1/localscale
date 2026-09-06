@@ -17,6 +17,8 @@ class HttpLocalAgentTransport implements LocalAgentTransport {
       final request = method == 'GET'
           ? await client.getUrl(base.replace(path: path))
           : await client.postUrl(base.replace(path: path));
+      final origin = '${base.scheme}://${base.host}:${base.port}';
+      request.headers.set('Origin', origin);
       if (body != null) {
         final bytes = utf8.encode(jsonEncode(body));
         request.headers

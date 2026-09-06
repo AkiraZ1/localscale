@@ -37,6 +37,8 @@ void main() {
 
     final expectedBody = jsonEncode({'mode': 'host', 'label': 'café'});
     expect(request.headers.contentLength, utf8.encode(expectedBody).length);
+    expect(request.headers.value('Origin'),
+        'http://${InternetAddress.loopbackIPv4.host}:${server.port}');
     expect(body, expectedBody);
   });
 }
