@@ -7,14 +7,79 @@ use localscale_agent_protocol::{
     MAX_FRAME_SIZE, VERSION,
 };
 use rand::{rngs::OsRng, RngCore};
+use sha2::{Digest, Sha256};
 use std::{
     fmt,
     io::{self, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
+    fs::{self, OpenOptions},
+    path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A crash-safe, caller-owned nonce allocator for persisted CryptoKeys.
+/// The counter is written to a temporary file, synced, and atomically renamed
+/// before the nonce is returned. The state file contains no key material.
+pub struct FileNonceAllocator { path: PathBuf, next: [u8; 24] }
+
+impl FileNonceAllocator {
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, TransportError> {
+        let path = path.into();
+        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+        let next = match fs::read_to_string(&path) {
+            Ok(text) => decode_nonce(text.trim()).ok_or(TransportError::Protocol("invalid nonce state"))?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let mut value = [0u8; 24]; OsRng.fill_bytes(&mut value); value
+            }
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Self { path, next })
+    }
+    fn persist(&self, value: &[u8; 24]) -> Result<(), TransportError> {
+        let tmp = self.path.with_extension("next");
+        let mut options = OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+        let mut file = options.open(&tmp)?;
+        file.write_all(hex(value).as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
+}
+impl NonceAllocator for FileNonceAllocator {
+    fn allocate(&mut self) -> Result<[u8; 24], CryptoError> {
+        let allocated = self.next;
+        let mut following = allocated;
+        for byte in following.iter_mut().rev() {
+            *byte = byte.wrapping_add(1);
+            if *byte != 0 { break; }
+        }
+        if following == [0; 24] { return Err(CryptoError::NonceReuse); }
+        self.persist(&following).map_err(|_| CryptoError::NonceReuse)?;
+        self.next = following;
+        Ok(allocated)
+    }
+}
+
+/// Deterministically derives the shared transport key from an invitation
+/// secret. Both sides must obtain the secret through their existing invitation
+/// flow; it is never sent over the Onion connection.
+pub fn key_from_invitation_secret(secret: &str) -> CryptoKey {
+    let digest = Sha256::digest(secret.as_bytes());
+    CryptoKey::from_bytes(&digest).expect("SHA-256 always produces a 32-byte key")
+}
+
+fn decode_nonce(text: &str) -> Option<[u8; 24]> {
+    if text.len() != 48 { return None; }
+    let mut value = [0u8; 24];
+    for (i, slot) in value.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(value)
+}
 
 pub trait TorRuntime {
     fn socks_endpoint(&self) -> Option<SocketAddr>;
@@ -423,5 +488,28 @@ mod tests {
             k, "c", "h", Box::new(TestNonceAllocator { next: 1 }),
         );
         assert!(matches!(c.connect("h.onion", 1), Err(TransportError::NotReady(_))));
+    }
+
+    #[test]
+    fn file_nonce_allocator_survives_reload_and_never_persists_key_material() {
+        let path = std::env::temp_dir().join(format!("localscale-nonce-{}", std::process::id()));
+        let first = {
+            let mut allocator = FileNonceAllocator::open(&path).unwrap();
+            allocator.allocate().unwrap()
+        };
+        let second = FileNonceAllocator::open(&path).unwrap().allocate().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read_to_string(&path).unwrap().len(), 48);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn invitation_secret_derives_the_same_opening_key() {
+        let a = key_from_invitation_secret("test-invitation-secret");
+        let b = key_from_invitation_secret("test-invitation-secret");
+        let mut allocator = TestNonceAllocator { next: 9 };
+        let envelope = HandshakeEnvelope::seal_with_allocator(&a, Role::Host, "host-1", &mut allocator, b"ok").unwrap();
+        assert_eq!(envelope.open(&b, Role::Host, "host-1").unwrap(), b"ok");
+        assert!(envelope.open(&key_from_invitation_secret("different"), Role::Host, "host-1").is_err());
     }
 }

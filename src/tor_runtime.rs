@@ -117,6 +117,13 @@ pub fn resolve_installed_bundled_tor() -> Result<PathBuf, TorRuntimeError> {
 
 /// Create or validate a LocalScale-owned private runtime directory.
 pub fn prepare_data_directory(path: &Path) -> Result<(), TorRuntimeError> {
+    // Tor stores its onion-service keys below this directory.  Do not follow
+    // an attacker-controlled symlink supplied as the data directory.
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(TorRuntimeError::InsecureDataDirectory(path.into()));
+        }
+    }
     if path.exists() {
         if !path.is_dir() { return Err(TorRuntimeError::InsecureDataDirectory(path.into())); }
         enforce_private_mode(path)?;
@@ -202,7 +209,7 @@ impl TorRuntime {
                 let _ = sender.send(line);
             }
         });
-        Ok(TorProcess { child, readiness })
+        Ok(TorProcess { child, readiness, socks_port: self.socks_port })
     }
 }
 
@@ -213,6 +220,9 @@ pub fn render_torrc(data_dir: &Path, mode: &TorMode) -> Result<String, TorRuntim
 fn render_torrc_with_socks_port(data_dir: &Path, mode: &TorMode, socks_port: u16) -> Result<String, TorRuntimeError> {
     if socks_port == 0 { return Err(TorRuntimeError::InvalidConfig("SOCKS port must be non-zero".into())); }
     if data_dir.is_relative() { return Err(TorRuntimeError::InvalidConfig("data directory must be absolute".into())); }
+    if data_dir.to_string_lossy().bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+        return Err(TorRuntimeError::InvalidConfig("data directory contains a line break".into()));
+    }
     let mut config = format!("DataDirectory {}\nLog notice stderr\nSocksPort 127.0.0.1:{}\n", data_dir.display(), socks_port);
     match mode {
         TorMode::Host { service_port, upstream } => {
@@ -226,13 +236,30 @@ fn render_torrc_with_socks_port(data_dir: &Path, mode: &TorMode, socks_port: u16
 
 fn validate_upstream(upstream: &str) -> Result<(), TorRuntimeError> {
     let (host, port) = upstream.rsplit_once(':').ok_or_else(|| TorRuntimeError::InvalidConfig("upstream must be host:port".into()))?;
-    if host.is_empty() || port.parse::<u16>().is_err() || host.contains('/') || host.contains('\n') { return Err(TorRuntimeError::InvalidConfig("invalid upstream".into())); }
+    if host.is_empty()
+        || port.parse::<u16>().is_err()
+        || host.contains('/')
+        || upstream.bytes().any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(TorRuntimeError::InvalidConfig("invalid upstream".into()));
+    }
     Ok(())
 }
 
 #[derive(Debug)]
-pub struct TorProcess { child: Child, readiness: Receiver<String> }
+pub struct TorProcess { child: Child, readiness: Receiver<String>, socks_port: u16 }
+impl Drop for TorProcess {
+    fn drop(&mut self) {
+        // std::process::Child does not reap or terminate its child on Drop.
+        // This runtime owns Tor, so every dropped handle must clean it up.
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
 impl TorProcess {
+    pub fn socks_endpoint(&self) -> std::net::SocketAddr { (std::net::Ipv4Addr::LOCALHOST, self.socks_port).into() }
     pub fn try_exit(&mut self) -> Result<Option<ExitStatus>, TorRuntimeError> { Ok(self.child.try_wait()?) }
     pub fn wait(&mut self) -> Result<ExitStatus, TorRuntimeError> { Ok(self.child.wait()?) }
     pub fn terminate(&mut self) -> Result<ExitStatus, TorRuntimeError> {
@@ -290,4 +317,24 @@ mod tests {
     #[test] fn data_directory_is_restrictive() { let root = temp("private"); prepare_data_directory(&root).unwrap(); #[cfg(unix)] assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700); let _ = fs::remove_dir_all(root); }
     #[test] fn existing_insecure_directory_is_rejected() { let root = temp("insecure"); fs::create_dir_all(&root).unwrap(); #[cfg(unix)] fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap(); #[cfg(unix)] assert!(matches!(prepare_data_directory(&root), Err(TorRuntimeError::InsecureDataDirectory(_)))); let _ = fs::remove_dir_all(root); }
     #[test] fn host_and_client_validate_v3_hostname() { assert!(validate_v3_hostname(&valid()).is_ok()); assert!(TorMode::client(valid()).is_ok()); assert!(validate_v3_hostname(&format!("{}.onion", "a".repeat(55))).is_err()); assert!(validate_v3_hostname(&format!("{}.onion", "A".repeat(56))).is_err()); }
-}
+
+ #[test] fn torrc_rejects_injection_values() {
+     let root = temp("injection");
+     fs::create_dir_all(&root).unwrap();
+     assert!(TorMode::host(80, "127.0.0.1:8080\nSocksPort 0").is_err());
+     let mode = TorMode::client(valid()).unwrap();
+     assert!(render_torrc(&root.join("data\nInjected"), &mode).is_err());
+     let _ = fs::remove_dir_all(root);
+ }
+
+ #[cfg(unix)]
+ #[test] fn symlinked_data_directory_is_rejected() {
+     let root = temp("symlink-data");
+     let real = root.join("real");
+     let link = root.join("data");
+     fs::create_dir_all(&real).unwrap();
+     std::os::unix::fs::symlink(&real, &link).unwrap();
+     assert!(matches!(prepare_data_directory(&link), Err(TorRuntimeError::InsecureDataDirectory(_))));
+     let _ = fs::remove_dir_all(root);
+ }
+ }

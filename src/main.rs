@@ -4,6 +4,7 @@ use localscale_control_plane::{
     google_oidc::{ClientSecretRef, GoogleOidcConfig, GoogleOidcProvider, HttpRequest, HttpResponse, HttpTransport, TransportError},
     AuthService,
 };
+use localscale_agent_transport::{ClienteTransport, FileNonceAllocator, HostTransport, TorRuntime as PeerTorRuntime, key_from_invitation_secret};
 use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -59,6 +60,12 @@ impl RuntimeConfig {
 
 struct RunningTor { process: TorProcess }
 
+struct ProcessTorRuntime { socks: std::net::SocketAddr }
+impl PeerTorRuntime for ProcessTorRuntime {
+    fn socks_endpoint(&self) -> Option<std::net::SocketAddr> { Some(self.socks) }
+    fn is_ready(&self) -> bool { true }
+}
+
 fn start_tor(bundle_root: &std::path::Path, config: &RuntimeConfig) -> Result<RunningTor, String> {
     let executable = resolve_bundled_tor(bundle_root).map_err(|e| e.to_string())?;
     let mut process = TorRuntime::new(executable, config.data_dir.clone()).map_err(|e| e.to_string())?.spawn(&config.mode).map_err(|e| e.to_string())?;
@@ -71,6 +78,34 @@ fn start_tor(bundle_root: &std::path::Path, config: &RuntimeConfig) -> Result<Ru
 
 fn stop_tor(mut running: RunningTor) {
     let _ = running.process.terminate();
+}
+
+fn start_peer_transport(config: &RuntimeConfig, tor: &RunningTor) -> Result<(), String> {
+    let secret = env::var("LOCALSCALE_INVITATION_SECRET").map_err(|_| "LOCALSCALE_INVITATION_SECRET is required for peer transport".to_string())?;
+    let node_id = env::var("LOCALSCALE_NODE_ID").map_err(|_| "LOCALSCALE_NODE_ID is required for peer transport".to_string())?;
+    if secret.is_empty() || node_id.is_empty() { return Err("peer credentials must not be empty".into()); }
+    let key = key_from_invitation_secret(&secret);
+    let nonce_path = config.data_dir.join("handshake-nonce");
+    match &config.mode {
+        TorMode::Host { upstream, .. } => {
+            let address: std::net::SocketAddr = upstream.parse().map_err(|_| "host upstream must be a socket address".to_string())?;
+            let allocator = FileNonceAllocator::open(nonce_path).map_err(|e| e.to_string())?;
+            let mut host = HostTransport::bind(address, key, node_id, Box::new(allocator)).map_err(|e| e.to_string())?;
+            std::thread::spawn(move || loop {
+                match host.accept() { Ok(_) => {}, Err(error) => eprintln!("LocalScale peer handshake failed: {error}") }
+            });
+            Ok(())
+        }
+        TorMode::Client { hostname } => {
+            let host_node_id = env::var("LOCALSCALE_HOST_NODE_ID").map_err(|_| "LOCALSCALE_HOST_NODE_ID is required for cliente transport".to_string())?;
+            let port = env::var("LOCALSCALE_ONION_PORT").ok().map(|v| v.parse::<u16>().map_err(|_| "LOCALSCALE_ONION_PORT must be a valid TCP port".to_string())).transpose()?.unwrap_or(8765);
+            let allocator = FileNonceAllocator::open(nonce_path).map_err(|e| e.to_string())?;
+            let mut client = ClienteTransport::new(Box::new(ProcessTorRuntime { socks: tor.process.socks_endpoint() }), key, node_id, host_node_id, Box::new(allocator));
+            let _stream = client.connect(hostname, port).map_err(|e| format!("cliente peer connection failed: {e}"))?;
+            println!("LocalScale peer: connected through bundled Tor");
+            Ok(())
+        }
+    }
 }
 
 struct Options {
@@ -205,7 +240,9 @@ fn main() -> std::io::Result<()> {
             let bundle_root = env::var_os("LOCALSCALE_BUNDLE_ROOT").map(std::path::PathBuf::from).unwrap_or_else(|| {
                 env::current_exe().ok().and_then(|path| path.parent().map(std::path::Path::to_path_buf)).unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"))
             });
-            Some(start_tor(&bundle_root, &runtime_config).map_err(std::io::Error::other)?)
+            let running = start_tor(&bundle_root, &runtime_config).map_err(std::io::Error::other)?;
+            start_peer_transport(&runtime_config, &running).map_err(std::io::Error::other)?;
+            Some(running)
         }
         None => None,
     };
