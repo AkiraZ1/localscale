@@ -22,6 +22,17 @@ if [ "$app_layout" -eq 0 ]; then
   cp -R "$bundle/Contents/Resources/tor/." "$bundle/tor/"
   rm -rf "$bundle/Contents"
   printf '%s\n' "staged macOS agent runtime at $bundle/tor/tor"
+  tor_dir="$bundle/tor"
+else
+  tor_dir="$bundle/Contents/Resources/tor"
+fi
+if command -v codesign >/dev/null 2>&1; then
+  sign_identity=${LOCALSCALE_CODESIGN_IDENTITY:--}
+  for library in "$tor_dir"/*.dylib; do
+    [ -f "$library" ] || continue
+    codesign --force --sign "$sign_identity" "$library"
+  done
+  codesign --force --sign "$sign_identity" "$tor_dir/tor"
 fi
 if [ "$app_layout" -eq 1 ]; then
   exec "$root/deploy/tor-runtime/check-package.sh" "$target" "$bundle"
