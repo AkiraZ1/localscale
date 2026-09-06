@@ -18,6 +18,16 @@ does not contain or fake these binary artifacts):
   `<bundle>/tor/tor` for non-`.app` distributions)
 - Windows: `<bundle>/tor/tor.exe`
 
+The release wrappers also install the `localscaled` agent alongside Tor:
+
+- Linux: `<bundle>/localscaled`
+- macOS app: `<bundle>/Contents/MacOS/localscaled`
+- macOS flat bundle: `<bundle>/localscaled`
+
+Use `deploy/packaging/linux/package-release.sh` or
+`deploy/packaging/macos/package-release.sh` with a built agent binary; they
+fail closed unless both the agent and Tor runtime pass validation.
+
 **Binary artifacts are currently missing from this source repository.** Release
 packaging must supply and verify the appropriate Tor artifact before shipping;
 development and tests must not fall back to a system installation.

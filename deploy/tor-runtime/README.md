@@ -27,9 +27,25 @@ These are intentionally the exact paths used by `src/tor_runtime.rs`:
 * Windows: `<bundle>/tor/tor.exe`
 
 The platform wrapper scripts under `deploy/packaging/` are the intended
-installer hooks. They must run after the application bundle has been created.
-A release is **incomplete** until the fetched, verified binaries are embedded
-in each platform installer; source-only builds are not shippable.
+installer hooks. For a complete release artifact, pass the built `localscaled`
+binary to the platform release wrapper (the Tor wrapper is called by it):
+
+```sh
+deploy/packaging/linux/package-release.sh <bundle> <path/to/localscaled>
+deploy/packaging/macos/package-release.sh <bundle.app> <path/to/localscaled> [x86_64|arm64]
+```
+
+The resulting relative paths are:
+
+* Linux: `<bundle>/localscaled` and `<bundle>/tor/tor`
+* macOS app: `<bundle>/Contents/MacOS/localscaled` and
+  `<bundle>/Contents/Resources/tor/tor`
+* macOS flat bundle: `<bundle>/localscaled` and `<bundle>/tor/tor`
+
+The wrappers reject missing, symlinked, or non-executable agent binaries and
+run the Tor fixture validator before reporting success. A release is
+**incomplete** until both the agent and fetched, verified Tor binaries are
+embedded in the installer; source-only builds are not shippable.
 
 The Tor Project artifacts remain subject to their upstream license and signing
 policy. Keep the downloaded cache outside version control.

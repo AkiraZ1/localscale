@@ -15,6 +15,30 @@ if [ ! -f "$path" ] || [ -L "$path" ]; then
   exit 1
 fi
 case "$platform" in
+  linux-x86_64)
+    python3 - "$path" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+if not path.read_bytes().startswith(b"\x7fELF"):
+    raise SystemExit(f"Linux Tor executable is not an ELF image: {path}")
+PY
+    ;;
+  macos-x86_64|macos-aarch64|macos-agent)
+    python3 - "$path" <<'PY'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+# Mach-O thin binaries support both byte orders and 32/64-bit headers.
+# Universal (fat) binaries likewise have both byte orders and 32/64-bit forms.
+mach_o_magics = {
+    b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
+}
+if path.read_bytes()[:4] not in mach_o_magics:
+    raise SystemExit(f"macOS Tor executable is not a Mach-O image: {path}")
+PY
+    ;;
   windows-x86_64)
     # A path-only check can accidentally package an ELF/Mach-O binary as
     # tor.exe. Validate the PE signature and e_lfanew before shipping.
