@@ -36,6 +36,19 @@ def main():
     check = ROOT / "check-package.sh"
     missing = subprocess.run([str(check), "linux-x86_64", str(Path(tempfile.gettempdir()) / "does-not-exist")], capture_output=True, text=True)
     assert missing.returncode != 0 and "release is incomplete" in missing.stderr
+
+    # Windows validation must distinguish a real PE tor.exe from a Linux/macOS
+    # executable copied into the bundle by mistake.
+    windows_bundle = Path(tempfile.mkdtemp())
+    windows_tor = windows_bundle / "tor" / "tor.exe"
+    windows_tor.parent.mkdir(parents=True)
+    windows_tor.write_bytes(b"MZ" + b"\0" * 58 + (64).to_bytes(4, "little") + b"PE\0\0")
+    valid = subprocess.run([str(check), "windows-x86_64", str(windows_bundle)], capture_output=True, text=True)
+    assert valid.returncode == 0, valid.stderr
+    windows_tor.write_bytes(b"\\x7fELF" + b"\\0" * 128)
+    wrong_format = subprocess.run([str(check), "windows-x86_64", str(windows_bundle)], capture_output=True, text=True)
+    assert wrong_format.returncode != 0 and "PE" in wrong_format.stderr
+
     print("tor-runtime static and fixture tests: ok")
 
 if __name__ == "__main__":
