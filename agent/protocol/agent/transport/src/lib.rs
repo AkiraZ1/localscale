@@ -8,6 +8,7 @@ use localscale_agent_protocol::{
 };
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
+use fs2::FileExt;
 use std::{
     fmt,
     io::{self, Read, Write},
@@ -15,10 +16,11 @@ use std::{
     fs::{self, OpenOptions},
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
 };
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A crash-safe, caller-owned nonce allocator for persisted CryptoKeys.
 /// The counter is written to a temporary file, synced, and atomically renamed
@@ -39,20 +41,36 @@ impl FileNonceAllocator {
         Ok(Self { path, next })
     }
     fn persist(&self, value: &[u8; 24]) -> Result<(), TransportError> {
-        let tmp = self.path.with_extension("next");
+        let tmp = self.path.with_extension(format!(
+            "next-{}-{}", std::process::id(), TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         let mut options = OpenOptions::new();
-        options.create(true).write(true).truncate(true);
+        options.create_new(true).write(true);
         #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
         let mut file = options.open(&tmp)?;
         file.write_all(hex(value).as_bytes())?;
         file.sync_all()?;
         fs::rename(&tmp, &self.path)?;
+        #[cfg(unix)] {
+            let parent = self.path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            OpenOptions::new().read(true).open(parent)?.sync_all()?;
+        }
         Ok(())
     }
 }
 impl NonceAllocator for FileNonceAllocator {
     fn allocate(&mut self) -> Result<[u8; 24], CryptoError> {
-        let allocated = self.next;
+        let lock_path = self.path.with_extension("lock");
+        let lock = OpenOptions::new().create(true).read(true).write(true).open(lock_path)
+            .map_err(|_| CryptoError::NonceReuse)?;
+        lock.lock_exclusive().map_err(|_| CryptoError::NonceReuse)?;
+        let allocated = match fs::read_to_string(&self.path) {
+            Ok(text) => decode_nonce(text.trim()).ok_or(CryptoError::NonceReuse)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let mut value = [0u8; 24]; OsRng.fill_bytes(&mut value); value
+            }
+            Err(_) => return Err(CryptoError::NonceReuse),
+        };
         let mut following = allocated;
         for byte in following.iter_mut().rev() {
             *byte = byte.wrapping_add(1);
@@ -511,6 +529,38 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(fs::read_to_string(&path).unwrap().len(), 48);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_nonce_allocator_is_unique_across_processes() {
+        let path = std::env::var_os("LOCALSCALE_NONCE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("localscale-nonce-concurrent-{}", std::process::id())));
+        if std::env::var_os("LOCALSCALE_NONCE_CHILD").is_some() {
+            let mut allocator = FileNonceAllocator::open(&path).unwrap();
+            for _ in 0..32 { allocator.allocate().unwrap(); }
+            return;
+        }
+        let _ = fs::remove_file(&path);
+        fs::write(&path, "000000000000000000000000000000000000000000000000").unwrap();
+        let mut children = Vec::new();
+        for _ in 0..8 {
+            children.push(std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("tests::file_nonce_allocator_is_unique_across_processes")
+                .arg("--exact")
+                .env("LOCALSCALE_NONCE_CHILD", "1")
+                .env("LOCALSCALE_NONCE_PATH", &path)
+                .env("RUST_TEST_THREADS", "1")
+                .spawn()
+                .unwrap());
+        }
+        assert!(children.into_iter().all(|mut child| child.wait().unwrap().success()));
+        let state = decode_nonce(&fs::read_to_string(&path).unwrap()).unwrap();
+        let mut expected = [0u8; 24];
+        expected[22] = 1;
+        assert_eq!(state, expected);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("lock"));
     }
 
     #[test]
