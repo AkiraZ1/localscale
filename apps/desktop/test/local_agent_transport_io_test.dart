@@ -5,6 +5,11 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:localscale_desktop/local_agent_transport_io.dart';
 
 void main() {
+  test('keeps the installed native agent ports', () {
+    expect(nativeLocalAgentPort(macOS: false), 8765);
+    expect(nativeLocalAgentPort(macOS: true), 18765);
+  });
+
   test('POST sends a UTF-8 body with an explicit content length', () async {
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     addTearDown(server.close);

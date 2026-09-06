@@ -19,12 +19,38 @@ void main() {
         throwsFormatException);
   });
 
-  test('client maps typed operations to local agent paths', () async {
-    final transport = FakeLocalAgentTransport();
+  test('client maps every operation to the versioned agent contract', () async {
+    final transport = _RecordingTransport();
     final client = LocalAgentApiClient(transport);
-    expect(
-        (await client.setMode(LocalScaleMode.host)).mode, LocalScaleMode.host);
-    expect((await client.start()).state, ServiceState.running);
-    expect((await client.stop()).state, ServiceState.stopped);
+    await client.status();
+    await client.setMode(LocalScaleMode.host);
+    await client.start();
+    await client.stop();
+    await client.sync();
+    expect(transport.requests, [
+      'GET /api/v1/status',
+      'POST /api/v1/mode {mode: host}',
+      'POST /api/v1/service/start',
+      'POST /api/v1/service/stop',
+      'POST /api/v1/sync',
+    ]);
   });
+}
+
+class _RecordingTransport implements LocalAgentTransport {
+  final requests = <String>[];
+  final response =
+      '{"mode":"cliente","state":"stopped","onion_endpoint":null}';
+
+  @override
+  Future<String> get(String path) async {
+    requests.add('GET $path');
+    return response;
+  }
+
+  @override
+  Future<String> post(String path, {Map<String, dynamic>? body}) async {
+    requests.add('POST $path${body == null ? '' : ' $body'}');
+    return response;
+  }
 }
