@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::path::{Path, PathBuf};
 use localscale_control_plane::{AuthRequest, AuthResponse};
 use localscale_agent_protocol::{ClientConfig, HostInvitation};
@@ -52,6 +52,7 @@ struct AgentState {
     peer: Arc<Mutex<PeerState>>,
     auth: Option<SharedAuth>,
     peer_store: Option<Arc<Mutex<PeerStore>>>,
+    peer_transport_enabled: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
@@ -133,19 +134,28 @@ impl Default for AgentState {
             peer: Arc::new(Mutex::new(PeerState { transport: "unavailable", ..PeerState::default() })),
             auth: None,
             peer_store: PeerStore::ephemeral().ok().map(|s| Arc::new(Mutex::new(s))),
+            peer_transport_enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 }
 
 pub fn serve(listener: TcpListener) -> std::io::Result<()> {
-    serve_with_auth_handler(listener, None)
+    serve_with_auth_handler(listener, None, None)
 }
 
 pub fn serve_with_auth(listener: TcpListener, auth: Box<dyn AuthHandler>) -> std::io::Result<()> {
-    serve_with_auth_handler(listener, Some(Arc::new(Mutex::new(auth))))
+    serve_with_auth_handler(listener, Some(Arc::new(Mutex::new(auth))), None)
 }
 
-fn serve_with_auth_handler(listener: TcpListener, auth: Option<SharedAuth>) -> std::io::Result<()> {
+pub fn serve_with_peer_transport_gate(listener: TcpListener, gate: Arc<AtomicBool>) -> std::io::Result<()> {
+    serve_with_auth_handler(listener, None, Some(gate))
+}
+
+pub fn serve_with_auth_and_peer_transport_gate(listener: TcpListener, auth: Box<dyn AuthHandler>, gate: Arc<AtomicBool>) -> std::io::Result<()> {
+    serve_with_auth_handler(listener, Some(Arc::new(Mutex::new(auth))), Some(gate))
+}
+
+fn serve_with_auth_handler(listener: TcpListener, auth: Option<SharedAuth>, gate: Option<Arc<AtomicBool>>) -> std::io::Result<()> {
     let peer_store = match std::env::var_os("LOCALSCALE_PEER_STORE") {
         Some(path) => match PeerStore::open(path) {
             Ok(store) => Some(store),
@@ -156,7 +166,12 @@ fn serve_with_auth_handler(listener: TcpListener, auth: Option<SharedAuth>) -> s
         },
         None => PeerStore::ephemeral().ok(),
     };
-    let state = AgentState { auth, peer_store: peer_store.map(|s| Arc::new(Mutex::new(s))), ..AgentState::default() };
+    let state = AgentState {
+        auth,
+        peer_store: peer_store.map(|s| Arc::new(Mutex::new(s))),
+        peer_transport_enabled: gate.unwrap_or_else(|| Arc::new(AtomicBool::new(true))),
+        ..AgentState::default()
+    };
     if let Some(store) = &state.peer_store {
         if let Some(record) = lock_recover(store).record().cloned() {
             let mut peer = lock_recover(&state.peer);
@@ -289,6 +304,9 @@ fn response_for_request_with_state(request: &str, state: &AgentState) -> String 
         let response = lock_recover(auth).handle(AuthRequest { method: method.to_owned(), path: path.to_owned(), query, headers: request_headers });
         return auth_http_response(response);
     }
+    if is_state_changing_method(method) && !has_same_origin_proof(&headers, host) {
+        return http_response("403 Forbidden", "text/plain; charset=utf-8", "csrf validation failed");
+    }
     match (method, path) {
         ("GET", "/api/v1/status") => service_status(state),
         ("GET", "/api/v1/peer/status") => peer_status(state),
@@ -418,7 +436,9 @@ fn set_peer_config(body: &str, state: &AgentState) -> String {
 fn set_peer_approval(approved: bool, state: &AgentState) -> String {
     let Some(store) = &state.peer_store else { return http_response("503 Service Unavailable", "application/json", r#"{"error":"peer_store_unavailable"}"#) };
     if lock_recover(store).set_approval(approved).is_err() { return http_response("404 Not Found", "application/json", r#"{"error":"peer_not_configured"}"#); }
-    let mut peer = lock_recover(&state.peer); peer.approved = approved; peer.revoked = !approved; drop(peer); peer_status(state)
+    let mut peer = lock_recover(&state.peer); peer.approved = approved; peer.revoked = !approved; drop(peer);
+    state.peer_transport_enabled.store(approved, Ordering::Release);
+    peer_status(state)
 }
 
 fn parse_json_fields(body: &str) -> Option<std::collections::HashMap<String, String>> {
@@ -470,6 +490,33 @@ fn parse_mode(body: &str, contract: bool) -> Option<&'static str> {
         "client" if !contract => Some("client"),
         _ => None,
     }
+}
+
+fn is_state_changing_method(method: &str) -> bool {
+    !matches!(method, "" | "GET" | "HEAD" | "OPTIONS")
+}
+
+fn has_same_origin_proof(headers: &[(&str, &str)], host: &str) -> bool {
+    let origins: Vec<&str> = headers.iter().filter_map(|(name, value)| {
+        name.eq_ignore_ascii_case("Origin").then_some(value.trim())
+    }).collect();
+    if !origins.is_empty() {
+        return origins.len() == 1 && origin_matches_host(origins[0], host);
+    }
+    let referers: Vec<&str> = headers.iter().filter_map(|(name, value)| {
+        name.eq_ignore_ascii_case("Referer").then_some(value.trim())
+    }).collect();
+    referers.len() == 1 && origin_matches_host(referers[0], host)
+}
+
+fn origin_matches_host(value: &str, host: &str) -> bool {
+    let Some(scheme_end) = value.find("://") else { return false; };
+    let authority_start = scheme_end + 3;
+    let authority = value[authority_start..].split('/').next().unwrap_or("");
+    if authority.is_empty() || !value[..scheme_end].eq_ignore_ascii_case("http") {
+        return false;
+    }
+    authority.eq_ignore_ascii_case(host)
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -526,23 +573,23 @@ mod tests {
     fn auth_callback_session_logout_use_actual_http_translation() {
         let mut auth = auth_service();
         let start = super::response_for_request_with_auth(
-            "GET /oauth/google/start HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut auth);
+            "GET /oauth/google/start HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n", &mut auth);
         let location = start.lines().find(|line| line.starts_with("Location: ")).unwrap();
         let state = location.split("state=").nth(1).unwrap();
         let callback = super::response_for_request_with_auth(
-            &format!("GET /oauth/google/callback?code=provider-code&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n"), &mut auth);
+            &format!("GET /oauth/google/callback?code=provider-code&state={state} HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n"), &mut auth);
         assert!(callback.starts_with("HTTP/1.1 303 See Other"), "{callback}");
         let cookie = callback.lines().find(|line| line.starts_with("Set-Cookie: ")).unwrap().strip_prefix("Set-Cookie: ").unwrap().split(';').next().unwrap();
         assert!(callback.contains("Location: /\r\n"));
         assert!(callback.contains("HttpOnly") && callback.contains("Secure") && callback.contains("SameSite=Strict"));
-        let replay = super::response_for_request_with_auth(&format!("GET /oauth/google/callback?code=provider-code&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n"), &mut auth);
+        let replay = super::response_for_request_with_auth(&format!("GET /oauth/google/callback?code=provider-code&state={state} HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n"), &mut auth);
         assert!(replay.starts_with("HTTP/1.1 400 Bad Request"));
-        let session = super::response_for_request_with_auth(&format!("GET /auth/session HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\n\r\n"), &mut auth);
+        let session = super::response_for_request_with_auth(&format!("GET /auth/session HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\nCookie: {cookie}\r\n\r\n"), &mut auth);
         assert!(session.starts_with("HTTP/1.1 200 OK"));
-        let missing_csrf = super::response_for_request_with_auth(&format!("POST /auth/logout HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\n\r\n"), &mut auth);
+        let missing_csrf = super::response_for_request_with_auth(&format!("POST /auth/logout HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\nCookie: {cookie}\r\n\r\n"), &mut auth);
         assert!(missing_csrf.starts_with("HTTP/1.1 403 Forbidden"));
         let sid = cookie.strip_prefix("localscale_session=").unwrap();
-        let logout = super::response_for_request_with_auth(&format!("POST /auth/logout HTTP/1.1\r\nHost: localhost\r\nCookie: {cookie}\r\nX-CSRF-Token: {sid}\r\n\r\n"), &mut auth);
+        let logout = super::response_for_request_with_auth(&format!("POST /auth/logout HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\nCookie: {cookie}\r\nX-CSRF-Token: {sid}\r\n\r\n"), &mut auth);
         assert!(logout.starts_with("HTTP/1.1 204 No Content"));
         assert!(!callback.contains("provider-code") && !callback.contains("access-secret") && !callback.contains("id-secret"));
     }
@@ -552,16 +599,16 @@ mod tests {
         let mut auth = auth_service();
         let app_callback = "http://127.0.0.1:43123/oauth/callback";
         let flutter_state = "flutter-state-root";
-        let start = super::response_for_request_with_auth(&format!("GET /oauth/google/start?app_callback={app_callback}&state={flutter_state} HTTP/1.1\r\nHost: localhost\r\n\r\n"), &mut auth);
+        let start = super::response_for_request_with_auth(&format!("GET /oauth/google/start?app_callback={app_callback}&state={flutter_state} HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n"), &mut auth);
         let server_state = start.lines().find(|line| line.starts_with("Location: ")).unwrap().split("state=").nth(1).unwrap();
         assert_ne!(server_state, flutter_state);
-        let callback = super::response_for_request_with_auth(&format!("GET /oauth/google/callback?code=provider-code&state={server_state} HTTP/1.1\r\nHost: localhost\r\n\r\n"), &mut auth);
+        let callback = super::response_for_request_with_auth(&format!("GET /oauth/google/callback?code=provider-code&state={server_state} HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n"), &mut auth);
         let location = callback.lines().find(|line| line.starts_with("Location: ")).unwrap().strip_prefix("Location: ").unwrap();
         assert!(location.starts_with(app_callback));
         let query = location.split('?').nth(1).unwrap();
         let params: std::collections::HashMap<_, _> = query.split('&').filter_map(|pair| pair.split_once('=')).collect();
         let handoff = params.get("handoff").unwrap();
-        let exchange = format!("GET /auth/session/bridge?handoff={handoff}&callback={app_callback}&state={flutter_state} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        let exchange = format!("GET /auth/session/bridge?handoff={handoff}&callback={app_callback}&state={flutter_state} HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n");
         let response = super::response_for_request_with_auth(&exchange, &mut auth);
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(!response.contains("access-secret") && !response.contains("id-secret"));
@@ -585,17 +632,17 @@ mod tests {
     fn auth_adapter_rejects_non_loopback_and_malformed_queries() {
         let mut auth = auth_service();
         assert!(super::response_for_request_with_auth("GET /oauth/google/start HTTP/1.1\r\nHost: example.test\r\n\r\n", &mut auth).starts_with("HTTP/1.1 403 Forbidden"));
-        assert!(super::response_for_request_with_auth("GET /oauth/google/callback?state=%ZZ&code=x HTTP/1.1\r\nHost: localhost\r\n\r\n", &mut auth).starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(super::response_for_request_with_auth("GET /oauth/google/callback?state=%ZZ&code=x HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n", &mut auth).starts_with("HTTP/1.1 400 Bad Request"));
     }
 
     #[test]
     fn auth_adapter_fails_closed_when_unconfigured() {
         for request in [
-            "GET /oauth/google/start HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            "GET /oauth/google/callback?code=x&state=y HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            "GET /auth/session HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            "GET /auth/session/bridge?handoff=x&callback=http%3A%2F%2F127.0.0.1%3A1234%2Foauth%2Fcallback&state=y HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            "POST /auth/logout HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /oauth/google/start HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n",
+            "GET /oauth/google/callback?code=x&state=y HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n",
+            "GET /auth/session HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n",
+            "GET /auth/session/bridge?handoff=x&callback=http%3A%2F%2F127.0.0.1%3A1234%2Foauth%2Fcallback&state=y HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n",
+            "POST /auth/logout HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n",
         ] {
             assert!(super::response_for_request(request).starts_with("HTTP/1.1 503 Service Unavailable"));
         }
@@ -616,8 +663,27 @@ mod tests {
     }
 
     #[test]
+    fn state_changing_routes_require_a_same_origin_proof() {
+        let rejected = super::response_for_request(
+            "POST /api/v1/service/start HTTP/1.1\r\nHost: 127.0.0.1:8765\r\n\r\n");
+        assert!(rejected.starts_with("HTTP/1.1 403 Forbidden"), "{rejected}");
+
+        let cross_origin = super::response_for_request(
+            "POST /api/v1/service/start HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nOrigin: http://127.0.0.1:9999\r\n\r\n");
+        assert!(cross_origin.starts_with("HTTP/1.1 403 Forbidden"), "{cross_origin}");
+
+        let accepted = super::response_for_request(
+            "POST /api/v1/service/start HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nOrigin: http://127.0.0.1:8765\r\n\r\n");
+        assert!(accepted.starts_with("HTTP/1.1 200 OK"), "{accepted}");
+
+        let referer = super::response_for_request(
+            "POST /api/v1/service/stop HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nReferer: http://127.0.0.1:8765/config\r\n\r\n");
+        assert!(referer.starts_with("HTTP/1.1 200 OK"), "{referer}");
+    }
+
+    #[test]
     fn mode_endpoint_accepts_client_mode() {
-        let response = super::response_for_request("POST /mode HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 17\r\n\r\n{\"mode\":\"client\"}");
+        let response = super::response_for_request("POST /mode HTTP/1.1\r\nHost: 127.0.0.1:8765\r\nOrigin: http://127.0.0.1:8765\r\nContent-Length: 17\r\n\r\n{\"mode\":\"client\"}");
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains("\"mode\":\"client\""));
     }
@@ -635,16 +701,16 @@ mod tests {
     fn control_page_routes_return_service_status_and_cliente_is_accepted() {
         let state = super::AgentState::default();
         let mode = super::response_for_request_with_state(
-            "POST /api/v1/mode HTTP/1.1\r\nHost: localhost\r\n\r\n{\"mode\":\"host\"}", &state);
+            "POST /api/v1/mode HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n{\"mode\":\"host\"}", &state);
         assert!(mode.starts_with("HTTP/1.1 200 OK"), "{mode}");
         assert!(mode.contains(r#""mode":"host""#));
         assert!(mode.contains(r#""state":"stopped""#));
 
         let start = super::response_for_request_with_state(
-            "POST /api/v1/service/start HTTP/1.1\r\nHost: localhost\r\n\r\n", &state);
+            "POST /api/v1/service/start HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n", &state);
         assert!(start.contains(r#""state":"running""#));
         let status = super::response_for_request_with_state(
-            "GET /api/v1/status HTTP/1.1\r\nHost: localhost\r\n\r\n", &state);
+            "GET /api/v1/status HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n", &state);
         assert!(status.contains(r#""mode":"host""#));
         assert!(status.contains(r#""state":"running""#));
     }
@@ -655,21 +721,21 @@ mod tests {
         let secret = "secret-token-123456";
         let state = super::AgentState::default();
         let host = super::response_for_request_with_state(&format!(
-            "POST /api/v1/peer/config HTTP/1.1\r\nHost: localhost\r\n\r\n{{\"role\":\"host\",\"node_id\":\"host-01\",\"onion_endpoint\":\"{hostname}\",\"invitation_secret\":\"{secret}\"}}"), &state);
+            "POST /api/v1/peer/config HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n{{\"role\":\"host\",\"node_id\":\"host-01\",\"onion_endpoint\":\"{hostname}\",\"invitation_secret\":\"{secret}\"}}"), &state);
         assert!(host.starts_with("HTTP/1.1 200 OK"), "{host}");
         assert!(host.contains("\"transport\":\"unavailable\""));
         assert!(!host.contains(secret));
-        let status = super::response_for_request_with_state("GET /api/v1/peer/status HTTP/1.1\r\nHost: localhost\r\n\r\n", &state);
+        let status = super::response_for_request_with_state("GET /api/v1/peer/status HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n", &state);
         assert!(status.contains(hostname));
         assert!(!status.contains(secret));
         let cliente = super::response_for_request_with_state(&format!(
-            "POST /api/v1/peer/config HTTP/1.1\r\nHost: localhost\r\n\r\n{{\"role\":\"cliente\",\"node_id\":\"client-01\",\"host_node_id\":\"host-01\",\"onion_endpoint\":\"{hostname}\",\"invitation_secret\":\"{secret}\"}}"), &state);
+            "POST /api/v1/peer/config HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n{{\"role\":\"cliente\",\"node_id\":\"client-01\",\"host_node_id\":\"host-01\",\"onion_endpoint\":\"{hostname}\",\"invitation_secret\":\"{secret}\"}}"), &state);
         assert!(cliente.starts_with("HTTP/1.1 200 OK"), "{cliente}");
     }
 
     #[test]
     fn peer_config_rejects_invalid_onion_and_non_loopback_admin_requests() {
-        let invalid = super::response_for_request("POST /api/v1/peer/config HTTP/1.1\r\nHost: localhost\r\n\r\n{\"role\":\"cliente\",\"node_id\":\"client-01\",\"host_node_id\":\"host-01\",\"onion_endpoint\":\"/var/lib/tor/hostname\",\"invitation_secret\":\"secret-token-123456\"}");
+        let invalid = super::response_for_request("POST /api/v1/peer/config HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n{\"role\":\"cliente\",\"node_id\":\"client-01\",\"host_node_id\":\"host-01\",\"onion_endpoint\":\"/var/lib/tor/hostname\",\"invitation_secret\":\"secret-token-123456\"}");
         assert!(invalid.starts_with("HTTP/1.1 400 Bad Request"), "{invalid}");
         let remote = super::response_for_request("GET /api/v1/peer/status HTTP/1.1\r\nHost: example.test\r\n\r\n");
         assert!(remote.starts_with("HTTP/1.1 403 Forbidden"), "{remote}");
@@ -700,11 +766,11 @@ mod tests {
     #[test]
     fn malformed_mode_json_is_rejected() {
         let response = super::response_for_request(
-            "POST /api/v1/mode HTTP/1.1\r\nHost: localhost\r\n\r\nnot-json{\"mode\":\"host\"}");
+            "POST /api/v1/mode HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\nnot-json{\"mode\":\"host\"}");
         assert!(response.starts_with("HTTP/1.1 400 Bad Request"), "{response}");
 
         let response = super::response_for_request(
-            "POST /api/v1/mode HTTP/1.1\r\nHost: localhost\r\n\r\n{\"mode\":\"client\"}");
+            "POST /api/v1/mode HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n{\"mode\":\"client\"}");
         assert!(response.starts_with("HTTP/1.1 400 Bad Request"), "{response}");
     }
 
@@ -744,12 +810,12 @@ mod tests {
     fn mode_parser_accepts_json_whitespace_but_rejects_extra_fields_and_escapes() {
         for body in [" { \"mode\" : \"host\" } ", "{\n\t\"mode\":\"cliente\"\n}"] {
             let response = super::response_for_request(&format!(
-                "POST /api/v1/mode HTTP/1.1\r\nHost: localhost\r\n\r\n{body}"));
+                "POST /api/v1/mode HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n{body}"));
             assert!(response.starts_with("HTTP/1.1 200 OK"), "{body}: {response}");
         }
         for body in ["{\"mode\":\"host\",\"other\":true}", "{\"mode\":\"ho\\u0073t\"}"] {
             let response = super::response_for_request(&format!(
-                "POST /api/v1/mode HTTP/1.1\r\nHost: localhost\r\n\r\n{body}"));
+                "POST /api/v1/mode HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n{body}"));
             assert!(response.starts_with("HTTP/1.1 400 Bad Request"), "{body}: {response}");
         }
     }
@@ -772,7 +838,7 @@ mod tests {
             panic!("poison test");
         });
         let response = super::response_for_request_with_state(
-            "GET /mode HTTP/1.1\r\nHost: localhost\r\n\r\n", &state);
+            "GET /mode HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n", &state);
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.contains(r#""mode":"cliente""#));
     }
@@ -789,11 +855,11 @@ mod tests {
         let slow = TcpStream::connect(address).unwrap();
         thread::sleep(Duration::from_millis(50));
         let mut broken = TcpStream::connect(address).unwrap();
-        broken.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n").unwrap();
+        broken.write_all(b"GET /health HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n").unwrap();
         drop(broken);
         let mut fast = TcpStream::connect(address).unwrap();
         fast.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
-        fast.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        fast.write_all(b"GET /health HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n").unwrap();
         let mut response = String::new();
         fast.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
@@ -839,6 +905,20 @@ mod tests {
         let mut response = String::new();
         excess.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"), "{response}");
+    }
+
+    #[test]
+    fn revoking_peer_disables_running_transport_gate() {
+        let state = super::AgentState::default();
+        super::lock_recover(state.peer_store.as_ref().unwrap()).configure(super::PeerRecord {
+            role: "host".into(), node_id: "host-01".into(), host_node_id: None,
+            endpoint: format!("{}.onion", "a".repeat(56)), invitation_secret: "secret".into(), approved: true, revoked: false,
+        }).unwrap();
+        assert!(state.peer_transport_enabled.load(std::sync::atomic::Ordering::Acquire));
+        let response = super::response_for_request_with_state(
+            "POST /api/v1/peer/revoke HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nContent-Length: 0\r\n\r\n", &state);
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(!state.peer_transport_enabled.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[test]
