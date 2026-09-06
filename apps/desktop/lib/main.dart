@@ -89,10 +89,6 @@ class _LocalScaleAppState extends State<LocalScaleApp> {
             brightness: Brightness.light,
           ),
           useMaterial3: true,
-          cardTheme: const CardTheme(
-            elevation: 1,
-            margin: EdgeInsets.symmetric(vertical: 8),
-          ),
         ),
         darkTheme: ThemeData(
           colorScheme: ColorScheme.fromSeed(
@@ -101,11 +97,6 @@ class _LocalScaleAppState extends State<LocalScaleApp> {
           ),
           useMaterial3: true,
           scaffoldBackgroundColor: const Color(0xff0b0f19),
-          cardTheme: const CardTheme(
-            color: Color(0xff111827),
-            elevation: 2,
-            margin: EdgeInsets.symmetric(vertical: 8),
-          ),
         ),
         home: AnimatedBuilder(
             animation: auth,

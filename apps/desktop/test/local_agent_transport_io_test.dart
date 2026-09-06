@@ -23,6 +23,7 @@ void main() {
       ),
     );
 
+    final serverPort = server.port;
     final responseFuture = transport.post('/control/mode', body: {
       'mode': 'host',
       'label': 'café',
@@ -38,7 +39,7 @@ void main() {
     final expectedBody = jsonEncode({'mode': 'host', 'label': 'café'});
     expect(request.headers.contentLength, utf8.encode(expectedBody).length);
     expect(request.headers.value('Origin'),
-        'http://${InternetAddress.loopbackIPv4.host}:${server.port}');
+        'http://${InternetAddress.loopbackIPv4.host}:$serverPort');
     expect(body, expectedBody);
   });
 }
