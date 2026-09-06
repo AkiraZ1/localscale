@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'core/browser_auth/browser_auth.dart';
@@ -149,27 +151,47 @@ class ControlPage extends StatefulWidget {
 }
 
 class _ControlPageState extends State<ControlPage> {
+  static const _pollInterval = Duration(seconds: 5);
   ServiceStatus? status;
   String? message;
+  Timer? _pollTimer;
   @override
   void initState() {
     super.initState();
     _refresh();
+    _pollTimer = Timer.periodic(_pollInterval, (_) {
+      if (mounted) _refresh();
+    });
+  }
+
+  @override
+  void dispose() {
+    _pollTimer?.cancel();
+    super.dispose();
   }
 
   Future<void> _refresh() async {
     try {
       final value = await widget.api.status();
-      if (mounted) setState(() => status = value);
+      if (mounted) {
+        setState(() {
+          status = value;
+          message = null;
+        });
+      }
     } catch (error) {
       if (mounted) {
-        setState(() => message = 'Unable to read LocalScale agent: $error');
+        setState(() {
+          status = null;
+          message = 'Unable to read LocalScale agent: $error';
+        });
       }
     }
   }
 
   Future<void> _run(
       Future<ServiceStatus> Function() action, String label) async {
+    if (!mounted) return;
     setState(() => message = '$label LocalScale…');
     try {
       final value = await action();
@@ -293,13 +315,18 @@ class _ControlPageState extends State<ControlPage> {
     );
   }
 
-  Color _stateColor(ServiceState? state) =>
-      state == ServiceState.running ? Colors.green : Colors.orange;
+  Color _stateColor(ServiceState? state) => switch (state) {
+        ServiceState.running => Colors.green,
+        null => Colors.grey,
+        _ => Colors.orange,
+      };
+
   String _stateLabel(ServiceState? state) => switch (state) {
         ServiceState.running => 'Running',
         ServiceState.starting => 'Starting',
         ServiceState.stopping => 'Stopping',
         ServiceState.error => 'Error',
-        _ => 'Stopped'
+        ServiceState.stopped => 'Stopped',
+        null => 'Status unavailable',
       };
 }
