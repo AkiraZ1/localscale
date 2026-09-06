@@ -76,6 +76,17 @@ fn start_tor(bundle_root: &std::path::Path, config: &RuntimeConfig) -> Result<Ru
     Ok(RunningTor { process })
 }
 
+fn wait_for_socks(endpoint: std::net::SocketAddr, timeout: Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match TcpStream::connect_timeout(&endpoint, Duration::from_millis(250)) {
+            Ok(_) => return Ok(()),
+            Err(_) if std::time::Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+            Err(_) => return Err("bundled Tor SOCKS endpoint did not become available".into()),
+        }
+    }
+}
+
 fn stop_tor(mut running: RunningTor) {
     let _ = running.process.terminate();
 }
@@ -100,6 +111,7 @@ fn start_peer_transport(config: &RuntimeConfig, tor: &RunningTor) -> Result<(), 
             let host_node_id = env::var("LOCALSCALE_HOST_NODE_ID").map_err(|_| "LOCALSCALE_HOST_NODE_ID is required for cliente transport".to_string())?;
             let port = env::var("LOCALSCALE_ONION_PORT").ok().map(|v| v.parse::<u16>().map_err(|_| "LOCALSCALE_ONION_PORT must be a valid TCP port".to_string())).transpose()?.unwrap_or(8765);
             let allocator = FileNonceAllocator::open(nonce_path).map_err(|e| e.to_string())?;
+            wait_for_socks(tor.process.socks_endpoint(), TOR_READY_TIMEOUT).map_err(|e| e.to_string())?;
             let mut client = ClienteTransport::new(Box::new(ProcessTorRuntime { socks: tor.process.socks_endpoint() }), key, node_id, host_node_id, Box::new(allocator));
             let _stream = client.connect(hostname, port).map_err(|e| format!("cliente peer connection failed: {e}"))?;
             println!("LocalScale peer: connected through bundled Tor");
