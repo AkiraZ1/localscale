@@ -146,7 +146,16 @@ pub fn serve_with_auth(listener: TcpListener, auth: Box<dyn AuthHandler>) -> std
 }
 
 fn serve_with_auth_handler(listener: TcpListener, auth: Option<SharedAuth>) -> std::io::Result<()> {
-    let peer_store = std::env::var_os("LOCALSCALE_PEER_STORE").map(PeerStore::open).transpose()?;
+    let peer_store = match std::env::var_os("LOCALSCALE_PEER_STORE") {
+        Some(path) => match PeerStore::open(path) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                eprintln!("LocalScale peer store unavailable; control API remains available ({error})");
+                None
+            }
+        },
+        None => PeerStore::ephemeral().ok(),
+    };
     let state = AgentState { auth, peer_store: peer_store.map(|s| Arc::new(Mutex::new(s))), ..AgentState::default() };
     if let Some(store) = &state.peer_store {
         if let Some(record) = lock_recover(store).record().cloned() {

@@ -23,20 +23,66 @@ struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    fn from_environment() -> Result<Option<Self>, String> {
-        let role = env::var("LOCALSCALE_ROLE").ok();
-        if role.is_none() {
-            return Ok(None);
-        }
-        Self::from_values(
-            role.as_deref(),
-            env::var("LOCALSCALE_SERVICE_PORT").ok().as_deref(),
-            env::var("LOCALSCALE_UPSTREAM").ok().as_deref(),
-            env::var("LOCALSCALE_ONION_ENDPOINT").ok().as_deref(),
-        ).map(Some)
+    fn data_dir_from_environment() -> Result<std::path::PathBuf, String> {
+        let data_dir = env::var_os("LOCALSCALE_TOR_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
+            env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| env::temp_dir()).join("localscale/tor")
+        });
+        if !data_dir.is_absolute() { return Err("LOCALSCALE_TOR_DATA_DIR must be absolute".into()); }
+        Ok(data_dir)
     }
 
+    fn from_environment() -> Result<Option<Self>, String> {
+        let data_dir = Self::data_dir_from_environment()?;
+        let role = env::var("LOCALSCALE_ROLE").ok();
+        if let Some(role) = role {
+            return Self::from_values_with_data_dir(
+                Some(&role),
+                env::var("LOCALSCALE_SERVICE_PORT").ok().as_deref(),
+                env::var("LOCALSCALE_UPSTREAM").ok().as_deref(),
+                env::var("LOCALSCALE_ONION_ENDPOINT").ok().as_deref(),
+                data_dir,
+            ).map(Some);
+        }
+
+        let store_path = env::var_os("LOCALSCALE_PEER_STORE").map(std::path::PathBuf::from).unwrap_or_else(|| data_dir.join("peer-record.json"));
+        let store = match PeerStore::open(store_path) {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("LocalScale peer bootstrap disabled: invalid peer store ({error})");
+                return Ok(None);
+            }
+        };
+        let Some(record) = store.record() else { return Ok(None); };
+        if !record.approved || record.revoked { return Ok(None); }
+        match Self::from_peer_record(record, data_dir) {
+            Ok(config) => Ok(Some(config)),
+            Err(error) => {
+                eprintln!("LocalScale peer bootstrap disabled: invalid approved peer configuration ({error})");
+                Ok(None)
+            }
+        }
+    }
+
+    fn from_peer_record(record: &localscale_agent::PeerRecord, data_dir: std::path::PathBuf) -> Result<Self, String> {
+        let mode = match record.role.as_str() {
+            "host" => {
+                let port = env::var("LOCALSCALE_SERVICE_PORT").ok().map(|value| value.parse::<u16>().map_err(|_| "LOCALSCALE_SERVICE_PORT must be a valid TCP port".to_string())).transpose()?.unwrap_or(8765);
+                if port == 0 { return Err("LOCALSCALE_SERVICE_PORT must be non-zero".into()); }
+                let upstream = env::var("LOCALSCALE_UPSTREAM").unwrap_or_else(|_| "127.0.0.1:8765".into());
+                TorMode::host(port, upstream).map_err(|e| e.to_string())?
+            }
+            "cliente" => TorMode::client(&record.endpoint).map_err(|e| e.to_string())?,
+            other => return Err(format!("peer record role must be host or cliente, got {other}")),
+        };
+        Ok(Self { mode, data_dir })
+    }
+
+    #[cfg(test)]
     fn from_values(role: Option<&str>, service_port: Option<&str>, upstream: Option<&str>, hostname: Option<&str>) -> Result<Self, String> {
+        Self::from_values_with_data_dir(role, service_port, upstream, hostname, Self::data_dir_from_environment()?)
+    }
+
+    fn from_values_with_data_dir(role: Option<&str>, service_port: Option<&str>, upstream: Option<&str>, hostname: Option<&str>, data_dir: std::path::PathBuf) -> Result<Self, String> {
         let mode = match role {
             Some("host") => {
                 let port = service_port.ok_or("host requires LOCALSCALE_SERVICE_PORT")?.parse::<u16>().map_err(|_| "LOCALSCALE_SERVICE_PORT must be a valid TCP port")?;
@@ -50,10 +96,6 @@ impl RuntimeConfig {
             Some(other) => return Err(format!("LOCALSCALE_ROLE must be host or cliente, got {other}")),
             None => return Err("LOCALSCALE_ROLE is required; refusing an implicit role".into()),
         };
-        let data_dir = env::var_os("LOCALSCALE_TOR_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
-            env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| env::temp_dir()).join("localscale/tor")
-        });
-        if !data_dir.is_absolute() { return Err("LOCALSCALE_TOR_DATA_DIR must be absolute".into()); }
         Ok(Self { mode, data_dir })
     }
 }
@@ -371,6 +413,97 @@ mod tests {
     fn runtime_config_rejects_wrong_role_fields_and_invalid_ports() {
         assert!(RuntimeConfig::from_values(Some("host"), Some("0"), Some("127.0.0.1:8765"), None).is_err());
         assert!(RuntimeConfig::from_values(Some("cliente"), Some("8080"), None, None).is_err());
+    }
+
+    #[test]
+    fn approved_peer_store_bootstraps_cliente_runtime_after_restart() {
+        let _guard = env_lock();
+        let path = test_temp("runtime-peer-client");
+        let data_dir = test_temp("runtime-peer-client-data");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let hostname = format!("{}.onion", "a".repeat(56));
+        let mut store = PeerStore::open(&path).unwrap();
+        store.configure(localscale_agent::PeerRecord {
+            role: "cliente".into(), node_id: "client-01".into(), host_node_id: Some("host-01".into()),
+            endpoint: hostname.clone(), invitation_secret: "secret-value".into(), approved: true, revoked: false,
+        }).unwrap();
+        env::set_var("LOCALSCALE_PEER_STORE", &path);
+        env::set_var("LOCALSCALE_TOR_DATA_DIR", &data_dir);
+        env::remove_var("LOCALSCALE_ROLE");
+        env::remove_var("LOCALSCALE_ONION_ENDPOINT");
+        env::remove_var("LOCALSCALE_SERVICE_PORT");
+        env::remove_var("LOCALSCALE_UPSTREAM");
+
+        let first_start = RuntimeConfig::from_environment().unwrap().unwrap();
+        let second_start = RuntimeConfig::from_environment().unwrap().unwrap();
+        assert_eq!(first_start.mode, TorMode::Client { hostname });
+        assert_eq!(second_start.mode, first_start.mode);
+        assert_eq!(second_start.data_dir, data_dir);
+
+        for name in ["LOCALSCALE_PEER_STORE", "LOCALSCALE_TOR_DATA_DIR"] { env::remove_var(name); }
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn approved_peer_store_bootstraps_host_runtime_after_restart() {
+        let _guard = env_lock();
+        let path = test_temp("runtime-peer-host");
+        let data_dir = test_temp("runtime-peer-host-data");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let mut store = PeerStore::open(&path).unwrap();
+        store.configure(localscale_agent::PeerRecord {
+            role: "host".into(), node_id: "host-01".into(), host_node_id: None,
+            endpoint: format!("{}.onion", "b".repeat(56)), invitation_secret: "secret-value".into(), approved: true, revoked: false,
+        }).unwrap();
+        env::set_var("LOCALSCALE_PEER_STORE", &path);
+        env::set_var("LOCALSCALE_TOR_DATA_DIR", &data_dir);
+        env::remove_var("LOCALSCALE_ROLE");
+        env::remove_var("LOCALSCALE_SERVICE_PORT");
+        env::remove_var("LOCALSCALE_UPSTREAM");
+
+        let config = RuntimeConfig::from_environment().unwrap().unwrap();
+        assert_eq!(config.mode, TorMode::Host { service_port: 8765, upstream: "127.0.0.1:8765".into() });
+
+        for name in ["LOCALSCALE_PEER_STORE", "LOCALSCALE_TOR_DATA_DIR"] { env::remove_var(name); }
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn semantically_invalid_approved_peer_store_fails_closed() {
+        let _guard = env_lock();
+        let path = test_temp("runtime-peer-invalid");
+        let _ = std::fs::remove_file(&path);
+        let mut store = PeerStore::open(&path).unwrap();
+        store.configure(localscale_agent::PeerRecord {
+            role: "unknown".into(), node_id: "node-01".into(), host_node_id: None,
+            endpoint: "not-an-onion".into(), invitation_secret: "secret-value".into(), approved: true, revoked: false,
+        }).unwrap();
+        env::set_var("LOCALSCALE_PEER_STORE", &path);
+        env::remove_var("LOCALSCALE_ROLE");
+        assert!(RuntimeConfig::from_environment().unwrap().is_none());
+        env::remove_var("LOCALSCALE_PEER_STORE");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unapproved_peer_store_does_not_bootstrap_runtime() {
+        let _guard = env_lock();
+        let path = test_temp("runtime-peer-unapproved");
+        let _ = std::fs::remove_file(&path);
+        let mut store = PeerStore::open(&path).unwrap();
+        store.configure(localscale_agent::PeerRecord {
+            role: "cliente".into(), node_id: "client-01".into(), host_node_id: Some("host-01".into()),
+            endpoint: format!("{}.onion", "a".repeat(56)), invitation_secret: "secret-value".into(), approved: false, revoked: false,
+        }).unwrap();
+        env::set_var("LOCALSCALE_PEER_STORE", &path);
+        env::remove_var("LOCALSCALE_ROLE");
+        assert!(RuntimeConfig::from_environment().unwrap().is_none());
+        env::remove_var("LOCALSCALE_PEER_STORE");
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(unix)]
