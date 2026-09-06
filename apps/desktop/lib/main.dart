@@ -82,10 +82,31 @@ class _LocalScaleAppState extends State<LocalScaleApp> {
   @override
   Widget build(BuildContext context) => MaterialApp(
         title: 'LocalScale',
+        themeMode: ThemeMode.system,
         theme: ThemeData(
-            colorScheme:
-                ColorScheme.fromSeed(seedColor: const Color(0xff6750a4)),
-            useMaterial3: true),
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: const Color(0xff2563eb),
+            brightness: Brightness.light,
+          ),
+          useMaterial3: true,
+          cardTheme: const CardTheme(
+            elevation: 1,
+            margin: EdgeInsets.symmetric(vertical: 8),
+          ),
+        ),
+        darkTheme: ThemeData(
+          colorScheme: ColorScheme.fromSeed(
+            seedColor: const Color(0xff3b82f6),
+            brightness: Brightness.dark,
+          ),
+          useMaterial3: true,
+          scaffoldBackgroundColor: const Color(0xff0b0f19),
+          cardTheme: const CardTheme(
+            color: Color(0xff111827),
+            elevation: 2,
+            margin: EdgeInsets.symmetric(vertical: 8),
+          ),
+        ),
         home: AnimatedBuilder(
             animation: auth,
             builder: (_, __) => auth.model.state == AuthState.signedIn

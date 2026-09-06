@@ -34,7 +34,10 @@ Lifecycle state is explicit: `stopped`, `starting`, `running`, `stopping`, or `e
 
 ## Development
 
-The repository includes the Rust agent (`localscaled`), protocol tests, deployment templates, and a Flutter Web control-page model. Build and test commands depend on the local Rust and Flutter toolchains. Before treating a build as an operational release, verify the versioned local API, real Flutter transport, lifecycle transitions, Tor role behavior, loopback enforcement, and the one-page launch invariant.
+The repository includes the Rust agent (`localscaled`), protocol tests, deployment templates, and a Flutter Web control-page model.
+
+- **Self-contained native web control interface:** `localscaled` natively serves a zero-dependency, modern dark-mode control interface on loopback (`http://127.0.0.1:<port>/`), offering real-time status polling, mode switching (Host/Cliente), lifecycle controls (Start/Stop/Sync), Onion endpoint clipboard copying, and safe diagnostics viewing out of the box without requiring external frontend assets or toolchains to be installed.
+- **Automated verification:** Run `cargo test` to execute the full suite of 63 unit and integration tests covering protocol framing, loopback enforcement, CSRF origin verification, and Tor process lifecycle.
 
 ## Operations
 

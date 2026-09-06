@@ -41,8 +41,504 @@ pub fn health_response() -> &'static str {
 
 pub fn configuration_html() -> &'static str {
     r#"<!doctype html>
-<html lang="en"><meta charset="utf-8"><title>LocalScale</title>
-<body><h1>LocalScale</h1><p>Local service is running.</p></body></html>"#
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LocalScale</title>
+  <style>
+    :root {
+      --bg-primary: #0b0f19;
+      --bg-surface: #111827;
+      --bg-surface-elevated: #1e293b;
+      --text-primary: #f8fafc;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --accent-primary: #3b82f6;
+      --accent-hover: #2563eb;
+      --accent-active: #1d4ed8;
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --border: #334155;
+      --border-focus: #60a5fa;
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 16px;
+      --shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.5;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+    .container {
+      width: 100%;
+      max-width: 680px;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .logo-group {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .logo-badge {
+      width: 38px;
+      height: 38px;
+      border-radius: var(--radius-md);
+      background: linear-gradient(135deg, var(--accent-primary), #8b5cf6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      color: #fff;
+      font-size: 1.15rem;
+      box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+    }
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.025em;
+    }
+    .subtitle {
+      font-size: 0.875rem;
+      color: var(--text-muted);
+    }
+    .badge-refresh {
+      background: var(--bg-surface-elevated);
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 0.35rem 0.75rem;
+      font-size: 0.8rem;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      transition: all 0.2s ease;
+    }
+    .badge-refresh:hover {
+      background: var(--border);
+      color: var(--text-primary);
+    }
+    .card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 1.5rem;
+      box-shadow: var(--shadow);
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+    }
+    .card-title {
+      font-size: 1rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .pulse-indicator {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background-color: var(--text-muted);
+      position: relative;
+    }
+    .pulse-indicator.running {
+      background-color: var(--success);
+      box-shadow: 0 0 10px var(--success);
+    }
+    .pulse-indicator.starting, .pulse-indicator.stopping {
+      background-color: var(--warning);
+      box-shadow: 0 0 10px var(--warning);
+    }
+    .pulse-indicator.error {
+      background-color: var(--danger);
+      box-shadow: 0 0 10px var(--danger);
+    }
+    .status-text {
+      font-size: 1.2rem;
+      font-weight: 600;
+      text-transform: capitalize;
+    }
+    .mode-toggle-group {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+    }
+    .mode-btn {
+      background: var(--bg-surface-elevated);
+      color: var(--text-secondary);
+      border: 2px solid transparent;
+      padding: 0.85rem;
+      border-radius: var(--radius-md);
+      font-weight: 600;
+      font-size: 0.95rem;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.25rem;
+      transition: all 0.2s ease;
+    }
+    .mode-btn span.mode-desc {
+      font-size: 0.75rem;
+      font-weight: 400;
+      color: var(--text-muted);
+    }
+    .mode-btn:hover {
+      background: #253349;
+      color: var(--text-primary);
+    }
+    .mode-btn.active {
+      border-color: var(--accent-primary);
+      background: rgba(59, 130, 246, 0.15);
+      color: #93c5fd;
+    }
+    .mode-btn.active span.mode-desc {
+      color: #bfdbfe;
+    }
+    .action-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+    }
+    .btn {
+      flex: 1;
+      min-width: 110px;
+      padding: 0.75rem 1rem;
+      font-size: 0.9rem;
+      font-weight: 600;
+      border-radius: var(--radius-md);
+      border: none;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      transition: all 0.2s ease;
+    }
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .btn-primary {
+      background: var(--accent-primary);
+      color: #fff;
+    }
+    .btn-primary:hover:not(:disabled) {
+      background: var(--accent-hover);
+    }
+    .btn-secondary {
+      background: var(--bg-surface-elevated);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:hover:not(:disabled) {
+      background: var(--border);
+    }
+    .btn-danger {
+      background: rgba(239, 68, 68, 0.15);
+      color: #fca5a5;
+      border: 1px solid rgba(239, 68, 68, 0.3);
+    }
+    .btn-danger:hover:not(:disabled) {
+      background: rgba(239, 68, 68, 0.25);
+    }
+    .field-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+    .field-label {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .input-with-action {
+      display: flex;
+      gap: 0.5rem;
+    }
+    .input-text {
+      flex: 1;
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 0.65rem 0.85rem;
+      color: var(--text-primary);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.85rem;
+      outline: none;
+    }
+    .input-text:focus {
+      border-color: var(--border-focus);
+    }
+    .btn-icon {
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      border-radius: var(--radius-md);
+      padding: 0.65rem 1rem;
+      font-weight: 500;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .btn-icon:hover {
+      background: var(--border);
+      color: var(--text-primary);
+    }
+    .toast-message {
+      padding: 0.75rem 1rem;
+      border-radius: var(--radius-md);
+      font-size: 0.85rem;
+      background: rgba(59, 130, 246, 0.1);
+      border: 1px solid rgba(59, 130, 246, 0.25);
+      color: #93c5fd;
+      display: none;
+    }
+    .toast-message.error {
+      background: rgba(239, 68, 68, 0.1);
+      border-color: rgba(239, 68, 68, 0.25);
+      color: #fca5a5;
+    }
+    details {
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 0.75rem 1rem;
+      font-size: 0.85rem;
+    }
+    summary {
+      cursor: pointer;
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
+    summary:hover {
+      color: var(--text-primary);
+    }
+    pre {
+      margin-top: 0.75rem;
+      overflow-x: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.78rem;
+      color: #94a3b8;
+    }
+    footer {
+      text-align: center;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      margin-top: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <header>
+      <div class="logo-group">
+        <div class="logo-badge">LS</div>
+        <div>
+          <h1>LocalScale</h1>
+          <div class="subtitle">Local-First Secure Agent Control</div>
+        </div>
+      </div>
+      <button class="badge-refresh" id="refreshBtn" onclick="refreshStatus()">
+        <span>↻</span> Refresh
+      </button>
+    </header>
+
+    <div id="toastMessage" class="toast-message"></div>
+
+    <section class="card">
+      <div class="card-title">
+        <span>Operating Status</span>
+        <span id="versionLabel" class="subtitle">v0.1.0</span>
+      </div>
+      <div class="status-row">
+        <div id="statusIndicator" class="pulse-indicator"></div>
+        <div id="statusText" class="status-text">Connecting...</div>
+      </div>
+
+      <div class="field-group">
+        <div class="field-label">Node Role</div>
+        <div class="mode-toggle-group">
+          <button type="button" class="mode-btn" id="modeBtnHost" onclick="selectMode('host')">
+            <span>Host Mode</span>
+            <span class="mode-desc">Publishes Tor v3 Onion service</span>
+          </button>
+          <button type="button" class="mode-btn" id="modeBtnCliente" onclick="selectMode('cliente')">
+            <span>Cliente Mode</span>
+            <span class="mode-desc">Connects outbound to Host</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="field-group" id="endpointGroup">
+        <div class="field-label">Public Onion Endpoint</div>
+        <div class="input-with-action">
+          <input type="text" id="onionEndpoint" class="input-text" readonly placeholder="Available in Host mode when running" />
+          <button type="button" class="btn-icon" id="copyBtn" onclick="copyEndpoint()">Copy</button>
+        </div>
+      </div>
+
+      <div class="action-group">
+        <button type="button" class="btn btn-primary" id="btnStart" onclick="callServiceAction('start')">▶ Start</button>
+        <button type="button" class="btn btn-danger" id="btnStop" onclick="callServiceAction('stop')">⏹ Stop</button>
+        <button type="button" class="btn btn-secondary" id="btnSync" onclick="callServiceAction('sync')">⟳ Sync</button>
+      </div>
+    </section>
+
+    <details>
+      <summary>Agent Diagnostics & Safety Info</summary>
+      <pre id="diagJson">Fetching diagnostics...</pre>
+    </details>
+
+    <footer>
+      Protected by strict loopback policy. Administrative interface is never exposed over external or Onion networks.
+    </footer>
+  </main>
+
+  <script>
+    let currentMode = 'cliente';
+    let currentState = 'stopped';
+
+    function showToast(msg, isError = false) {
+      const toast = document.getElementById('toastMessage');
+      toast.textContent = msg;
+      toast.className = 'toast-message' + (isError ? ' error' : '');
+      toast.style.display = 'block';
+      setTimeout(() => { toast.style.display = 'none'; }, 4000);
+    }
+
+    function updateUi(status) {
+      currentState = status.state || 'stopped';
+      currentMode = status.mode || 'cliente';
+
+      const indicator = document.getElementById('statusIndicator');
+      indicator.className = 'pulse-indicator ' + currentState;
+
+      document.getElementById('statusText').textContent = currentState;
+
+      const hostBtn = document.getElementById('modeBtnHost');
+      const clienteBtn = document.getElementById('modeBtnCliente');
+      if (currentMode === 'host') {
+        hostBtn.classList.add('active');
+        clienteBtn.classList.remove('active');
+      } else {
+        clienteBtn.classList.add('active');
+        hostBtn.classList.remove('active');
+      }
+
+      const onionInput = document.getElementById('onionEndpoint');
+      onionInput.value = status.onion_endpoint || '';
+
+      const isRunning = currentState === 'running';
+      document.getElementById('btnStart').disabled = isRunning || currentState === 'starting';
+      document.getElementById('btnStop').disabled = currentState === 'stopped' || currentState === 'stopping';
+    }
+
+    async function refreshStatus() {
+      try {
+        const res = await fetch('/api/v1/status');
+        if (!res.ok) throw new Error('Status HTTP ' + res.status);
+        const data = await res.json();
+        updateUi(data);
+      } catch (err) {
+        document.getElementById('statusText').textContent = 'Agent unreachable';
+        document.getElementById('statusIndicator').className = 'pulse-indicator error';
+      }
+      loadDiagnostics();
+    }
+
+    async function selectMode(mode) {
+      try {
+        const res = await fetch('/api/v1/mode', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: mode })
+        });
+        if (!res.ok) throw new Error('Mode update HTTP ' + res.status);
+        const data = await res.json();
+        updateUi(data);
+        showToast('Mode switched to ' + mode);
+      } catch (err) {
+        showToast('Failed to switch mode: ' + err.message, true);
+      }
+    }
+
+    async function callServiceAction(action) {
+      try {
+        const url = action === 'sync' ? '/api/v1/sync' : '/api/v1/service/' + action;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+        if (!res.ok) throw new Error('Action HTTP ' + res.status);
+        const data = await res.json();
+        updateUi(data);
+        showToast('Service ' + action + ' requested');
+      } catch (err) {
+        showToast('Service ' + action + ' failed: ' + err.message, true);
+      }
+    }
+
+    async function loadDiagnostics() {
+      try {
+        const res = await fetch('/diagnostics');
+        if (res.ok) {
+          const data = await res.json();
+          document.getElementById('diagJson').textContent = JSON.stringify(data, null, 2);
+        }
+      } catch (_) {}
+    }
+
+    function copyEndpoint() {
+      const input = document.getElementById('onionEndpoint');
+      if (!input.value) {
+        showToast('No endpoint available to copy', true);
+        return;
+      }
+      navigator.clipboard.writeText(input.value).then(() => {
+        showToast('Onion address copied to clipboard!');
+      }).catch(() => {
+        input.select();
+        document.execCommand('copy');
+        showToast('Copied to clipboard!');
+      });
+    }
+
+    refreshStatus();
+    setInterval(refreshStatus, 4000);
+  </script>
+</body>
+</html>"#
 }
 
 #[derive(Clone)]
