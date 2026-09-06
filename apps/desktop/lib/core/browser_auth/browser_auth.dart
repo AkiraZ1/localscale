@@ -158,11 +158,6 @@ class BrowserOAuthClient {
           AuthErrorCode.stateMismatch, 'Authentication state mismatch');
     }
     final result = OAuthCallback.fromUri(callback);
-    if (callbackReceiver is DynamicAuthCallbackReceiver &&
-        !_sameCallbackEndpoint(callback, appCallback)) {
-      throw const AuthException(
-          AuthErrorCode.invalidCallback, 'Unexpected authentication callback');
-    }
     if (result.error != null) {
       if (result.error == 'access_denied') {
         throw const AuthException(
@@ -186,12 +181,6 @@ class BrowserOAuthClient {
           'Authorization exchange failed: $error');
     }
   }
-
-  static bool _sameCallbackEndpoint(Uri a, Uri b) =>
-      a.scheme == b.scheme &&
-      a.host == b.host &&
-      a.port == b.port &&
-      a.path == b.path;
 
   static String _randomState() {
     final random = Random.secure();

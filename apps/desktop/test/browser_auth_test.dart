@@ -90,7 +90,8 @@ BrowserOAuthClient client(
 }
 
 void main() {
-  test('dynamic callback port uses server redirect and opaque handoff', () async {
+  test('dynamic callback port uses server redirect and opaque handoff',
+      () async {
     final launcher = RecordingLauncher();
     final exchanger = TestExchanger();
     final appCallback = Uri.parse('http://127.0.0.1:43123/oauth/callback');
@@ -99,8 +100,7 @@ void main() {
         authorizationEndpoint:
             Uri.parse('http://127.0.0.1:8765/oauth/google/start'),
         clientId: 'local-agent',
-        redirectUri:
-            Uri.parse('http://127.0.0.1:8765/oauth/google/callback'),
+        redirectUri: Uri.parse('http://127.0.0.1:8765/oauth/google/callback'),
         scopes: const ['openid'],
       ),
       browserLauncher: launcher,
@@ -120,8 +120,37 @@ void main() {
     expect(launcher.launched!.queryParameters['app_callback'],
         appCallback.toString());
     expect(exchanger.handoff, 'opaque');
+    expect(exchanger.callbackUri, appCallback);
     expect(exchanger.callbackUri!.port, 43123);
     expect(launcher.launched!.toString(), isNot(contains('access_token')));
+  });
+
+  test(
+      'dynamic receiver classifies provider errors before endpoint text checks',
+      () async {
+    final appCallback = Uri.parse('http://localhost:56595/oauth/callback');
+    final callback = Uri.parse(
+        'http://127.0.0.1:56595/oauth/callback?error=authentication_failed&state=expected-state');
+    final client = BrowserOAuthClient(
+      request: OAuthAuthorizationRequest(
+        authorizationEndpoint:
+            Uri.parse('http://127.0.0.1:8765/oauth/google/start'),
+        clientId: 'local-agent',
+        redirectUri: Uri.parse('http://127.0.0.1:8765/oauth/google/callback'),
+        scopes: const ['openid'],
+      ),
+      browserLauncher: RecordingLauncher(),
+      callbackReceiver: DynamicCallbackQueue(callback, appCallback),
+      exchanger: TestExchanger(),
+      pkce: TestPkce(),
+      stateGenerator: () => 'expected-state',
+    );
+
+    await expectLater(
+      client.authorize(),
+      throwsA(isA<AuthException>()
+          .having((e) => e.code, 'code', AuthErrorCode.providerError)),
+    );
   });
 
   test('start URL contains authorization code + PKCE parameters', () async {
@@ -138,8 +167,10 @@ void main() {
         containsPair('response_type', 'code'));
     expect(launcher.launched!.queryParameters,
         containsPair('client_id', 'public-client'));
-    expect(launcher.launched!.queryParameters,
-        containsPair('redirect_uri', 'http://127.0.0.1:8765/oauth/google/callback'));
+    expect(
+        launcher.launched!.queryParameters,
+        containsPair(
+            'redirect_uri', 'http://127.0.0.1:8765/oauth/google/callback'));
     expect(launcher.launched!.queryParameters,
         containsPair('state', 'expected-state'));
     expect(launcher.launched!.queryParameters,
@@ -170,8 +201,8 @@ void main() {
   test('state mismatch maps to stateMismatch', () async {
     await expectLater(
         client(
-                callback:
-                    Uri.parse('http://127.0.0.1:8765/oauth/google/callback?handoff=abc&state=wrong'))
+                callback: Uri.parse(
+                    'http://127.0.0.1:8765/oauth/google/callback?handoff=abc&state=wrong'))
             .authorize(),
         throwsA(isA<AuthException>()
             .having((e) => e.code, 'code', AuthErrorCode.stateMismatch)));
