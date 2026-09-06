@@ -6,6 +6,7 @@ bundle=${2:?installed bundle root}
 case "$platform" in
   linux-x86_64|windows-x86_64) path="$bundle/tor/tor"; [ "$platform" = windows-x86_64 ] && path="$bundle/tor/tor.exe" ;;
   macos-x86_64|macos-aarch64) path="$bundle/Contents/Resources/tor/tor" ;;
+  macos-agent) path="$bundle/tor/tor" ;;
   *) echo "unknown platform: $platform" >&2; exit 2 ;;
 esac
 if [ ! -f "$path" ]; then
