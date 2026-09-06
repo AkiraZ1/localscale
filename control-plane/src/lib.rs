@@ -450,12 +450,19 @@ impl<P: AuthProvider> AuthService<P> {
         let (Some(code), Some(state)) = (request.query.get("code"), request.query.get("state")) else { return AuthResponse::new(400) };
         if code.is_empty() || state.is_empty() { return AuthResponse::new(400); }
         let tx = match self.transactions.consume(state, now) { Ok(t) => t, Err(_) => return AuthResponse::new(400) };
-        let token = match self.provider.exchange_code(&tx, code) { Ok(t) => t, Err(_) => return AuthResponse::new(502) };
+        let pending_callback = self.pending_callbacks.remove(state).filter(|callback| valid_loopback_callback(callback));
+        let token = match self.provider.exchange_code(&tx, code) {
+            Ok(t) => t,
+            Err(_) => return Self::provider_failure(pending_callback, state, 502),
+        };
         let now_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
-        let identity = match self.provider.validate_id_token(&token.id_token, tx.nonce(), now_secs) { Ok(i) => i, Err(_) => return AuthResponse::new(401) };
+        let identity = match self.provider.validate_id_token(&token.id_token, tx.nonce(), now_secs) {
+            Ok(i) => i,
+            Err(_) => return Self::provider_failure(pending_callback, state, 401),
+        };
         let sid = random_opaque();
         self.sessions.insert(sid.clone(), Session { issuer: identity.issuer, subject: identity.subject, expires_at: now + self.session_ttl, revoked: false });
-        let location = self.pending_callbacks.remove(state);
+        let location = pending_callback;
         let has_handoff = location.is_some();
         let location = if let Some(location) = location {
             let handoff = random_opaque();
@@ -467,6 +474,11 @@ impl<P: AuthProvider> AuthService<P> {
         } else { "/".to_owned() };
         let headers = if has_handoff { Vec::new() } else { vec![("Set-Cookie".into(), format!("localscale_session={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict", sid, self.session_ttl.as_secs()))] };
         AuthResponse { status: 303, headers: { let mut h = headers; h.insert(0, ("Location".into(), location)); h }, body: String::new() }
+    }
+    fn provider_failure(callback: Option<String>, state: &str, status: u16) -> AuthResponse {
+        let Some(callback) = callback else { return AuthResponse::new(status); };
+        let encoded_state = form_urlencoded::byte_serialize(state.as_bytes()).collect::<String>();
+        AuthResponse { status: 303, headers: vec![("Location".into(), format!("{callback}?error=authentication_failed&state={encoded_state}"))], body: String::new() }
     }
     fn bridge(&mut self, request: &AuthRequest, now: std::time::SystemTime) -> AuthResponse {
         let (Some(token), Some(callback), Some(state)) = (request.query.get("handoff"), request.query.get("callback"), request.query.get("state")) else { return AuthResponse::new(400) };
@@ -517,6 +529,64 @@ mod phase3_red_tests {
 
     fn service() -> AuthService<Provider> { AuthService::new(Provider, Duration::from_secs(60), "https://host.test/auth/google/callback") }
     fn now() -> SystemTime { SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000) }
+
+    struct FailingProvider { fail_exchange: bool, fail_validation: bool }
+    impl AuthProvider for FailingProvider {
+        fn authorization_url(&self, tx: &PkceTransaction) -> Result<String, AuthError> {
+            Ok(format!("https://accounts.google.com/auth?state={}", tx.state()))
+        }
+        fn exchange_code(&mut self, _: &PkceTransaction, _: &str) -> Result<TokenResponse, AuthError> {
+            if self.fail_exchange { return Err(AuthError::Provider); }
+            Ok(TokenResponse { access_token: "access-secret".into(), id_token: "id-secret".into(), token_type: "Bearer".into() })
+        }
+        fn validate_id_token(&mut self, _: &str, _: &str, _: i64) -> Result<ValidatedIdentity, AuthError> {
+            if self.fail_validation { return Err(AuthError::Provider); }
+            Ok(ValidatedIdentity { issuer: "https://accounts.google.com".into(), subject: "subject".into() })
+        }
+        fn transaction_ttl(&self) -> Duration { Duration::from_secs(60) }
+    }
+
+    fn failing_service(fail_exchange: bool, fail_validation: bool) -> AuthService<FailingProvider> {
+        AuthService::new(FailingProvider { fail_exchange, fail_validation }, Duration::from_secs(60), "https://host.test/auth/google/callback")
+    }
+
+    fn assert_provider_failure_redirects(fail_exchange: bool, fail_validation: bool) {
+        let mut service = failing_service(fail_exchange, fail_validation);
+        let callback = "http://127.0.0.1:43126/oauth/callback";
+        let start = service.handle_at(AuthRequest::get("/oauth/google/start").query("app_callback", callback), now());
+        let state = start.header("Location").unwrap().split("state=").nth(1).unwrap().to_owned();
+        let sensitive_code = "provider-code-secret";
+        let response = service.handle_at(AuthRequest::get("/oauth/google/callback").query("code", sensitive_code).query("state", &state), now());
+        assert_eq!(response.status, 303);
+        assert_eq!(response.header("Location").unwrap(), format!("{callback}?error=authentication_failed&state={state}"));
+        assert!(response.body.is_empty());
+        let rendered = format!("{:?}{:?}{:?}", response.status, response.headers, response.body);
+        assert!(!rendered.contains(sensitive_code) && !rendered.contains("access-secret") && !rendered.contains("id-secret"));
+        assert_eq!(service.handle_at(AuthRequest::get("/oauth/google/callback").query("code", sensitive_code).query("state", &state), now()).status, 400);
+    }
+
+    #[test]
+    fn exchange_failure_redirects_to_exact_pending_loopback_callback() {
+        assert_provider_failure_redirects(true, false);
+    }
+
+    #[test]
+    fn id_token_validation_failure_redirects_to_exact_pending_loopback_callback() {
+        assert_provider_failure_redirects(false, true);
+    }
+
+    #[test]
+    fn provider_failures_without_pending_callback_keep_bare_statuses() {
+        let mut exchange = failing_service(true, false);
+        let start = exchange.handle_at(AuthRequest::get("/oauth/google/start"), now());
+        let state = start.header("Location").unwrap().split("state=").nth(1).unwrap();
+        assert_eq!(exchange.handle_at(AuthRequest::get("/oauth/google/callback").query("code", "secret-code").query("state", state), now()).status, 502);
+
+        let mut validation = failing_service(false, true);
+        let start = validation.handle_at(AuthRequest::get("/oauth/google/start"), now());
+        let state = start.header("Location").unwrap().split("state=").nth(1).unwrap();
+        assert_eq!(validation.handle_at(AuthRequest::get("/oauth/google/callback").query("code", "secret-code").query("state", state), now()).status, 401);
+    }
 
     #[test]
     fn start_is_a_safe_302_and_stores_pkce_state() {
