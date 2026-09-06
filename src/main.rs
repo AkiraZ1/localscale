@@ -25,7 +25,11 @@ struct RuntimeConfig {
 impl RuntimeConfig {
     fn data_dir_from_environment() -> Result<std::path::PathBuf, String> {
         let data_dir = env::var_os("LOCALSCALE_TOR_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
-            env::var_os("XDG_STATE_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| env::temp_dir()).join("localscale/tor")
+            env::var_os("XDG_STATE_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/state")))
+                .unwrap_or_else(|| env::temp_dir())
+                .join("localscale/tor")
         });
         if !data_dir.is_absolute() { return Err("LOCALSCALE_TOR_DATA_DIR must be absolute".into()); }
         Ok(data_dir)
