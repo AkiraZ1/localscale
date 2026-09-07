@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 mod tun_linux;
+#[cfg(target_os = "macos")]
+mod tun_macos;
 
 use localscale_agent::tor_runtime::{resolve_bundled_tor, TorMode, TorProcess, TorRuntime};
 use localscale_agent::{
@@ -418,9 +420,104 @@ fn spawn_tun_bridge(status: &PeerTransportStatus, packets: PacketChannel) {
     std::mem::forget(device);
 }
 
-#[cfg(not(target_os = "linux"))]
+/// macOS `utun` point-to-point interface — see `tun_macos` module docs for
+/// why its read/write path differs from Linux's (an address-family header
+/// frames every packet). `utun` is inherently point-to-point (no ARP/L2 to
+/// resolve), so both addresses go on at configure time and there is no
+/// separate "wait for peer IP, then add a route" step like Linux needs.
+#[cfg(target_os = "macos")]
+fn spawn_tun_bridge(status: &PeerTransportStatus, packets: PacketChannel) {
+    let local_ip = status.local_virtual_ip();
+    if local_ip.is_empty() {
+        log_event("tun: no local virtual IP configured, skipping TUN bridge");
+        return;
+    }
+    let device = match tun_macos::TunDevice::create(0) {
+        Ok(device) => device,
+        Err(error) => {
+            log_event(&format!(
+                "tun: failed to create utun device (needs root — see scripts/install-macos.sh): {error}"
+            ));
+            return;
+        }
+    };
+    // The peer's virtual IP may not be known yet (learned from its first
+    // heartbeat); poll briefly rather than failing the whole bridge.
+    let peer_ip = {
+        let mut found = None;
+        for _ in 0..20 {
+            if let Some(ip) = status.remote_virtual_ip() {
+                if !ip.is_empty() {
+                    found = Some(ip);
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+        found
+    };
+    let Some(peer_ip) = peer_ip else {
+        log_event("tun: peer virtual IP never arrived, skipping TUN bridge");
+        return;
+    };
+    if let Err(error) = device.configure_address(&local_ip, &peer_ip) {
+        log_event(&format!(
+            "tun: failed to configure {}: {error}",
+            device.name()
+        ));
+        return;
+    }
+    log_event(&format!(
+        "tun: {} up ({local_ip} -> {peer_ip}) — bridging to peer",
+        device.name()
+    ));
+    let reader = match device.try_clone_handle() {
+        Ok(handle) => handle,
+        Err(error) => {
+            log_event(&format!("tun: failed to clone utun handle: {error}"));
+            return;
+        }
+    };
+    let writer = match device.try_clone_handle() {
+        Ok(handle) => handle,
+        Err(error) => {
+            log_event(&format!("tun: failed to clone utun handle: {error}"));
+            return;
+        }
+    };
+    let sender = packets.sender();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65535];
+        loop {
+            let n = match reader.read_packet(&mut buf) {
+                Ok(0) => continue,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if sender.send_packet(&buf[..n]).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::spawn(move || loop {
+        match packets.receive_packet(Duration::from_secs(30)) {
+            Ok(packet) => {
+                if writer.write_packet(&packet).is_err() {
+                    break;
+                }
+            }
+            Err(localscale_agent_transport::TransportError::Timeout) => continue,
+            Err(_) => break,
+        }
+    });
+    // Keep the device alive for the process's lifetime: it must stay open
+    // as long as either forwarding thread holds a cloned/dup'd fd.
+    std::mem::forget(device);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn spawn_tun_bridge(_status: &PeerTransportStatus, packets: PacketChannel) {
-    log_event("tun: LOCALSCALE_ENABLE_TUN is set but this platform has no TUN implementation yet (Linux only so far)");
+    log_event("tun: LOCALSCALE_ENABLE_TUN is set but this platform has no TUN implementation yet (Linux and macOS only so far)");
     // Nothing reads `receive_packet` on this platform; if the peer has TUN
     // enabled and starts forwarding real traffic, its packets would pile up
     // forever in the channel's internal queue with no consumer. Drain and
