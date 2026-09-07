@@ -128,7 +128,11 @@ class _LocalScaleAppState extends State<LocalScaleApp> {
           useMaterial3: true,
           scaffoldBackgroundColor: const Color(0xff0b0f19),
         ),
-        home: ControlPage(api: widget.api, onLogout: () async {}),
+        home: AnimatedBuilder(
+            animation: auth,
+            builder: (_, __) => auth.model.state == AuthState.signedIn || const bool.fromEnvironment('LOCALSCALE_TEST_PAIRING')
+                ? ControlPage(api: widget.api, onLogout: auth.logout)
+                : LoginPage(controller: auth)),
       );
 }
 

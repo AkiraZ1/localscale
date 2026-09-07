@@ -110,7 +110,25 @@ Future<bool> ensureLocalAgentRestarted({
 
 Future<void> _startAgentDetached(
     String executable, List<String> arguments) async {
-  await Process.start(executable, arguments, mode: ProcessStartMode.detached);
+  final env = Map<String, String>.from(Platform.environment);
+  try {
+    final home = Platform.environment['HOME'] ?? '';
+    final oidcFile = File('$home/.config/localscale/oidc.json');
+    final secretsFile = File('$home/.config/localscale/secrets/google-client.json');
+    if (oidcFile.existsSync() && secretsFile.existsSync()) {
+      final oidc = jsonDecode(oidcFile.readAsStringSync());
+      final credential = jsonDecode(secretsFile.readAsStringSync())['web'];
+      env['LOCALSCALE_GOOGLE_CLIENT_ID'] = credential['client_id'];
+      env['LOCALSCALE_GOOGLE_CLIENT_SECRET'] = credential['client_secret'];
+      env['LOCALSCALE_OIDC_ISSUER'] = oidc['issuer'];
+      env['LOCALSCALE_GOOGLE_REDIRECT_URI'] = oidc['redirect_uri'];
+      final scopes = oidc['scopes'];
+      env['LOCALSCALE_OIDC_SCOPES'] = scopes is List ? scopes.join(' ') : scopes.toString();
+      env['LOCALSCALE_UPSTREAM'] = '127.0.0.1:8767';
+      env['LOCALSCALE_PEER_STORE'] = '$home/.local/state/localscale/peer-record.json';
+    }
+  } catch (_) {}
+  await Process.start(executable, arguments, mode: ProcessStartMode.detached, environment: env);
 }
 
 Future<bool> _probeAgentHealth(Uri base) async {
