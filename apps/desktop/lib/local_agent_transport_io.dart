@@ -29,8 +29,16 @@ Future<bool> ensureLocalAgentRunning({
   }
 
   final desktopExecutable = resolvedExecutable ?? Platform.resolvedExecutable;
-  final agentExecutable = File(
+  var agentExecutable = File(
       '${File(desktopExecutable).parent.path}${Platform.pathSeparator}localscaled');
+  
+  if (!await agentExecutable.exists() && Platform.isLinux) {
+    final home = Platform.environment['HOME'];
+    if (home != null) {
+      agentExecutable = File('$home/.local/opt/localscale-agent/localscaled');
+    }
+  }
+
   if (!await agentExecutable.exists()) return false;
 
   final start = processStarter ?? _startAgentDetached;
