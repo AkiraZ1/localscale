@@ -6,6 +6,12 @@ This document defines the security boundary for LocalScale's Google SSO deployme
 
 LocalScale has a **Host** that owns the control plane and starts a local browser page automatically. A **Cliente** connects to a Host and requests permitted operations. An **Onion** endpoint may provide reachability across an untrusted network. Google OIDC authenticates people; it does not decide LocalScale roles. The Host must make the final authorization decision for every operation.
 
+The current acceptance topology is **Linux Host → macOS Cliente**. Pairing is
+performed from the two app UIs using a short-lived, signed, one-use invitation
+(paste or QR). A development fixture may be generated through the UI for a
+single run, but static invitation secrets are forbidden and any historical
+literal shared secret must be treated as compromised and rotated.
+
 Assumptions:
 
 - The Host operating system and secret store are trusted within their stated administrative boundary; full Host compromise is an in-scope high-impact compromise, not something application controls can repair.
@@ -20,6 +26,7 @@ Assumptions:
 | Google client secret, token exchange, and OIDC transaction state | Confidentiality, single use, rapid rotation/revocation |
 | LocalScale identity mapping and role/policy | Integrity; map by Google `sub`, not mutable email |
 | Host control-plane API and Cliente pairing/session | Authentication, authorization, replay resistance, auditability |
+| Optional Drive `appDataFolder` discovery manifest | Least-privilege consent, signed/TTL-bound metadata, replay protection; never secrets or tokens |
 | User data and Host configuration | Confidentiality and integrity; least privilege per operation |
 | Local browser session and automatic startup flow | Confidentiality, CSRF resistance, predictable origin, safe logout |
 | Availability and audit records | Resist abuse; preserve enough redacted evidence for incident response |

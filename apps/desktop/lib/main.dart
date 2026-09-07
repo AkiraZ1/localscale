@@ -2,11 +2,14 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'core/browser_auth/browser_auth.dart';
 import 'core/browser_auth/browser_platform.dart';
 import 'features/auth/login_controller.dart';
 import 'local_agent_api.dart';
 import 'local_agent_transport.dart';
+import 'pairing_invitation.dart';
+import 'test_pairing_bootstrap.dart';
 
 // Native agents keep their installed ports: macOS 18765, other platforms 8765.
 final int localAgentPort =
@@ -16,8 +19,35 @@ const String googleClientId = String.fromEnvironment(
   defaultValue: 'local-agent',
 );
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  final agentRunning = await ensureLocalAgentRunning();
   final api = LocalAgentApiClient(defaultLocalAgentTransport());
+  if (agentRunning) {
+    final platform = defaultTargetPlatform == TargetPlatform.linux
+        ? TestPairingPlatform.linux
+        : defaultTargetPlatform == TargetPlatform.macOS
+            ? TestPairingPlatform.macOS
+            : TestPairingPlatform.unsupported;
+    try {
+      final outcome = await TestPairingBootstrap(api)
+          .run(config: TestPairingConfig.fromEnvironment(), platform: platform);
+      if (outcome == TestPairingOutcome.restartScheduled) {
+        final restarted = await ensureLocalAgentRestarted();
+        if (!restarted) {
+          debugPrint('LocalScale test pairing could not restart the local '
+              'agent after saving the peer profile.');
+        } else {
+          final resumed = await TestPairingBootstrap(api).run(
+              config: TestPairingConfig.fromEnvironment(), platform: platform);
+          debugPrint('LocalScale test pairing resumed after agent restart: '
+              '$resumed');
+        }
+      }
+    } on Object catch (error) {
+      debugPrint('LocalScale test pairing bootstrap failed: $error');
+    }
+  }
   final auth = LoginController(
     oauth: BrowserOAuthClient(
       request: OAuthAuthorizationRequest(
@@ -169,6 +199,11 @@ class _ControlPageState extends State<ControlPage> {
   String? message;
   Timer? _pollTimer;
   final TextEditingController _vipController = TextEditingController();
+  final TextEditingController _onionController = TextEditingController();
+  final TextEditingController _nodeIdController = TextEditingController();
+  final TextEditingController _invitationController = TextEditingController();
+  GeneratedInvitation? _generatedInvitation;
+  bool _pairingBusy = false;
 
   @override
   void initState() {
@@ -183,6 +218,9 @@ class _ControlPageState extends State<ControlPage> {
   void dispose() {
     _pollTimer?.cancel();
     _vipController.dispose();
+    _onionController.dispose();
+    _nodeIdController.dispose();
+    _invitationController.dispose();
     super.dispose();
   }
 
@@ -198,8 +236,19 @@ class _ControlPageState extends State<ControlPage> {
         setState(() {
           status = value;
           networkDevices = devices;
-          if (devices?.localDevice.virtualIp != null && _vipController.text.isEmpty) {
+          if (devices?.localDevice.virtualIp != null &&
+              _vipController.text.isEmpty) {
             _vipController.text = devices!.localDevice.virtualIp!;
+          }
+          final onion =
+              value.onionEndpoint ?? devices?.localDevice.onionEndpoint;
+          if (onion != null &&
+              onion.isNotEmpty &&
+              _onionController.text != onion) {
+            _onionController.text = onion;
+          }
+          if (_nodeIdController.text.isEmpty && devices != null) {
+            _nodeIdController.text = devices.localDevice.nodeId;
           }
           message = null;
         });
@@ -238,7 +287,8 @@ class _ControlPageState extends State<ControlPage> {
       await widget.api.setVirtualIp(ip);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('IP Virtual atualizado para $ip (persistido)')),
+          SnackBar(
+              content: Text('IP Virtual atualizado para $ip (persistido)')),
         );
         _refresh();
       }
@@ -249,6 +299,142 @@ class _ControlPageState extends State<ControlPage> {
         );
       }
     }
+  }
+
+  Future<void> _generateInvitation() async {
+    final nodeId = _nodeIdController.text.trim();
+    if (nodeId.isEmpty) {
+      _pairingMessage('Informe o identificador deste computador.');
+      return;
+    }
+    setState(() => _pairingBusy = true);
+    try {
+      if (status?.mode != LocalScaleMode.host) {
+        await widget.api.setMode(LocalScaleMode.host);
+      }
+      final generated = await widget.api.generateInvitation(
+        nodeId: nodeId,
+        virtualIp: _vipController.text.trim(),
+      );
+      // The agent generated the capability and is the source of truth. Parsing
+      // here is only a defensive display check.
+      InvitationPreview.parse(generated.invitation);
+      if (!mounted) return;
+      setState(() {
+        _generatedInvitation = generated;
+        _invitationController.text = generated.invitation;
+      });
+      _pairingMessage(
+          'Convite criado. Confira, copie e ative o Host para utilizá-lo.');
+    } catch (error) {
+      _pairingMessage('Não foi possível gerar o convite: $error');
+    } finally {
+      if (mounted) setState(() => _pairingBusy = false);
+    }
+  }
+
+  Future<void> _activateGeneratedInvitation() async {
+    final generated = _generatedInvitation;
+    if (generated == null) return;
+    final preview = InvitationPreview.parse(generated.invitation);
+    final confirmed = await _confirmInvitation(
+      preview,
+      title: 'Ativar este Host?',
+      explanation:
+          'O código abaixo identifica este convite específico; compare-o por um canal confiável com o Cliente.',
+    );
+    if (confirmed != true || !mounted) return;
+    await _approveAndRestart('Host ativado. O agente será reiniciado.');
+  }
+
+  Future<void> _importInvitation() async {
+    final nodeId = _nodeIdController.text.trim();
+    final invitation = _invitationController.text.trim();
+    if (nodeId.isEmpty || invitation.isEmpty) {
+      _pairingMessage('Informe o identificador local e cole o convite.');
+      return;
+    }
+    InvitationPreview preview;
+    try {
+      preview = InvitationPreview.parse(invitation);
+    } on FormatException catch (error) {
+      _pairingMessage(error.message);
+      return;
+    }
+    final confirmed = await _confirmInvitation(
+      preview,
+      title: 'Confirmar conexão?',
+      explanation:
+          'Este é apenas um resumo visual. O agente local ainda validará validade, expiração e uso único do convite.',
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _pairingBusy = true);
+    try {
+      if (status?.mode != LocalScaleMode.cliente) {
+        await widget.api.setMode(LocalScaleMode.cliente);
+      }
+      await widget.api.importInvitation(
+        nodeId: nodeId,
+        invitation: invitation,
+        virtualIp: _vipController.text.trim(),
+      );
+      await widget.api.approvePeer();
+      await widget.api.restartRuntime();
+      _pairingMessage('Convite aprovado. O agente será reiniciado.');
+    } catch (error) {
+      _pairingMessage('Falha ao importar convite: $error');
+    } finally {
+      if (mounted) setState(() => _pairingBusy = false);
+    }
+  }
+
+  Future<void> _approveAndRestart(String success) async {
+    setState(() => _pairingBusy = true);
+    try {
+      await widget.api.approvePeer();
+      await widget.api.restartRuntime();
+      _pairingMessage(success);
+    } catch (error) {
+      _pairingMessage('Falha ao ativar convite: $error');
+    } finally {
+      if (mounted) setState(() => _pairingBusy = false);
+    }
+  }
+
+  Future<bool?> _confirmInvitation(InvitationPreview preview,
+      {required String title, required String explanation}) {
+    return showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(title),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          Text(explanation),
+          const SizedBox(height: 16),
+          SelectableText('Host: ${preview.hostNodeId}'),
+          SelectableText('Onion: ${preview.onionEndpoint}'),
+          SelectableText('Expira: ${preview.expiresAt.toLocal()}'),
+          const SizedBox(height: 12),
+          const Text('Código de comparação do convite'),
+          SelectableText(preview.fingerprint,
+              key: const Key('invitation-fingerprint'),
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+        ]),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancelar')),
+          FilledButton(
+              key: const Key('confirm-invitation'),
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Confirmar')),
+        ],
+      ),
+    );
+  }
+
+  void _pairingMessage(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   }
 
   @override
@@ -301,9 +487,13 @@ class _ControlPageState extends State<ControlPage> {
                                   selected: {
                                     current?.mode ?? LocalScaleMode.cliente
                                   },
-                                  onSelectionChanged: (s) => _run(
-                                      () => widget.api.setMode(s.first),
-                                      'Mode update')),
+                                  onSelectionChanged: (s) {
+                                    _vipController.clear();
+                                    _onionController.clear();
+                                    _nodeIdController.clear();
+                                    _run(() => widget.api.setMode(s.first),
+                                        'Mode update');
+                                  }),
                               const SizedBox(height: 8),
                               const Text(
                                   'Host publishes an Onion service. Cliente connects outbound.'),
@@ -327,14 +517,41 @@ class _ControlPageState extends State<ControlPage> {
                                 Text(_stateLabel(current?.state))
                               ]),
                               const SizedBox(height: 16),
-                              TextFormField(
-                                  initialValue: current?.onionEndpoint ?? '',
-                                  readOnly: true,
-                                  decoration: const InputDecoration(
-                                      labelText: 'Onion endpoint',
-                                      hintText:
-                                          'Available when running as Host',
-                                      border: OutlineInputBorder())),
+                              Row(
+                                children: [
+                                  Expanded(
+                                    child: TextField(
+                                      controller: _onionController,
+                                      readOnly: true,
+                                      decoration: InputDecoration(
+                                        labelText: 'Onion endpoint (Tor v3)',
+                                        hintText: current?.mode ==
+                                                LocalScaleMode.host
+                                            ? 'Detectando endpoint Onion do Host...'
+                                            : 'Disponível no modo Host ou ao parear',
+                                        border: const OutlineInputBorder(),
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  IconButton.filledTonal(
+                                    tooltip: 'Copiar Onion',
+                                    onPressed: () {
+                                      if (_onionController.text.isNotEmpty) {
+                                        Clipboard.setData(ClipboardData(
+                                            text: _onionController.text));
+                                        ScaffoldMessenger.of(context)
+                                            .showSnackBar(
+                                          const SnackBar(
+                                              content: Text(
+                                                  'Endereço .onion copiado!')),
+                                        );
+                                      }
+                                    },
+                                    icon: const Icon(Icons.copy),
+                                  ),
+                                ],
+                              ),
                               const SizedBox(height: 16),
                               Wrap(spacing: 12, runSpacing: 8, children: [
                                 FilledButton.icon(
@@ -377,13 +594,14 @@ class _ControlPageState extends State<ControlPage> {
                               padding: const EdgeInsets.symmetric(
                                   horizontal: 8, vertical: 4),
                               decoration: BoxDecoration(
-                                color: Colors.green.withOpacity(0.15),
+                                color: Colors.green.withValues(alpha: 0.15),
                                 borderRadius: BorderRadius.circular(6),
                               ),
                               child: const Row(
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
-                                  Icon(Icons.shield, size: 14, color: Colors.green),
+                                  Icon(Icons.shield,
+                                      size: 14, color: Colors.green),
                                   SizedBox(width: 4),
                                   Text('Isolamento LAN Ativo (Tor 100%)',
                                       style: TextStyle(
@@ -439,8 +657,8 @@ class _ControlPageState extends State<ControlPage> {
                               ),
                             )
                           else
-                            ...devices.remotePeers
-                                .map((peer) => _buildDeviceTile(peer, isLocal: false)),
+                            ...devices.remotePeers.map((peer) =>
+                                _buildDeviceTile(peer, isLocal: false)),
                         ] else ...[
                           const Text('Carregando dispositivos da rede Onion...',
                               style: TextStyle(color: Colors.grey)),
@@ -449,7 +667,88 @@ class _ControlPageState extends State<ControlPage> {
                     ),
                   ),
                 ),
+                const SizedBox(height: 16),
+                _buildInvitationCard(current),
               ]))),
+    );
+  }
+
+  Widget _buildInvitationCard(ServiceStatus? current) {
+    final isHost = current?.mode == LocalScaleMode.host;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('Pareamento por convite',
+              style: Theme.of(context).textTheme.titleLarge),
+          const SizedBox(height: 8),
+          Text(isHost
+              ? 'Gere um convite de uso único e envie-o ao Cliente por um canal confiável.'
+              : 'Cole o convite recebido do Host, confira os dados e aprove localmente.'),
+          const SizedBox(height: 12),
+          TextField(
+            key: const Key('pairing-node-id'),
+            controller: _nodeIdController,
+            decoration: const InputDecoration(
+                labelText: 'Identificador deste computador',
+                border: OutlineInputBorder()),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            key: const Key('pairing-invitation'),
+            controller: _invitationController,
+            minLines: 2,
+            maxLines: 4,
+            readOnly: isHost && _generatedInvitation != null,
+            decoration: InputDecoration(
+                labelText: isHost ? 'Convite gerado' : 'Convite do Host',
+                hintText: 'lsinv1.…',
+                border: const OutlineInputBorder(),
+                suffixIcon: IconButton(
+                  tooltip: 'Copiar convite',
+                  onPressed: _invitationController.text.trim().isEmpty
+                      ? null
+                      : () {
+                          Clipboard.setData(ClipboardData(
+                              text: _invitationController.text.trim()));
+                          _pairingMessage('Convite copiado.');
+                        },
+                  icon: const Icon(Icons.copy),
+                )),
+          ),
+          const SizedBox(height: 12),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+            if (isHost)
+              FilledButton.icon(
+                  key: const Key('generate-invitation'),
+                  onPressed: _pairingBusy ? null : _generateInvitation,
+                  icon: const Icon(Icons.add_link),
+                  label: const Text('Gerar convite'))
+            else
+              FilledButton.icon(
+                  key: const Key('import-invitation'),
+                  onPressed: _pairingBusy ? null : _importInvitation,
+                  icon: const Icon(Icons.link),
+                  label: const Text('Revisar e conectar')),
+            if (isHost && _generatedInvitation != null)
+              OutlinedButton.icon(
+                  key: const Key('activate-invitation'),
+                  onPressed: _pairingBusy ? null : _activateGeneratedInvitation,
+                  icon: const Icon(Icons.verified_user),
+                  label: const Text('Ativar Host')),
+          ]),
+          if (_generatedInvitation != null && isHost) ...[
+            const SizedBox(height: 8),
+            Text(
+                'Expira em ${_generatedInvitation!.expiresAt.toLocal()}. Gerar outro convite invalida a configuração pendente anterior.'),
+          ],
+          const SizedBox(height: 8),
+          const Text(
+            'A conta Google autoriza somente o painel local. O convite é a credencial de pareamento; não é sincronizado pelo Google e deve permanecer privado.',
+            style: TextStyle(fontSize: 12, color: Colors.grey),
+          ),
+        ]),
+      ),
     );
   }
 
@@ -458,7 +757,10 @@ class _ControlPageState extends State<ControlPage> {
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(0.4),
+        color: Theme.of(context)
+            .colorScheme
+            .surfaceContainerHighest
+            .withValues(alpha: 0.4),
         border: Border.all(color: Colors.white10),
         borderRadius: BorderRadius.circular(8),
       ),
@@ -481,22 +783,25 @@ class _ControlPageState extends State<ControlPage> {
                     ),
                     const SizedBox(width: 8),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 6, vertical: 2),
                       decoration: BoxDecoration(
-                        color: Colors.blue.withOpacity(0.2),
+                        color: Colors.blue.withValues(alpha: 0.2),
                         borderRadius: BorderRadius.circular(4),
                       ),
                       child: Text(
                         dev.role.toUpperCase(),
-                        style: const TextStyle(fontSize: 10, color: Colors.blueAccent),
+                        style: const TextStyle(
+                            fontSize: 10, color: Colors.blueAccent),
                       ),
                     ),
                     if (isLocal) ...[
                       const SizedBox(width: 6),
                       Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 2),
                         decoration: BoxDecoration(
-                          color: Colors.green.withOpacity(0.2),
+                          color: Colors.green.withValues(alpha: 0.2),
                           borderRadius: BorderRadius.circular(4),
                         ),
                         child: const Text(
@@ -509,7 +814,7 @@ class _ControlPageState extends State<ControlPage> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'IP Virtual: ${dev.virtualIp ?? "não configurado"} | Onion: ${dev.onionEndpoint ?? "aguardando"}',
+                  'IP Virtual: ${dev.virtualIp?.isNotEmpty == true ? dev.virtualIp : "não configurado"} | Onion: ${dev.onionEndpoint?.isNotEmpty == true ? dev.onionEndpoint : (isLocal ? "aguardando Tor" : "não configurado")}',
                   style: const TextStyle(fontSize: 12, color: Colors.grey),
                 ),
               ],
@@ -518,16 +823,18 @@ class _ControlPageState extends State<ControlPage> {
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
             decoration: BoxDecoration(
-              color: dev.status == 'active' || dev.status == 'approved' || dev.status == 'connected'
-                  ? Colors.green.withOpacity(0.15)
-                  : Colors.orange.withOpacity(0.15),
+              color: dev.status == 'active' ||
+                      dev.status == 'connected'
+                  ? Colors.green.withValues(alpha: 0.15)
+                  : Colors.orange.withValues(alpha: 0.15),
               borderRadius: BorderRadius.circular(12),
             ),
             child: Text(
               dev.status,
               style: TextStyle(
                 fontSize: 11,
-                color: dev.status == 'active' || dev.status == 'approved' || dev.status == 'connected'
+                color: dev.status == 'active' ||
+                        dev.status == 'connected'
                     ? Colors.green
                     : Colors.orange,
               ),

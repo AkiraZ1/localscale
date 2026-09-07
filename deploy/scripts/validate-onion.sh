@@ -34,7 +34,17 @@ validate_templates() {
 validate_env() {
     file=$1
     [ -f "$file" ] || { printf 'env file not found\n' >&2; return 1; }
-    permissions=$(stat -c '%a' "$file") || { printf 'cannot inspect env file permissions\n' >&2; return 1; }
+    # GNU coreutils and BSD/macOS expose different stat flags. Prefer the
+    # numeric GNU form, then fall back to the equivalent BSD form without
+    # weakening the private-file check below.
+    if permissions=$(stat -c '%a' "$file" 2>/dev/null); then
+        :
+    elif permissions=$(stat -f '%Lp' "$file" 2>/dev/null); then
+        :
+    else
+        printf 'cannot inspect env file permissions\n' >&2
+        return 1
+    fi
     case "$permissions" in
         *[1-7][0-7]|*[0-7][1-7]) printf 'env file must not be group/world accessible\n' >&2; return 1 ;;
     esac

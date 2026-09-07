@@ -1,22 +1,38 @@
-use localscale_agent::{serve_with_auth_and_peer_transport_gate, AuthHandler, PeerStore};
 use localscale_agent::tor_runtime::{resolve_bundled_tor, TorMode, TorProcess, TorRuntime};
+use localscale_agent::{
+    serve_with_auth_and_peer_transport, AuthHandler, PeerStore, PeerTransportStatus, RoleStore,
+    TransportState,
+};
 use localscale_agent_protocol::{ClientConfig, HostInvitation};
+use localscale_agent_transport::{
+    key_from_stored_transport_key, ClienteTransport, FileNonceAllocator, HostTransport,
+    TorRuntime as PeerTorRuntime,
+};
 use localscale_control_plane::{
-    google_oidc::{ClientSecretRef, GoogleOidcConfig, GoogleOidcProvider, HttpRequest, HttpResponse, HttpTransport, TransportError},
+    google_oidc::{
+        ClientSecretRef, GoogleOidcConfig, GoogleOidcProvider, HttpRequest, HttpResponse,
+        HttpTransport, TransportError,
+    },
     AuthService,
 };
-use localscale_agent_transport::{ClienteTransport, FileNonceAllocator, HostTransport, TorRuntime as PeerTorRuntime, key_from_invitation_secret};
 use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::time::Duration;
 
 const CURL_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const CURL_TIMEOUT_SECONDS: u64 = 5;
 const TOR_READY_TIMEOUT: Duration = Duration::from_secs(300);
+/// A supervisor can distinguish a requested configuration reload from an
+/// ordinary failure. Standalone desktop startup observes the health drop and
+/// launches the bundled agent again.
+const RUNTIME_RESTART_EXIT_CODE: i32 = 75;
 
 #[derive(Debug)]
 struct RuntimeConfig {
@@ -26,14 +42,21 @@ struct RuntimeConfig {
 
 impl RuntimeConfig {
     fn data_dir_from_environment() -> Result<std::path::PathBuf, String> {
-        let data_dir = env::var_os("LOCALSCALE_TOR_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
-            env::var_os("XDG_STATE_HOME")
-                .map(std::path::PathBuf::from)
-                .or_else(|| env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/state")))
-                .unwrap_or_else(|| env::temp_dir())
-                .join("localscale/tor")
-        });
-        if !data_dir.is_absolute() { return Err("LOCALSCALE_TOR_DATA_DIR must be absolute".into()); }
+        let data_dir = env::var_os("LOCALSCALE_TOR_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                env::var_os("XDG_STATE_HOME")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        env::var_os("HOME")
+                            .map(|home| std::path::PathBuf::from(home).join(".local/state"))
+                    })
+                    .unwrap_or_else(env::temp_dir)
+                    .join("localscale/tor")
+            });
+        if !data_dir.is_absolute() {
+            return Err("LOCALSCALE_TOR_DATA_DIR must be absolute".into());
+        }
         Ok(data_dir)
     }
 
@@ -47,10 +70,16 @@ impl RuntimeConfig {
                 env::var("LOCALSCALE_UPSTREAM").ok().as_deref(),
                 env::var("LOCALSCALE_ONION_ENDPOINT").ok().as_deref(),
                 data_dir,
-            ).map(Some);
+            )
+            .map(Some);
         }
 
-        let store_path = env::var_os("LOCALSCALE_PEER_STORE").map(std::path::PathBuf::from).unwrap_or_else(|| data_dir.join("peer-record.json"));
+        let store_path = env::var_os("LOCALSCALE_PEER_STORE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("peer-record.json"));
+        let role_store_path = env::var_os("LOCALSCALE_ROLE_STORE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| store_path.with_file_name("selected-role"));
         let store = match PeerStore::open(store_path) {
             Ok(store) => store,
             Err(error) => {
@@ -58,8 +87,34 @@ impl RuntimeConfig {
                 return Ok(None);
             }
         };
-        let Some(record) = store.record() else { return Ok(None); };
-        if !record.approved || record.revoked { return Ok(None); }
+        let selected_role = RoleStore::open(role_store_path)
+            .map_err(|error| format!("invalid selected role: {error}"))?
+            .role()
+            .map(str::to_owned);
+        let Some(record) = store.record() else {
+            return match selected_role.as_deref() {
+                Some("host") => Self::from_values_with_data_dir(
+                    Some("host"),
+                    Some(
+                        env::var("LOCALSCALE_SERVICE_PORT")
+                            .as_deref()
+                            .unwrap_or("8765"),
+                    ),
+                    Some(
+                        env::var("LOCALSCALE_UPSTREAM")
+                            .as_deref()
+                            .unwrap_or("127.0.0.1:8766"),
+                    ),
+                    None,
+                    data_dir,
+                )
+                .map(Some),
+                _ => Ok(None),
+            };
+        };
+        if !record.approved || record.revoked {
+            return Ok(None);
+        }
         match Self::from_peer_record(record, data_dir) {
             Ok(config) => Ok(Some(config)),
             Err(error) => {
@@ -69,74 +124,156 @@ impl RuntimeConfig {
         }
     }
 
-    fn from_peer_record(record: &localscale_agent::PeerRecord, data_dir: std::path::PathBuf) -> Result<Self, String> {
+    fn from_peer_record(
+        record: &localscale_agent::PeerRecord,
+        data_dir: std::path::PathBuf,
+    ) -> Result<Self, String> {
         validate_approved_peer_record(record, &record.role)?;
         let mode = match record.role.as_str() {
             "host" => {
-                let port = env::var("LOCALSCALE_SERVICE_PORT").ok().map(|value| value.parse::<u16>().map_err(|_| "LOCALSCALE_SERVICE_PORT must be a valid TCP port".to_string())).transpose()?.unwrap_or(8765);
-                if port == 0 { return Err("LOCALSCALE_SERVICE_PORT must be non-zero".into()); }
-                let upstream = env::var("LOCALSCALE_UPSTREAM").unwrap_or_else(|_| "127.0.0.1:8766".into());
+                let port = env::var("LOCALSCALE_SERVICE_PORT")
+                    .ok()
+                    .map(|value| {
+                        value.parse::<u16>().map_err(|_| {
+                            "LOCALSCALE_SERVICE_PORT must be a valid TCP port".to_string()
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(8765);
+                if port == 0 {
+                    return Err("LOCALSCALE_SERVICE_PORT must be non-zero".into());
+                }
+                let upstream =
+                    env::var("LOCALSCALE_UPSTREAM").unwrap_or_else(|_| "127.0.0.1:8766".into());
                 TorMode::host(port, upstream).map_err(|e| e.to_string())?
             }
             "cliente" => TorMode::client(&record.endpoint).map_err(|e| e.to_string())?,
-            other => return Err(format!("peer record role must be host or cliente, got {other}")),
+            other => {
+                return Err(format!(
+                    "peer record role must be host or cliente, got {other}"
+                ))
+            }
         };
         Ok(Self { mode, data_dir })
     }
 
     #[cfg(test)]
-    fn from_values(role: Option<&str>, service_port: Option<&str>, upstream: Option<&str>, hostname: Option<&str>) -> Result<Self, String> {
-        Self::from_values_with_data_dir(role, service_port, upstream, hostname, Self::data_dir_from_environment()?)
+    fn from_values(
+        role: Option<&str>,
+        service_port: Option<&str>,
+        upstream: Option<&str>,
+        hostname: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::from_values_with_data_dir(
+            role,
+            service_port,
+            upstream,
+            hostname,
+            Self::data_dir_from_environment()?,
+        )
     }
 
-    fn from_values_with_data_dir(role: Option<&str>, service_port: Option<&str>, upstream: Option<&str>, hostname: Option<&str>, data_dir: std::path::PathBuf) -> Result<Self, String> {
+    fn from_values_with_data_dir(
+        role: Option<&str>,
+        service_port: Option<&str>,
+        upstream: Option<&str>,
+        hostname: Option<&str>,
+        data_dir: std::path::PathBuf,
+    ) -> Result<Self, String> {
         let mode = match role {
             Some("host") => {
-                let port = service_port.ok_or("host requires LOCALSCALE_SERVICE_PORT")?.parse::<u16>().map_err(|_| "LOCALSCALE_SERVICE_PORT must be a valid TCP port")?;
-                if port == 0 { return Err("LOCALSCALE_SERVICE_PORT must be non-zero".into()); }
-                TorMode::host(port, upstream.ok_or("host requires LOCALSCALE_UPSTREAM")?).map_err(|e| e.to_string())?
+                let port = service_port
+                    .ok_or("host requires LOCALSCALE_SERVICE_PORT")?
+                    .parse::<u16>()
+                    .map_err(|_| "LOCALSCALE_SERVICE_PORT must be a valid TCP port")?;
+                if port == 0 {
+                    return Err("LOCALSCALE_SERVICE_PORT must be non-zero".into());
+                }
+                TorMode::host(port, upstream.ok_or("host requires LOCALSCALE_UPSTREAM")?)
+                    .map_err(|e| e.to_string())?
             }
             Some("cliente") => {
-                if service_port.is_some() { return Err("cliente must not configure LOCALSCALE_SERVICE_PORT".into()); }
-                TorMode::client(hostname.ok_or("cliente requires LOCALSCALE_ONION_ENDPOINT")?).map_err(|e| e.to_string())?
+                if service_port.is_some() {
+                    return Err("cliente must not configure LOCALSCALE_SERVICE_PORT".into());
+                }
+                TorMode::client(hostname.ok_or("cliente requires LOCALSCALE_ONION_ENDPOINT")?)
+                    .map_err(|e| e.to_string())?
             }
-            Some(other) => return Err(format!("LOCALSCALE_ROLE must be host or cliente, got {other}")),
+            Some(other) => {
+                return Err(format!(
+                    "LOCALSCALE_ROLE must be host or cliente, got {other}"
+                ))
+            }
             None => return Err("LOCALSCALE_ROLE is required; refusing an implicit role".into()),
         };
         Ok(Self { mode, data_dir })
     }
 }
 
-fn validate_approved_peer_record(record: &localscale_agent::PeerRecord, expected_role: &str) -> Result<(), String> {
-    if !record.approved || record.revoked || !matches!(expected_role, "host" | "cliente") || record.role != expected_role {
+fn validate_approved_peer_record(
+    record: &localscale_agent::PeerRecord,
+    expected_role: &str,
+) -> Result<(), String> {
+    if !record.approved
+        || record.revoked
+        || !matches!(expected_role, "host" | "cliente")
+        || record.role != expected_role
+    {
         return Err("peer record is not approved or has an invalid role".into());
     }
+    key_from_stored_transport_key(&record.invitation_secret)
+        .map_err(|_| "peer record contains an invalid transport key".to_string())?;
     match expected_role {
         "host" => {
-            if record.host_node_id.is_some() { return Err("host peer must not contain host_node_id".into()); }
-            HostInvitation::new(&record.node_id, &record.endpoint, &record.invitation_secret).map_err(|e| format!("invalid host peer record: {e:?}"))?;
+            if record.host_node_id.is_some() {
+                return Err("host peer must not contain host_node_id".into());
+            }
+            HostInvitation::new(&record.node_id, &record.endpoint, "validation-secret-0001")
+                .map_err(|e| format!("invalid host peer record: {e:?}"))?;
         }
         "cliente" => {
-            let host_node_id = record.host_node_id.as_deref().ok_or("cliente peer requires host_node_id")?;
-            if host_node_id == record.node_id { return Err("peer node IDs must differ".into()); }
-            ClientConfig::client(&record.node_id, host_node_id, &record.endpoint, &record.invitation_secret).map_err(|e| format!("invalid cliente peer record: {e:?}"))?;
+            let host_node_id = record
+                .host_node_id
+                .as_deref()
+                .ok_or("cliente peer requires host_node_id")?;
+            if host_node_id == record.node_id {
+                return Err("peer node IDs must differ".into());
+            }
+            ClientConfig::client(
+                &record.node_id,
+                host_node_id,
+                &record.endpoint,
+                "validation-secret-0001",
+            )
+            .map_err(|e| format!("invalid cliente peer record: {e:?}"))?;
         }
         _ => unreachable!(),
     }
     Ok(())
 }
 
-struct RunningTor { process: TorProcess }
+struct RunningTor {
+    process: TorProcess,
+}
 
-struct ProcessTorRuntime { socks: std::net::SocketAddr }
+struct ProcessTorRuntime {
+    socks: std::net::SocketAddr,
+}
 impl PeerTorRuntime for ProcessTorRuntime {
-    fn socks_endpoint(&self) -> Option<std::net::SocketAddr> { Some(self.socks) }
-    fn is_ready(&self) -> bool { true }
+    fn socks_endpoint(&self) -> Option<std::net::SocketAddr> {
+        Some(self.socks)
+    }
+    fn is_ready(&self) -> bool {
+        true
+    }
 }
 
 fn start_tor(bundle_root: &std::path::Path, config: &RuntimeConfig) -> Result<RunningTor, String> {
     let executable = resolve_bundled_tor(bundle_root).map_err(|e| e.to_string())?;
-    let mut process = TorRuntime::new(executable, config.data_dir.clone()).map_err(|e| e.to_string())?.spawn(&config.mode).map_err(|e| e.to_string())?;
+    let mut process = TorRuntime::new(executable, config.data_dir.clone())
+        .map_err(|e| e.to_string())?
+        .spawn(&config.mode)
+        .map_err(|e| e.to_string())?;
     if let Err(error) = process.wait_for_readiness(TOR_READY_TIMEOUT) {
         let _ = process.terminate();
         return Err(error.to_string());
@@ -149,7 +286,9 @@ fn wait_for_socks(endpoint: std::net::SocketAddr, timeout: Duration) -> Result<(
     loop {
         match TcpStream::connect_timeout(&endpoint, Duration::from_millis(250)) {
             Ok(_) => return Ok(()),
-            Err(_) if std::time::Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+            Err(_) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(100))
+            }
             Err(_) => return Err("bundled Tor SOCKS endpoint did not become available".into()),
         }
     }
@@ -159,32 +298,146 @@ fn stop_tor(mut running: RunningTor) {
     let _ = running.process.terminate();
 }
 
-fn start_peer_transport(config: &RuntimeConfig, tor: &RunningTor, gate: Arc<AtomicBool>) -> Result<(), String> {
-    let store_path = env::var_os("LOCALSCALE_PEER_STORE").map(std::path::PathBuf::from).unwrap_or_else(|| config.data_dir.join("peer-record.json"));
-    if env::var_os("LOCALSCALE_PEER_STORE").is_none() { env::set_var("LOCALSCALE_PEER_STORE", &store_path); }
+fn retry_delay(failures: u32) -> Duration {
+    Duration::from_secs(1u64 << failures.saturating_sub(1).min(5))
+}
+
+fn start_peer_transport(
+    config: &RuntimeConfig,
+    tor: &RunningTor,
+    gate: Arc<AtomicBool>,
+    status: PeerTransportStatus,
+) -> Result<(), String> {
+    let store_path = env::var_os("LOCALSCALE_PEER_STORE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| config.data_dir.join("peer-record.json"));
+    if env::var_os("LOCALSCALE_PEER_STORE").is_none() {
+        env::set_var("LOCALSCALE_PEER_STORE", &store_path);
+    }
     let store = PeerStore::open(&store_path).map_err(|e| format!("peer store unavailable: {e}"))?;
-    let record = store.record().ok_or("peer is not configured; refusing transport startup")?;
-    let expected_role = match &config.mode { TorMode::Host { .. } => "host", TorMode::Client { .. } => "cliente" };
+    let record = store
+        .record()
+        .ok_or("peer is not configured; refusing transport startup")?;
+    let expected_role = match &config.mode {
+        TorMode::Host { .. } => "host",
+        TorMode::Client { .. } => "cliente",
+    };
     validate_approved_peer_record(record, expected_role)?;
-    let key = key_from_invitation_secret(&record.invitation_secret);
+    let key = key_from_stored_transport_key(&record.invitation_secret)
+        .map_err(|_| "peer record contains an invalid transport key".to_string())?;
     let nonce_path = config.data_dir.join("handshake-nonce");
     match &config.mode {
         TorMode::Host { upstream, .. } => {
-            let address: std::net::SocketAddr = upstream.parse().map_err(|_| "host upstream must be a socket address".to_string())?;
+            let address: std::net::SocketAddr = upstream
+                .parse()
+                .map_err(|_| "host upstream must be a socket address".to_string())?;
             let allocator = FileNonceAllocator::open(nonce_path).map_err(|e| e.to_string())?;
-            let mut host = HostTransport::bind(address, key, record.node_id.clone(), Box::new(allocator)).map_err(|e| e.to_string())?;
-            host.set_acceptance_gate(gate);
-            std::thread::spawn(move || loop { match host.accept() { Ok(_) => {}, Err(error) => eprintln!("LocalScale peer handshake failed: {error}") } });
+            let mut host =
+                HostTransport::bind(address, key, record.node_id.clone(), Box::new(allocator))
+                    .map_err(|e| e.to_string())?;
+            host.set_acceptance_gate(gate.clone());
+            let host_status = status.clone();
+            let local_node_id = record.node_id.clone();
+            std::thread::spawn(move || loop {
+                host_status.set(TransportState::Connecting);
+                match host.accept() {
+                    Ok(mut stream) => {
+                        while gate.load(Ordering::Acquire) {
+                            match stream.receive_ping() {
+                                Ok(sequence) => {
+                                    if stream.send_pong(&local_node_id, sequence).is_err() {
+                                        break;
+                                    }
+                                    // One authenticated ping received and one matching pong sent.
+                                    host_status.record_peer_activity(2);
+                                }
+                                Err(error) => {
+                                    eprintln!("LocalScale peer heartbeat failed: {error}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("LocalScale peer handshake failed: {error}");
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                }
+                host_status.set(TransportState::Retrying);
+            });
             Ok(())
         }
         TorMode::Client { hostname } => {
-            let host_node_id = record.host_node_id.clone().ok_or("approved cliente peer lacks host node id")?;
-            let port = env::var("LOCALSCALE_ONION_PORT").ok().map(|v| v.parse::<u16>().map_err(|_| "LOCALSCALE_ONION_PORT must be a valid TCP port".to_string())).transpose()?.unwrap_or(8765);
+            let host_node_id = record
+                .host_node_id
+                .clone()
+                .ok_or("approved cliente peer lacks host node id")?;
+            let port = env::var("LOCALSCALE_ONION_PORT")
+                .ok()
+                .map(|v| {
+                    v.parse::<u16>()
+                        .map_err(|_| "LOCALSCALE_ONION_PORT must be a valid TCP port".to_string())
+                })
+                .transpose()?
+                .unwrap_or(8765);
             let allocator = FileNonceAllocator::open(nonce_path).map_err(|e| e.to_string())?;
             wait_for_socks(tor.process.socks_endpoint(), TOR_READY_TIMEOUT)?;
-            let mut client = ClienteTransport::new(Box::new(ProcessTorRuntime { socks: tor.process.socks_endpoint() }), key, record.node_id.clone(), host_node_id, Box::new(allocator));
-            let _stream = client.connect(hostname, port).map_err(|e| format!("cliente peer connection failed: {e}"))?;
-            println!("LocalScale peer: connected through bundled Tor"); Ok(())
+            let socks = tor.process.socks_endpoint();
+            let node_id = record.node_id.clone();
+            let hostname = hostname.clone();
+            std::thread::spawn(move || {
+                let mut client = ClienteTransport::new(
+                    Box::new(ProcessTorRuntime { socks }),
+                    key,
+                    node_id.clone(),
+                    host_node_id,
+                    Box::new(allocator),
+                );
+                let mut failures: u32 = 0;
+                loop {
+                    if !gate.load(Ordering::Acquire) {
+                        status.set(TransportState::Disabled);
+                        thread::sleep(Duration::from_millis(250));
+                        continue;
+                    }
+                    status.set(if failures == 0 {
+                        TransportState::Connecting
+                    } else {
+                        TransportState::Retrying
+                    });
+                    match client.connect(&hostname, port) {
+                        Ok(mut stream) => {
+                            failures = 0;
+                            let mut sequence = 0u64;
+                            while gate.load(Ordering::Acquire) {
+                                sequence = sequence.wrapping_add(1);
+                                if stream.send_ping(&node_id, sequence).is_err()
+                                    || stream.receive_pong(sequence).is_err()
+                                {
+                                    break;
+                                }
+                                // One ping sent and its authenticated-session pong received.
+                                status.record_peer_activity(2);
+                                if sequence == 1 {
+                                    println!("LocalScale peer: connected through bundled Tor");
+                                }
+                                thread::sleep(localscale_agent_transport::HEARTBEAT_INTERVAL);
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("LocalScale cliente connection attempt failed: {error}")
+                        }
+                    }
+                    failures = failures.saturating_add(1);
+                    status.set(if gate.load(Ordering::Acquire) {
+                        TransportState::Retrying
+                    } else {
+                        TransportState::Disabled
+                    });
+                    thread::sleep(retry_delay(failures));
+                }
+            });
+            Ok(())
         }
     }
 }
@@ -204,7 +457,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--port" => {
                 index += 1;
                 let value = args.get(index).ok_or("--port requires a value")?;
-                port = value.parse().map_err(|_| "--port must be a valid TCP port")?;
+                port = value
+                    .parse()
+                    .map_err(|_| "--port must be a valid TCP port")?;
             }
             argument => return Err(format!("unknown argument: {argument}")),
         }
@@ -242,7 +497,9 @@ fn curl_args(request: &HttpRequest, timeout_seconds: &str) -> Vec<String> {
 
 impl HttpTransport for CurlTransport {
     fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
-        let timeout = request.timeout.min(Duration::from_secs(CURL_TIMEOUT_SECONDS));
+        let timeout = request
+            .timeout
+            .min(Duration::from_secs(CURL_TIMEOUT_SECONDS));
         let timeout_seconds = timeout.as_secs_f64().max(0.001).to_string();
         let mut child = Command::new("curl")
             .args(curl_args(&request, &timeout_seconds))
@@ -263,7 +520,9 @@ impl HttpTransport for CurlTransport {
         };
         let mut buffer = [0_u8; 8192];
         while output.len() <= CURL_MAX_RESPONSE_BYTES + 32 {
-            let read = stdout.read(&mut buffer).map_err(|_| TransportError::Network)?;
+            let read = stdout
+                .read(&mut buffer)
+                .map_err(|_| TransportError::Network)?;
             if read == 0 {
                 break;
             }
@@ -281,7 +540,11 @@ impl HttpTransport for CurlTransport {
 
 fn parse_curl_output(output: &[u8]) -> Option<HttpResponse> {
     let split = output.iter().rposition(|byte| *byte == b'\n')?;
-    let status = std::str::from_utf8(&output[split + 1..]).ok()?.trim().parse::<u16>().ok()?;
+    let status = std::str::from_utf8(&output[split + 1..])
+        .ok()?
+        .trim()
+        .parse::<u16>()
+        .ok()?;
     if !(100..=599).contains(&status) {
         return None;
     }
@@ -294,7 +557,9 @@ fn redirect_uri_matches_port(redirect_uri: &str, port: u16) -> bool {
 }
 
 fn auth_provider(port: u16) -> Option<Box<dyn AuthHandler>> {
-    let secret = env::var("LOCALSCALE_GOOGLE_CLIENT_SECRET").ok().filter(|v| !v.is_empty())?;
+    let secret = env::var("LOCALSCALE_GOOGLE_CLIENT_SECRET")
+        .ok()
+        .filter(|v| !v.is_empty())?;
     let redirect = env::var("LOCALSCALE_GOOGLE_REDIRECT_URI").ok()?;
     if !redirect_uri_matches_port(&redirect, port) {
         return None;
@@ -310,17 +575,57 @@ fn auth_provider(port: u16) -> Option<Box<dyn AuthHandler>> {
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
     let options = parse_args(&args).map_err(std::io::Error::other)?;
+    // The control API and the bootstrap path must use the same durable peer
+    // record. Without this, a first-run profile could be written to the
+    // library's test-friendly ephemeral store and disappear before the
+    // scheduled runtime reload.
+    if env::var_os("LOCALSCALE_PEER_STORE").is_none() {
+        let peer_store = RuntimeConfig::data_dir_from_environment()
+            .map_err(std::io::Error::other)?
+            .join("peer-record.json");
+        env::set_var("LOCALSCALE_PEER_STORE", peer_store);
+    }
     let peer_transport_enabled = Arc::new(AtomicBool::new(true));
+    let peer_transport_status = PeerTransportStatus::default();
     let listener = TcpListener::bind(("127.0.0.1", options.port))?;
     let running_tor = match RuntimeConfig::from_environment().map_err(std::io::Error::other)? {
         Some(runtime_config) => {
-            let bundle_root = env::var_os("LOCALSCALE_BUNDLE_ROOT").map(std::path::PathBuf::from).unwrap_or_else(|| {
-                env::current_exe().ok().and_then(|path| path.parent().map(std::path::Path::to_path_buf)).unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"))
-            });
-            let running = start_tor(&bundle_root, &runtime_config).map_err(std::io::Error::other)?;
-            match start_peer_transport(&runtime_config, &running, peer_transport_enabled.clone()) {
+            let bundle_root = env::var_os("LOCALSCALE_BUNDLE_ROOT")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    env::current_exe()
+                        .ok()
+                        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+                        .unwrap_or_else(|| std::path::PathBuf::from("/nonexistent"))
+                });
+            let running =
+                start_tor(&bundle_root, &runtime_config).map_err(std::io::Error::other)?;
+            let fresh_host = matches!(runtime_config.mode, TorMode::Host { .. })
+                && PeerStore::open(
+                    env::var_os("LOCALSCALE_PEER_STORE")
+                        .expect("peer store path initialized before Tor startup"),
+                )
+                .ok()
+                .is_some_and(|store| store.record().is_none());
+            match start_peer_transport(
+                &runtime_config,
+                &running,
+                peer_transport_enabled.clone(),
+                peer_transport_status.clone(),
+            ) {
                 Ok(()) => Some(running),
-                Err(error) => { eprintln!("LocalScale peer transport disabled: {error}"); stop_tor(running); None }
+                Err(error) => {
+                    if fresh_host {
+                        peer_transport_enabled.store(false, Ordering::Release);
+                        peer_transport_status.set(TransportState::WaitingForInvitation);
+                        eprintln!("LocalScale Host Onion is ready and waiting for an invitation");
+                        Some(running)
+                    } else {
+                        eprintln!("LocalScale peer transport disabled: {error}");
+                        stop_tor(running);
+                        None
+                    }
+                }
             }
         }
         None => None,
@@ -331,15 +636,35 @@ fn main() -> std::io::Result<()> {
 
     let auth = auth_provider(address.port());
     let server = thread::spawn(move || match auth {
-        Some(auth) => serve_with_auth_and_peer_transport_gate(listener, auth, peer_transport_enabled),
-        None => localscale_agent::serve_with_peer_transport_gate(listener, peer_transport_enabled),
+        Some(auth) => serve_with_auth_and_peer_transport(
+            listener,
+            auth,
+            peer_transport_enabled,
+            peer_transport_status,
+        ),
+        None => localscale_agent::serve_with_peer_transport(
+            listener,
+            peer_transport_enabled,
+            peer_transport_status,
+        ),
     });
     let result = wait_until_healthy(address).and_then(|_| {
-        if !options.no_open { open_browser(&url); }
-        server.join().map_err(|_| std::io::Error::other("LocalScale server thread failed"))?
+        if !options.no_open {
+            open_browser(&url);
+        }
+        server
+            .join()
+            .map_err(|_| std::io::Error::other("LocalScale server thread failed"))?
     });
+    let restart_requested = matches!(
+        result.as_ref().err(),
+        Some(error) if error.kind() == std::io::ErrorKind::Interrupted
+    );
     if let Some(running_tor) = running_tor {
         stop_tor(running_tor);
+    }
+    if restart_requested {
+        std::process::exit(RUNTIME_RESTART_EXIT_CODE);
     }
     result
 }
@@ -349,10 +674,14 @@ fn wait_until_healthy(address: std::net::SocketAddr) -> std::io::Result<()> {
     loop {
         if let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
             stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-            stream.write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")?;
+            stream.write_all(
+                b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )?;
             let mut response = String::new();
             stream.read_to_string(&mut response)?;
-            if health_response_is_ready(&response) { return Ok(()); }
+            if health_response_is_ready(&response) {
+                return Ok(());
+            }
         }
         if std::time::Instant::now() >= deadline {
             return Err(std::io::Error::other("LocalScale health check failed"));
@@ -362,8 +691,7 @@ fn wait_until_healthy(address: std::net::SocketAddr) -> std::io::Result<()> {
 }
 
 fn health_response_is_ready(response: &str) -> bool {
-    response.starts_with("HTTP/1.1 200 OK")
-        && response.contains("\r\n\r\n{\"status\":\"ok\"")
+    response.starts_with("HTTP/1.1 200 OK") && response.contains("\r\n\r\n{\"status\":\"ok\"")
 }
 
 fn open_browser(url: &str) {
@@ -416,7 +744,14 @@ mod tests {
         let path = root.join("tor/tor");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let starts = root.join("tor-starts");
-        let script = if exits { format!("#!/bin/sh\nprintf '%s\\n' $$ >> '{}'\n/bin/echo 'Bootstrapped 100%' >&2\nexit 0\n", starts.display()) } else { format!("#!/bin/sh\nprintf '%s\\n' $$ >> '{}'\n/bin/echo 'Bootstrapped 100%' >&2\ntrap 'exit 0' TERM INT\nwhile :; do /bin/sleep 1; done\n", starts.display()) };
+        let script = if exits {
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' $$ >> '{}'\n/bin/echo 'Bootstrapped 100%' >&2\nexit 0\n",
+                starts.display()
+            )
+        } else {
+            format!("#!/bin/sh\nprintf '%s\\n' $$ >> '{}'\n/bin/echo 'Bootstrapped 100%' >&2\ntrap 'exit 0' TERM INT\nwhile :; do /bin/sleep 1; done\n", starts.display())
+        };
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path
@@ -427,8 +762,17 @@ mod tests {
     fn second_instance_binds_before_starting_tor() {
         let root = test_temp("duplicate-startup");
         let executable = fake_bundled_executable(&root, false);
-        let config = RuntimeConfig { mode: TorMode::Client { hostname: format!("{}.onion", "a".repeat(56)) }, data_dir: root.join("data") };
-        let port = TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        let config = RuntimeConfig {
+            mode: TorMode::Client {
+                hostname: format!("{}.onion", "a".repeat(56)),
+            },
+            data_dir: root.join("data"),
+        };
+        let port = TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         let first_listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         let mut first = start_tor(&root, &config).unwrap();
         assert!(first.process.try_exit().unwrap().is_none());
@@ -447,16 +791,61 @@ mod tests {
 
     #[test]
     fn runtime_config_selects_host_and_cliente_without_defaults() {
-        let host = RuntimeConfig::from_values(Some("host"), Some("8080"), Some("127.0.0.1:8765"), None).unwrap();
-        assert_eq!(host.mode, TorMode::Host { service_port: 8080, upstream: "127.0.0.1:8765".into() });
-        let client = RuntimeConfig::from_values(Some("cliente"), None, None, Some(&format!("{}.onion", "a".repeat(56)))).unwrap();
+        let host =
+            RuntimeConfig::from_values(Some("host"), Some("8080"), Some("127.0.0.1:8765"), None)
+                .unwrap();
+        assert_eq!(
+            host.mode,
+            TorMode::Host {
+                service_port: 8080,
+                upstream: "127.0.0.1:8765".into()
+            }
+        );
+        let client = RuntimeConfig::from_values(
+            Some("cliente"),
+            None,
+            None,
+            Some(&format!("{}.onion", "a".repeat(56))),
+        )
+        .unwrap();
         assert!(matches!(client.mode, TorMode::Client { .. }));
         assert!(RuntimeConfig::from_values(None, None, None, None).is_err());
     }
 
     #[test]
+    fn persisted_host_role_bootstraps_tor_before_first_invitation() {
+        let _guard = env_lock();
+        let root = test_temp("fresh-host-role");
+        let peer_path = root.join("peer-record.json");
+        let role_path = root.join("selected-role");
+        let mut roles = RoleStore::open(&role_path).unwrap();
+        assert!(roles.set("host").unwrap());
+        env::remove_var("LOCALSCALE_ROLE");
+        env::set_var("LOCALSCALE_PEER_STORE", &peer_path);
+        env::set_var("LOCALSCALE_ROLE_STORE", &role_path);
+        env::set_var("LOCALSCALE_TOR_DATA_DIR", root.join("tor"));
+        env::remove_var("LOCALSCALE_SERVICE_PORT");
+        env::remove_var("LOCALSCALE_UPSTREAM");
+        let config = RuntimeConfig::from_environment().unwrap().unwrap();
+        assert_eq!(
+            config.mode,
+            TorMode::Host {
+                service_port: 8765,
+                upstream: "127.0.0.1:8766".into(),
+            }
+        );
+        env::remove_var("LOCALSCALE_PEER_STORE");
+        env::remove_var("LOCALSCALE_ROLE_STORE");
+        env::remove_var("LOCALSCALE_TOR_DATA_DIR");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn runtime_config_rejects_wrong_role_fields_and_invalid_ports() {
-        assert!(RuntimeConfig::from_values(Some("host"), Some("0"), Some("127.0.0.1:8765"), None).is_err());
+        assert!(
+            RuntimeConfig::from_values(Some("host"), Some("0"), Some("127.0.0.1:8765"), None)
+                .is_err()
+        );
         assert!(RuntimeConfig::from_values(Some("cliente"), Some("8080"), None, None).is_err());
     }
 
@@ -469,10 +858,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
         let hostname = format!("{}.onion", "a".repeat(56));
         let mut store = PeerStore::open(&path).unwrap();
-        store.configure(localscale_agent::PeerRecord {
-            role: "cliente".into(), node_id: "client-01".into(), host_node_id: Some("host-01".into()),
-            endpoint: hostname.clone(), invitation_secret: "secret-value-1234".into(), virtual_ip: None, approved: true, revoked: false,
-        }).unwrap();
+        store
+            .configure(localscale_agent::PeerRecord {
+                role: "cliente".into(),
+                node_id: "client-01".into(),
+                host_node_id: Some("host-01".into()),
+                endpoint: hostname.clone(),
+                invitation_secret: "secret-value-1234".into(),
+                virtual_ip: None,
+                approved: true,
+                revoked: false,
+            })
+            .unwrap();
         env::set_var("LOCALSCALE_PEER_STORE", &path);
         env::set_var("LOCALSCALE_TOR_DATA_DIR", &data_dir);
         env::remove_var("LOCALSCALE_ROLE");
@@ -486,7 +883,9 @@ mod tests {
         assert_eq!(second_start.mode, first_start.mode);
         assert_eq!(second_start.data_dir, data_dir);
 
-        for name in ["LOCALSCALE_PEER_STORE", "LOCALSCALE_TOR_DATA_DIR"] { env::remove_var(name); }
+        for name in ["LOCALSCALE_PEER_STORE", "LOCALSCALE_TOR_DATA_DIR"] {
+            env::remove_var(name);
+        }
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -499,10 +898,18 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&data_dir);
         let mut store = PeerStore::open(&path).unwrap();
-        store.configure(localscale_agent::PeerRecord {
-            role: "host".into(), node_id: "host-01".into(), host_node_id: None,
-            endpoint: format!("{}.onion", "b".repeat(56)), invitation_secret: "secret-value-1234".into(), virtual_ip: None, approved: true, revoked: false,
-        }).unwrap();
+        store
+            .configure(localscale_agent::PeerRecord {
+                role: "host".into(),
+                node_id: "host-01".into(),
+                host_node_id: None,
+                endpoint: format!("{}.onion", "b".repeat(56)),
+                invitation_secret: "secret-value-1234".into(),
+                virtual_ip: None,
+                approved: true,
+                revoked: false,
+            })
+            .unwrap();
         env::set_var("LOCALSCALE_PEER_STORE", &path);
         env::set_var("LOCALSCALE_TOR_DATA_DIR", &data_dir);
         env::remove_var("LOCALSCALE_ROLE");
@@ -510,9 +917,17 @@ mod tests {
         env::remove_var("LOCALSCALE_UPSTREAM");
 
         let config = RuntimeConfig::from_environment().unwrap().unwrap();
-        assert_eq!(config.mode, TorMode::Host { service_port: 8765, upstream: "127.0.0.1:8766".into() });
+        assert_eq!(
+            config.mode,
+            TorMode::Host {
+                service_port: 8765,
+                upstream: "127.0.0.1:8766".into()
+            }
+        );
 
-        for name in ["LOCALSCALE_PEER_STORE", "LOCALSCALE_TOR_DATA_DIR"] { env::remove_var(name); }
+        for name in ["LOCALSCALE_PEER_STORE", "LOCALSCALE_TOR_DATA_DIR"] {
+            env::remove_var(name);
+        }
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -523,10 +938,18 @@ mod tests {
         let path = test_temp("runtime-peer-invalid");
         let _ = std::fs::remove_file(&path);
         let mut store = PeerStore::open(&path).unwrap();
-        store.configure(localscale_agent::PeerRecord {
-            role: "unknown".into(), node_id: "node-01".into(), host_node_id: None,
-            endpoint: "not-an-onion".into(), invitation_secret: "secret-value-1234".into(), virtual_ip: None, approved: true, revoked: false,
-        }).unwrap();
+        store
+            .configure(localscale_agent::PeerRecord {
+                role: "unknown".into(),
+                node_id: "node-01".into(),
+                host_node_id: None,
+                endpoint: "not-an-onion".into(),
+                invitation_secret: "secret-value-1234".into(),
+                virtual_ip: None,
+                approved: true,
+                revoked: false,
+            })
+            .unwrap();
         env::set_var("LOCALSCALE_PEER_STORE", &path);
         env::remove_var("LOCALSCALE_ROLE");
         assert!(RuntimeConfig::from_environment().unwrap().is_none());
@@ -540,10 +963,18 @@ mod tests {
         let path = test_temp("runtime-peer-unapproved");
         let _ = std::fs::remove_file(&path);
         let mut store = PeerStore::open(&path).unwrap();
-        store.configure(localscale_agent::PeerRecord {
-            role: "cliente".into(), node_id: "client-01".into(), host_node_id: Some("host-01".into()),
-            endpoint: format!("{}.onion", "a".repeat(56)), invitation_secret: "secret-value-1234".into(), virtual_ip: None, approved: false, revoked: false,
-        }).unwrap();
+        store
+            .configure(localscale_agent::PeerRecord {
+                role: "cliente".into(),
+                node_id: "client-01".into(),
+                host_node_id: Some("host-01".into()),
+                endpoint: format!("{}.onion", "a".repeat(56)),
+                invitation_secret: "secret-value-1234".into(),
+                virtual_ip: None,
+                approved: false,
+                revoked: false,
+            })
+            .unwrap();
         env::set_var("LOCALSCALE_PEER_STORE", &path);
         env::remove_var("LOCALSCALE_ROLE");
         assert!(RuntimeConfig::from_environment().unwrap().is_none());
@@ -553,8 +984,14 @@ mod tests {
 
     fn approved_cliente_record() -> localscale_agent::PeerRecord {
         localscale_agent::PeerRecord {
-            role: "cliente".into(), node_id: "client-01".into(), host_node_id: Some("host-01".into()),
-            endpoint: format!("{}.onion", "a".repeat(56)), invitation_secret: "secret-value-1234".into(), virtual_ip: None, approved: true, revoked: false,
+            role: "cliente".into(),
+            node_id: "client-01".into(),
+            host_node_id: Some("host-01".into()),
+            endpoint: format!("{}.onion", "a".repeat(56)),
+            invitation_secret: "secret-value-1234".into(),
+            virtual_ip: None,
+            approved: true,
+            revoked: false,
         }
     }
 
@@ -615,7 +1052,12 @@ mod tests {
     fn lifecycle_starts_fake_bundled_tor_and_kills_it_cleanly() {
         let root = test_temp("lifecycle");
         let executable = fake_bundled_executable(&root, false);
-        let config = RuntimeConfig { mode: TorMode::Client { hostname: format!("{}.onion", "a".repeat(56)) }, data_dir: root.join("data") };
+        let config = RuntimeConfig {
+            mode: TorMode::Client {
+                hostname: format!("{}.onion", "a".repeat(56)),
+            },
+            data_dir: root.join("data"),
+        };
         let mut runtime = start_tor(&root, &config).unwrap();
         assert!(runtime.process.try_exit().unwrap().is_none());
         stop_tor(runtime);
@@ -627,21 +1069,35 @@ mod tests {
     fn lifecycle_fails_closed_when_bundle_is_absent() {
         let root = test_temp("missing-bundle");
         std::fs::create_dir_all(&root).unwrap();
-        let config = RuntimeConfig { mode: TorMode::Client { hostname: format!("{}.onion", "a".repeat(56)) }, data_dir: root.join("data") };
+        let config = RuntimeConfig {
+            mode: TorMode::Client {
+                hostname: format!("{}.onion", "a".repeat(56)),
+            },
+            data_dir: root.join("data"),
+        };
         assert!(start_tor(&root, &config).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn readiness_requires_the_health_json_body() {
-        assert!(!super::health_response_is_ready("HTTP/1.1 200 OK\r\n\r\n{}"));
+        assert!(!super::health_response_is_ready(
+            "HTTP/1.1 200 OK\r\n\r\n{}"
+        ));
         assert!(super::health_response_is_ready(
-            "HTTP/1.1 200 OK\r\n\r\n{\"status\":\"ok\",\"service\":\"localscale\"}"));
+            "HTTP/1.1 200 OK\r\n\r\n{\"status\":\"ok\",\"service\":\"localscale\"}"
+        ));
     }
 
     #[test]
     fn arguments_support_port_and_no_open() {
-        let options = super::parse_args(&["localscaled".into(), "--port".into(), "9123".into(), "--no-open".into()]).unwrap();
+        let options = super::parse_args(&[
+            "localscaled".into(),
+            "--port".into(),
+            "9123".into(),
+            "--no-open".into(),
+        ])
+        .unwrap();
         assert_eq!(options.port, 9123);
         assert!(options.no_open);
     }
@@ -660,7 +1116,10 @@ mod tests {
         env::set_var("LOCALSCALE_GOOGLE_CLIENT_SECRET", "test-placeholder-only");
         env::set_var("LOCALSCALE_GOOGLE_CLIENT_ID", "client-id");
         env::set_var("LOCALSCALE_OIDC_ISSUER", "https://accounts.google.com");
-        env::set_var("LOCALSCALE_GOOGLE_REDIRECT_URI", "http://127.0.0.1:8765/oauth/google/callback");
+        env::set_var(
+            "LOCALSCALE_GOOGLE_REDIRECT_URI",
+            "http://127.0.0.1:8765/oauth/google/callback",
+        );
         env::set_var("LOCALSCALE_OIDC_SCOPES", "openid email");
         assert!(auth_provider(8765).is_some());
         clear_auth_env();
@@ -668,7 +1127,10 @@ mod tests {
 
     #[test]
     fn runtime_redirect_must_be_exact_bound_loopback_callback() {
-        assert!(redirect_uri_matches_port("http://127.0.0.1:8765/oauth/google/callback", 8765));
+        assert!(redirect_uri_matches_port(
+            "http://127.0.0.1:8765/oauth/google/callback",
+            8765
+        ));
         for redirect in [
             "http://127.0.0.1:9999/oauth/google/callback",
             "http://127.0.0.1:8765/oauth/callback",
@@ -676,7 +1138,10 @@ mod tests {
             "https://127.0.0.1:8765/oauth/google/callback",
             "https://login.example.test/callback",
         ] {
-            assert!(!redirect_uri_matches_port(redirect, 8765), "accepted invalid redirect {redirect}");
+            assert!(
+                !redirect_uri_matches_port(redirect, 8765),
+                "accepted invalid redirect {redirect}"
+            );
         }
     }
 
@@ -693,7 +1158,10 @@ mod tests {
             env::set_var("LOCALSCALE_GOOGLE_CLIENT_ID", "client-id");
             env::set_var("LOCALSCALE_OIDC_ISSUER", "https://accounts.google.com");
             env::set_var("LOCALSCALE_GOOGLE_REDIRECT_URI", redirect);
-            assert!(auth_provider(8765).is_none(), "bootstrapped invalid redirect {redirect}");
+            assert!(
+                auth_provider(8765).is_none(),
+                "bootstrapped invalid redirect {redirect}"
+            );
         }
         clear_auth_env();
     }
@@ -711,9 +1179,15 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["--data-binary", "@-"]));
         assert!(!args.iter().any(|arg| arg.contains(&request.body)));
 
-        let get = HttpRequest { method: "GET".into(), body: String::new(), ..request };
+        let get = HttpRequest {
+            method: "GET".into(),
+            body: String::new(),
+            ..request
+        };
         let get_args = curl_args(&get, "5");
-        assert!(!get_args.iter().any(|arg| arg == "--data-binary" || arg == "@-"));
+        assert!(!get_args
+            .iter()
+            .any(|arg| arg == "--data-binary" || arg == "@-"));
     }
 
     #[test]
@@ -723,5 +1197,13 @@ mod tests {
         assert_eq!(response.body, "{\"error\":\"bad\"}");
         assert!(parse_curl_output(b"not-a-response").is_none());
         assert!(parse_curl_output(&vec![b'x'; CURL_MAX_RESPONSE_BYTES + 1]).is_none());
+    }
+
+    #[test]
+    fn peer_retry_delay_is_exponential_and_capped() {
+        assert_eq!(retry_delay(1), Duration::from_secs(1));
+        assert_eq!(retry_delay(2), Duration::from_secs(2));
+        assert_eq!(retry_delay(6), Duration::from_secs(32));
+        assert_eq!(retry_delay(30), Duration::from_secs(32));
     }
 }

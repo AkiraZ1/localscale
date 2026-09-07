@@ -12,6 +12,22 @@ Use `--no-open` when another process owns the UI, when running a service manager
 
 The browser-open operation is best effort. A missing `xdg-open`, `open`, or Windows shell integration does not mean that the agent failed. Check health using the URL printed by the process and inspect logs before restarting. Never implement browser-open retries that can create multiple tabs.
 
+### In-app pairing acceptance
+
+The current test topology is **Linux Host → macOS Cliente**. Open both desktop
+apps, select the roles in their control pages, generate the Host's short-lived
+signed invitation, and transfer it with the app's **Copiar convite** or **QR**
+action. Import and confirm the public-key fingerprint in the macOS Cliente,
+then wait for `configured`, `dialing`, `handshaking`, and `connected` in the UI
+before exercising sync/ping.
+
+This acceptance path must not be replaced with shell commands, direct peer-file
+edits, or manual API POSTs. A development fixture is permitted only when chosen
+in the UI and regenerated per run with random nonce/expiry; static invitation
+secrets are forbidden and fixtures are disabled in production. `approved` or
+`peer_configured` is not connectivity: require an active transport session,
+validated handshake/role, `peer_connected=true`, and a recent data exchange.
+
 ### Headless mode
 
 Headless operation is the default for servers and CI:
@@ -76,10 +92,36 @@ The expected Flutter Web routes are documented in the [OpenAPI contract](api/loc
 | POST | `/api/v1/service/start` | Start the selected role |
 | POST | `/api/v1/service/stop` | Stop cleanly |
 | POST | `/api/v1/sync` | Request peer/protocol sync |
+| GET | `/api/v1/peer/status` | Read persisted peer approval and transport state |
+| POST | `/api/v1/peer/config` | Persist a validated Host invitation or Cliente configuration without approval |
+| POST | `/api/v1/peer/approve` | Explicitly approve the configured peer |
+| POST | `/api/v1/runtime/restart` | Apply an approved `restart_required` peer configuration by restarting the local agent |
 | GET | `/health` | Local health/readiness |
 | GET | `/diagnostics` | Safe support data |
 
 The current Rust scaffold also exposes legacy `/`, `/config`, `/status`, `/mode`, `/version`, `/onion`, and `/diagnostics` routes. Treat those legacy routes as compatibility/development behavior until the `/api/v1` adapter is integrated. Never grant the legacy or versioned API an external bind. Control-page actions must use returned state and errors, not optimistic UI transitions.
+
+### Opt-in two-app pairing test
+
+The desktop test profile is disabled by default. Linux is always the test Host
+and macOS is always the Cliente. Select the profile and generate/import the
+invitation through the two app UIs (paste or QR), then verify the fingerprint,
+the `configured → dialing → handshaking → connected` sequence, and a sync/ping
+event in both apps. The profile is not a production provisioning mechanism.
+
+For the opt-in deterministic test profile, `LOCALSCALE_TEST_*` Dart defines
+may embed a pre-defined invitation, including its invitation secret, in a
+test-only app artifact. Do not distribute, publish, sign for release, commit,
+or log that artifact or value. Use a short-lived test invitation and rotate or
+revoke it immediately after verification. Normal and production builds must
+omit every test define; production pairing continues to require the UI-driven,
+one-use invitation flow.
+
+Saving a changed peer profile can return `restart_required`, because the running
+agent loads Tor and the approved record at process start. A loopback-only
+runtime restart may be used for bootstrap in that state; it is not a substitute
+for the app's pairing flow, and `/service/start` must never be treated as a
+configuration reload.
 
 ## Logs and data
 

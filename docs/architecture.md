@@ -56,12 +56,40 @@ A normal desktop launch opens **exactly one** local control-page URL after the l
 
 The page is a local control page, not the Onion endpoint. Hostname publication or Cliente connection must never trigger a second browser window. `--no-open` disables all browser launching and is required for automation/headless use.
 
+## Pairing and discovery
+
+The current acceptance scenario is **Linux Host → macOS Cliente**. The Host
+creates a short-lived, signed, one-use invitation containing version, node IDs,
+the current public Onion, public-key fingerprint, proposed virtual IP, nonce and
+expiry. The Cliente imports it through the control page by paste or QR and must
+confirm the fingerprint. The invitation envelope must not contain a static
+`invitation_secret`, private key, OAuth token, or refresh token; persisted peer
+state stores protected key material rather than a plaintext shared secret.
+
+An in-app development fixture is allowed only when selected through the UI. It
+must be regenerated per run with random nonce/expiry and is disabled in
+production. Re-importing an invitation must fail as replay. This flow is part
+of the functional test; direct API calls, shell commands, and screenshots are
+only bootstrap/diagnostic evidence.
+
+Optional same-account discovery uses incremental consent for Google Drive's
+`https://www.googleapis.com/auth/drive.appdata` scope and a signed, TTL-bound
+manifest in `appDataFolder`. The base OIDC login remains `openid email profile`.
+Drive is a control-plane mailbox, never a data relay; after discovery all peer
+traffic remains on Tor v3. Never publish secrets or tokens in the manifest.
+
 ## Host and Cliente modes
 
 - **Host:** owns the authoritative local service and publishes a Tor v3 Onion service. It may expose a narrowly scoped protocol upstream through Tor. The Onion hostname is public connection information; the service directory and private key remain local and protected by Tor. The control API remains loopback-only.
 - **Cliente:** consumes the Host's public v3 `.onion` address and makes outbound Tor connections. It does not create a HiddenServiceDir and must never receive Host private-key material. Its `onion_endpoint` is normally null; a successful peer connection is reported as peer/session state, not as a locally published address.
 
 Mode names are intentionally `host` and `cliente` throughout the Flutter/API contract. Any internal protocol role mapping must be explicit (`Host` and `Cliente`) and tested at the protocol boundary. Changing mode should be an agent operation, not a Flutter-only preference.
+
+Configuration and authorization are separate from connectivity. `approved` and
+`peer_configured` do not imply `connected`. The UI may report `connected` only
+when the transport session is active, the handshake and role are validated,
+`peer_connected=true`, and a recent data exchange/`last_handshake_at` is
+available. Otherwise expose a transitional or error state with its cause.
 
 ## Onion boundary and trust
 

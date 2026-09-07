@@ -5,6 +5,10 @@ import 'dart:html' as html;
 
 import 'local_agent_api.dart';
 
+Future<bool> ensureLocalAgentRunning() async => true;
+
+Future<bool> ensureLocalAgentRestarted() async => true;
+
 /// HTTP transport used by the Flutter page served from the local agent.
 ///
 /// The page and API share the agent's origin, so this remains a loopback
@@ -22,7 +26,8 @@ class HttpLocalAgentTransport implements LocalAgentTransport {
       base.replace(path: path).toString(),
       method: method,
       sendData: body == null ? null : jsonEncode(body),
-      requestHeaders: body == null ? null : {'Content-Type': 'application/json'},
+      requestHeaders:
+          body == null ? null : {'Content-Type': 'application/json'},
     );
     final text = request.responseText ?? '';
     final status = request.status ?? 0;

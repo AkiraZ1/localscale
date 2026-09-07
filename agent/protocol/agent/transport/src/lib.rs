@@ -1,40 +1,52 @@
 //! Authenticated Host/Cliente transport over a bundled Tor SOCKS endpoint.
 //! Tests use injected loopback runtimes; this crate never starts system Tor.
 
+use fs2::FileExt;
 use localscale_agent_protocol::{
-    decode_frame, encode_frame, CryptoError, CryptoKey, HandshakeEnvelope, Message,
-    NonceAllocator, ParseError, ReplayGuard, Role, SessionNonce, ValidationError,
-    MAX_FRAME_SIZE, VERSION,
+    decode_frame, encode_frame, CryptoError, CryptoKey, HandshakeEnvelope, Message, NonceAllocator,
+    ParseError, ReplayGuard, Role, SessionNonce, ValidationError, MAX_FRAME_SIZE, VERSION,
 };
 use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
-use fs2::FileExt;
 use std::{
     fmt,
+    fs::{self, OpenOptions},
     io::{self, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
-    fs::{self, OpenOptions},
     path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
-    sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
 };
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A crash-safe, caller-owned nonce allocator for persisted CryptoKeys.
 /// The counter is written to a temporary file, synced, and atomically renamed
 /// before the nonce is returned. The state file contains no key material.
-pub struct FileNonceAllocator { path: PathBuf, next: [u8; 24] }
+pub struct FileNonceAllocator {
+    path: PathBuf,
+    next: [u8; 24],
+}
 
 impl FileNonceAllocator {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, TransportError> {
         let path = path.into();
-        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let next = match fs::read_to_string(&path) {
-            Ok(text) => decode_nonce(text.trim()).ok_or(TransportError::Protocol("invalid nonce state"))?,
+            Ok(text) => {
+                decode_nonce(text.trim()).ok_or(TransportError::Protocol("invalid nonce state"))?
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let mut value = [0u8; 24]; OsRng.fill_bytes(&mut value); value
+                let mut value = [0u8; 24];
+                OsRng.fill_bytes(&mut value);
+                value
             }
             Err(e) => return Err(e.into()),
         };
@@ -42,17 +54,27 @@ impl FileNonceAllocator {
     }
     fn persist(&self, value: &[u8; 24]) -> Result<(), TransportError> {
         let tmp = self.path.with_extension(format!(
-            "next-{}-{}", std::process::id(), TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+            "next-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
-        #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
         let mut file = options.open(&tmp)?;
         file.write_all(hex(value).as_bytes())?;
         file.sync_all()?;
         fs::rename(&tmp, &self.path)?;
-        #[cfg(unix)] {
-            let parent = self.path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        #[cfg(unix)]
+        {
+            let parent = self
+                .path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
             OpenOptions::new().read(true).open(parent)?.sync_all()?;
         }
         Ok(())
@@ -61,23 +83,35 @@ impl FileNonceAllocator {
 impl NonceAllocator for FileNonceAllocator {
     fn allocate(&mut self) -> Result<[u8; 24], CryptoError> {
         let lock_path = self.path.with_extension("lock");
-        let lock = OpenOptions::new().create(true).read(true).write(true).open(lock_path)
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)
             .map_err(|_| CryptoError::NonceReuse)?;
         lock.lock_exclusive().map_err(|_| CryptoError::NonceReuse)?;
         let allocated = match fs::read_to_string(&self.path) {
             Ok(text) => decode_nonce(text.trim()).ok_or(CryptoError::NonceReuse)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let mut value = [0u8; 24]; OsRng.fill_bytes(&mut value); value
+                let mut value = [0u8; 24];
+                OsRng.fill_bytes(&mut value);
+                value
             }
             Err(_) => return Err(CryptoError::NonceReuse),
         };
         let mut following = allocated;
         for byte in following.iter_mut().rev() {
             *byte = byte.wrapping_add(1);
-            if *byte != 0 { break; }
+            if *byte != 0 {
+                break;
+            }
         }
-        if following == [0; 24] { return Err(CryptoError::NonceReuse); }
-        self.persist(&following).map_err(|_| CryptoError::NonceReuse)?;
+        if following == [0; 24] {
+            return Err(CryptoError::NonceReuse);
+        }
+        self.persist(&following)
+            .map_err(|_| CryptoError::NonceReuse)?;
         self.next = following;
         Ok(allocated)
     }
@@ -91,8 +125,37 @@ pub fn key_from_invitation_secret(secret: &str) -> CryptoKey {
     CryptoKey::from_bytes(&digest).expect("SHA-256 always produces a 32-byte key")
 }
 
+/// One-way, versioned representation persisted by the local peer store. It
+/// contains the derived transport key, never the bearer invitation secret.
+pub fn stored_transport_key_from_invitation_secret(secret: &str) -> String {
+    let digest = Sha256::digest(secret.as_bytes());
+    let mut encoded = String::with_capacity(71);
+    encoded.push_str("key-v1-");
+    for byte in digest {
+        encoded.push_str(&format!("{byte:02x}"));
+    }
+    encoded
+}
+
+pub fn key_from_stored_transport_key(value: &str) -> Result<CryptoKey, CryptoError> {
+    let hex = value
+        .strip_prefix("key-v1-")
+        .ok_or(CryptoError::InvalidKeyLength)?;
+    if hex.len() != 64 {
+        return Err(CryptoError::InvalidKeyLength);
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
+            .map_err(|_| CryptoError::InvalidKeyLength)?;
+    }
+    CryptoKey::from_bytes(&bytes)
+}
+
 fn decode_nonce(text: &str) -> Option<[u8; 24]> {
-    if text.len() != 48 { return None; }
+    if text.len() != 48 {
+        return None;
+    }
     let mut value = [0u8; 24];
     for (i, slot) in value.iter_mut().enumerate() {
         *slot = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).ok()?;
@@ -134,13 +197,19 @@ impl From<io::Error> for TransportError {
     }
 }
 impl From<CryptoError> for TransportError {
-    fn from(e: CryptoError) -> Self { Self::Crypto(e) }
+    fn from(e: CryptoError) -> Self {
+        Self::Crypto(e)
+    }
 }
 impl From<ParseError> for TransportError {
-    fn from(e: ParseError) -> Self { Self::Parse(e) }
+    fn from(e: ParseError) -> Self {
+        Self::Parse(e)
+    }
 }
 impl From<ValidationError> for TransportError {
-    fn from(e: ValidationError) -> Self { Self::Validation(e) }
+    fn from(e: ValidationError) -> Self {
+        Self::Validation(e)
+    }
 }
 
 pub struct AuthenticatedStream {
@@ -148,13 +217,90 @@ pub struct AuthenticatedStream {
     peer_node_id: String,
 }
 impl AuthenticatedStream {
-    pub fn peer_node_id(&self) -> &str { &self.peer_node_id }
+    pub fn peer_node_id(&self) -> &str {
+        &self.peer_node_id
+    }
+    /// Checks whether the authenticated TCP session is still open without consuming
+    /// protocol bytes. A pending frame also counts as a live connection.
+    pub fn is_connected(&self) -> Result<bool, TransportError> {
+        self.stream.set_nonblocking(true)?;
+        let result = match self.stream.peek(&mut [0u8; 1]) {
+            Ok(0) => Ok(false),
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
+            Err(error) => Err(TransportError::Io(error)),
+        };
+        self.stream.set_nonblocking(false)?;
+        result
+    }
     pub fn send(&mut self, payload: &[u8]) -> Result<(), TransportError> {
         write_frame(&mut self.stream, payload)
     }
     pub fn receive(&mut self) -> Result<Vec<u8>, TransportError> {
         read_frame(&mut self.stream)
     }
+
+    /// Sends a versioned liveness probe. The monotonically increasing sequence
+    /// number lets the caller reject delayed or replayed acknowledgements.
+    pub fn send_ping(&mut self, node_id: &str, sequence: u64) -> Result<(), TransportError> {
+        self.send(heartbeat_frame("ping", node_id, unix_now(), sequence).as_bytes())
+    }
+
+    /// Receives a liveness probe and returns its sequence number after checking
+    /// the protocol version, message kind, and authenticated peer identity.
+    pub fn receive_ping(&mut self) -> Result<u64, TransportError> {
+        let payload = self.receive()?;
+        parse_heartbeat(&payload, "ping", &self.peer_node_id)
+    }
+
+    pub fn send_pong(&mut self, node_id: &str, sequence: u64) -> Result<(), TransportError> {
+        self.send(heartbeat_frame("pong", node_id, unix_now(), sequence).as_bytes())
+    }
+
+    /// Receives an acknowledgement for `expected_sequence`. A connection is
+    /// considered live only after this validation succeeds.
+    pub fn receive_pong(&mut self, expected_sequence: u64) -> Result<(), TransportError> {
+        let payload = self.receive()?;
+        let sequence = parse_heartbeat(&payload, "pong", &self.peer_node_id)?;
+        if sequence != expected_sequence {
+            return Err(TransportError::Protocol("unexpected pong sequence"));
+        }
+        Ok(())
+    }
+}
+
+fn heartbeat_frame(kind: &str, node_id: &str, timestamp: u64, sequence: u64) -> String {
+    format!("v{VERSION}|{kind}|{node_id}|{timestamp}|{sequence}")
+}
+
+fn parse_heartbeat(
+    payload: &[u8],
+    expected_kind: &str,
+    expected_node_id: &str,
+) -> Result<u64, TransportError> {
+    let text = std::str::from_utf8(payload)
+        .map_err(|_| TransportError::Protocol("invalid heartbeat encoding"))?;
+    let mut fields = text.split('|');
+    let version = fields.next();
+    let kind = fields.next();
+    let node_id = fields.next();
+    let timestamp = fields.next().and_then(|value| value.parse::<u64>().ok());
+    let sequence = fields.next().and_then(|value| value.parse::<u64>().ok());
+    let expected_version = format!("v{VERSION}");
+    if fields.next().is_some()
+        || version != Some(expected_version.as_str())
+        || kind != Some(expected_kind)
+        || node_id != Some(expected_node_id)
+        || timestamp.is_none()
+        || sequence.is_none()
+    {
+        return Err(TransportError::Protocol("invalid heartbeat"));
+    }
+    let timestamp = timestamp.expect("checked above");
+    if unix_now().abs_diff(timestamp) > 30 {
+        return Err(TransportError::Protocol("stale heartbeat"));
+    }
+    Ok(sequence.expect("checked above"))
 }
 
 /// Host-side transport with an explicit caller-owned nonce allocator.
@@ -209,7 +355,11 @@ impl HostTransport {
 
     pub fn accept(&mut self) -> Result<AuthenticatedStream, TransportError> {
         let (mut stream, _) = self.listener.accept()?;
-        if self.acceptance_gate.as_ref().is_some_and(|gate| !gate.load(Ordering::Acquire)) {
+        if self
+            .acceptance_gate
+            .as_ref()
+            .is_some_and(|gate| !gate.load(Ordering::Acquire))
+        {
             return Err(TransportError::Protocol("peer transport revoked"));
         }
         set_deadline(&stream, self.timeout)?;
@@ -220,7 +370,11 @@ impl HostTransport {
             .or_else(|_| find_and_open_client(&envelope, &self.key, &envelope_bytes))?;
         let init = localscale_agent_protocol::parse_message(&parsed)?;
         let (client_id, _timestamp, nonce_text) = match &init {
-            Message::HandshakeInit { node_id, timestamp, nonce } => (node_id, *timestamp, nonce),
+            Message::HandshakeInit {
+                node_id,
+                timestamp,
+                nonce,
+            } => (node_id, *timestamp, nonce),
             _ => return Err(TransportError::Protocol("expected handshake init")),
         };
         let now = unix_now();
@@ -244,7 +398,10 @@ impl HostTransport {
             &encode_message(&response),
         )?;
         write_frame(&mut stream, sealed.as_bytes())?;
-        Ok(AuthenticatedStream { stream, peer_node_id: client_id.clone() })
+        Ok(AuthenticatedStream {
+            stream,
+            peer_node_id: client_id.clone(),
+        })
     }
 }
 
@@ -298,14 +455,20 @@ impl ClienteTransport {
         self
     }
 
-    pub fn connect(&mut self, host: &str, port: u16) -> Result<AuthenticatedStream, TransportError> {
+    pub fn connect(
+        &mut self,
+        host: &str,
+        port: u16,
+    ) -> Result<AuthenticatedStream, TransportError> {
         if !self.runtime.is_ready() {
             return Err(TransportError::NotReady("bundled Tor runtime is not ready"));
         }
         let socks = self
             .runtime
             .socks_endpoint()
-            .ok_or(TransportError::Unavailable("bundled Tor SOCKS endpoint is unavailable"))?;
+            .ok_or(TransportError::Unavailable(
+                "bundled Tor SOCKS endpoint is unavailable",
+            ))?;
         if host.is_empty() || host.bytes().any(|b| b.is_ascii_control() || b == b' ') {
             return Err(TransportError::InvalidEndpoint);
         }
@@ -331,11 +494,14 @@ impl ClienteTransport {
         let now = unix_now();
         localscale_agent_protocol::validate_message(&message, now, Role::Cliente)?;
         match message {
-            Message::HandshakeResponse { node_id, nonce: echoed, .. }
-                if node_id == self.host_node_id && echoed == hex(&nonce) =>
-            {
-                Ok(AuthenticatedStream { stream, peer_node_id: node_id })
-            }
+            Message::HandshakeResponse {
+                node_id,
+                nonce: echoed,
+                ..
+            } if node_id == self.host_node_id && echoed == hex(&nonce) => Ok(AuthenticatedStream {
+                stream,
+                peer_node_id: node_id,
+            }),
             _ => Err(TransportError::Protocol("invalid handshake response")),
         }
     }
@@ -343,13 +509,23 @@ impl ClienteTransport {
 
 fn encode_message(message: &Message) -> Vec<u8> {
     match message {
-        Message::HandshakeInit { node_id, timestamp, nonce } => {
+        Message::HandshakeInit {
+            node_id,
+            timestamp,
+            nonce,
+        } => {
             format!("v{VERSION}|handshake|init|{node_id}|{timestamp}|{nonce}")
         }
-        Message::HandshakeResponse { node_id, timestamp, nonce } => {
+        Message::HandshakeResponse {
+            node_id,
+            timestamp,
+            nonce,
+        } => {
             format!("v{VERSION}|handshake|response|{node_id}|{timestamp}|{nonce}")
         }
-        Message::Keepalive { node_id, timestamp } => format!("v{VERSION}|keepalive|{node_id}|{timestamp}"),
+        Message::Keepalive { node_id, timestamp } => {
+            format!("v{VERSION}|keepalive|{node_id}|{timestamp}")
+        }
         Message::MtuProbe { node_id, mtu } => format!("v{VERSION}|mtu|{node_id}|{mtu}"),
     }
     .into_bytes()
@@ -371,7 +547,9 @@ fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>, TransportError> {
     stream.read_exact(&mut body)?;
     let mut frame = head.to_vec();
     frame.extend_from_slice(&body);
-    Ok(decode_frame(&frame).map_err(|_| TransportError::Frame)?.to_vec())
+    Ok(decode_frame(&frame)
+        .map_err(|_| TransportError::Frame)?
+        .to_vec())
 }
 fn set_deadline(stream: &TcpStream, timeout: Duration) -> Result<(), TransportError> {
     stream.set_read_timeout(Some(timeout))?;
@@ -390,7 +568,9 @@ fn connect_socks(
     let mut r = [0u8; 2];
     s.read_exact(&mut r)?;
     if r != [5, 0] {
-        return Err(TransportError::Protocol("SOCKS5 authentication unavailable"));
+        return Err(TransportError::Protocol(
+            "SOCKS5 authentication unavailable",
+        ));
     }
     let hb = host.as_bytes();
     if hb.len() > 255 {
@@ -419,7 +599,10 @@ fn connect_socks(
     Ok(s)
 }
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 fn fresh_nonce() -> [u8; 24] {
     let mut n = [0u8; 24];
@@ -439,7 +622,9 @@ fn session_nonce(n: &[u8; 24]) -> SessionNonce {
 mod tests {
     use super::*;
 
-    struct TestNonceAllocator { next: u8 }
+    struct TestNonceAllocator {
+        next: u8,
+    }
     impl NonceAllocator for TestNonceAllocator {
         fn allocate(&mut self) -> Result<[u8; 24], CryptoError> {
             let nonce = [self.next; 24];
@@ -450,10 +635,16 @@ mod tests {
 
     struct LoopbackRuntime(SocketAddr, bool);
     impl TorRuntime for LoopbackRuntime {
-        fn socks_endpoint(&self) -> Option<SocketAddr> { Some(self.0) }
-        fn is_ready(&self) -> bool { self.1 }
+        fn socks_endpoint(&self) -> Option<SocketAddr> {
+            Some(self.0)
+        }
+        fn is_ready(&self) -> bool {
+            self.1
+        }
     }
-    struct SocksProxy { addr: SocketAddr }
+    struct SocksProxy {
+        addr: SocketAddr,
+    }
     fn proxy(target: SocketAddr) -> SocksProxy {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -473,7 +664,11 @@ mod tests {
             let c_to_t = c.try_clone().unwrap();
             let t_to_c = t.try_clone().unwrap();
             std::thread::spawn(move || {
-                io::copy(&mut c_to_t.try_clone().unwrap(), &mut t_to_c.try_clone().unwrap()).unwrap();
+                io::copy(
+                    &mut c_to_t.try_clone().unwrap(),
+                    &mut t_to_c.try_clone().unwrap(),
+                )
+                .unwrap();
             });
             io::copy(&mut t, &mut c).unwrap();
         });
@@ -490,22 +685,55 @@ mod tests {
             host_key,
             "host-1",
             Box::new(TestNonceAllocator { next: 1 }),
-        ).unwrap();
+        )
+        .unwrap();
         let addr = host.local_addr().unwrap();
         let proxy = proxy(addr);
         let rt = LoopbackRuntime(proxy.addr, true);
         let mut client = ClienteTransport::new(
-            Box::new(rt), client_key, "cliente-1", "host-1",
+            Box::new(rt),
+            client_key,
+            "cliente-1",
+            "host-1",
             Box::new(TestNonceAllocator { next: 2 }),
         );
         let j = std::thread::spawn(move || {
             let mut s = host.accept().unwrap();
             assert_eq!(s.peer_node_id(), "cliente-1");
-            assert_eq!(s.receive().unwrap(), b"ping");
+            let sequence = s.receive_ping().unwrap();
+            assert_eq!(sequence, 7);
+            s.send_pong("host-1", sequence).unwrap();
         });
         let mut c = client.connect("host.onion", 1234).unwrap();
-        c.send(b"ping").unwrap();
+        c.send_ping("cliente-1", 7).unwrap();
+        c.receive_pong(7).unwrap();
         j.join().unwrap();
+    }
+
+    #[test]
+    fn heartbeat_rejects_wrong_kind_identity_and_sequence() {
+        let now = unix_now();
+        assert_eq!(
+            parse_heartbeat(
+                format!("v{VERSION}|ping|client-1|{now}|9").as_bytes(),
+                "ping",
+                "client-1"
+            )
+            .unwrap(),
+            9
+        );
+        assert!(parse_heartbeat(
+            format!("v{VERSION}|pong|client-1|{now}|9").as_bytes(),
+            "ping",
+            "client-1"
+        )
+        .is_err());
+        assert!(parse_heartbeat(
+            format!("v{VERSION}|ping|other|{now}|9").as_bytes(),
+            "ping",
+            "client-1"
+        )
+        .is_err());
     }
 
     #[test]
@@ -513,9 +741,15 @@ mod tests {
         let k = CryptoKey::generate();
         let mut c = ClienteTransport::new(
             Box::new(LoopbackRuntime("127.0.0.1:1".parse().unwrap(), false)),
-            k, "c", "h", Box::new(TestNonceAllocator { next: 1 }),
+            k,
+            "c",
+            "h",
+            Box::new(TestNonceAllocator { next: 1 }),
         );
-        assert!(matches!(c.connect("h.onion", 1), Err(TransportError::NotReady(_))));
+        assert!(matches!(
+            c.connect("h.onion", 1),
+            Err(TransportError::NotReady(_))
+        ));
     }
 
     #[test]
@@ -535,26 +769,37 @@ mod tests {
     fn file_nonce_allocator_is_unique_across_processes() {
         let path = std::env::var_os("LOCALSCALE_NONCE_PATH")
             .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join(format!("localscale-nonce-concurrent-{}", std::process::id())));
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!(
+                    "localscale-nonce-concurrent-{}",
+                    std::process::id()
+                ))
+            });
         if std::env::var_os("LOCALSCALE_NONCE_CHILD").is_some() {
             let mut allocator = FileNonceAllocator::open(&path).unwrap();
-            for _ in 0..32 { allocator.allocate().unwrap(); }
+            for _ in 0..32 {
+                allocator.allocate().unwrap();
+            }
             return;
         }
         let _ = fs::remove_file(&path);
         fs::write(&path, "000000000000000000000000000000000000000000000000").unwrap();
         let mut children = Vec::new();
         for _ in 0..8 {
-            children.push(std::process::Command::new(std::env::current_exe().unwrap())
-                .arg("tests::file_nonce_allocator_is_unique_across_processes")
-                .arg("--exact")
-                .env("LOCALSCALE_NONCE_CHILD", "1")
-                .env("LOCALSCALE_NONCE_PATH", &path)
-                .env("RUST_TEST_THREADS", "1")
-                .spawn()
-                .unwrap());
+            children.push(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("tests::file_nonce_allocator_is_unique_across_processes")
+                    .arg("--exact")
+                    .env("LOCALSCALE_NONCE_CHILD", "1")
+                    .env("LOCALSCALE_NONCE_PATH", &path)
+                    .env("RUST_TEST_THREADS", "1")
+                    .spawn()
+                    .unwrap(),
+            );
         }
-        assert!(children.into_iter().all(|mut child| child.wait().unwrap().success()));
+        assert!(children
+            .into_iter()
+            .all(|mut child| child.wait().unwrap().success()));
         let state = decode_nonce(&fs::read_to_string(&path).unwrap()).unwrap();
         let mut expected = [0u8; 24];
         expected[22] = 1;
@@ -568,8 +813,16 @@ mod tests {
         let a = key_from_invitation_secret("test-invitation-secret");
         let b = key_from_invitation_secret("test-invitation-secret");
         let mut allocator = TestNonceAllocator { next: 9 };
-        let envelope = HandshakeEnvelope::seal_with_allocator(&a, Role::Host, "host-1", &mut allocator, b"ok").unwrap();
+        let envelope =
+            HandshakeEnvelope::seal_with_allocator(&a, Role::Host, "host-1", &mut allocator, b"ok")
+                .unwrap();
         assert_eq!(envelope.open(&b, Role::Host, "host-1").unwrap(), b"ok");
-        assert!(envelope.open(&key_from_invitation_secret("different"), Role::Host, "host-1").is_err());
+        assert!(envelope
+            .open(
+                &key_from_invitation_secret("different"),
+                Role::Host,
+                "host-1"
+            )
+            .is_err());
     }
 }

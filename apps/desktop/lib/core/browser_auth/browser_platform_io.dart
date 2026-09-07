@@ -59,13 +59,12 @@ class HttpLocalSessionBridge implements AuthorizationCodeExchanger {
       required String state}) async {
     final client = HttpClient();
     try {
-      final uri = agentBase.replace(
-          path: '/auth/session/bridge',
-          queryParameters: {
-            'handoff': handoff,
-            'callback': callbackUri.toString(),
-            'state': state,
-          });
+      final uri =
+          agentBase.replace(path: '/auth/session/bridge', queryParameters: {
+        'handoff': handoff,
+        'callback': callbackUri.toString(),
+        'state': state,
+      });
       final response = await (await client.getUrl(uri))
           .close()
           .timeout(const Duration(seconds: 5));

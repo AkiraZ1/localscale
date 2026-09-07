@@ -195,6 +195,90 @@ paths:
           $ref: '#/components/responses/Busy'
         '503':
           $ref: '#/components/responses/NotReady'
+  /api/v1/peer/status:
+    get:
+      tags: [Local agent]
+      summary: Read persisted peer and transport state
+      description: Does not return invitation material or any Host private key material. `connected` is transport/session state, not peer approval.
+      x-implementation-status: implemented-in-development-scaffold
+      security:
+        - localToken: []
+      responses:
+        '200':
+          description: Current peer configuration and transport state.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PeerStatus'}
+        '403': {$ref: '#/components/responses/LoopbackForbidden'}
+  /api/v1/peer/config:
+    post:
+      tags: [Local agent]
+      summary: Persist a validated peer configuration without approving it
+      description: |
+        Stores an invitation-derived configuration. A changed configuration is
+        unapproved and reports `restart_required`; clients must explicitly
+        approve it, then use the narrow runtime-restart route to load it. The
+        current development scaffold retains a write-only opaque invitation
+        field for compatibility; callers must generate it per test run and
+        never use a static secret. Production pairing is expected to use a
+        signed, one-use envelope with nonce and expiry.
+        Repeating the exact persisted configuration is idempotent and retains
+        its existing approval state.
+      x-implementation-status: implemented-in-development-scaffold
+      security:
+        - localToken: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PeerConfigRequest'}
+      responses:
+        '200':
+          description: Persisted peer status; no secret is returned.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PeerStatus'}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '403': {$ref: '#/components/responses/LoopbackForbidden'}
+  /api/v1/peer/approve:
+    post:
+      tags: [Local agent]
+      summary: Explicitly approve the persisted peer
+      description: Approval is separate from configuration and may still require runtime restart.
+      x-implementation-status: implemented-in-development-scaffold
+      security:
+        - localToken: []
+          csrfToken: []
+      responses:
+        '200':
+          description: Updated peer status.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PeerStatus'}
+        '403': {$ref: '#/components/responses/LoopbackForbidden'}
+        '404': {$ref: '#/components/responses/NotReady'}
+  /api/v1/runtime/restart:
+    post:
+      tags: [Local agent]
+      summary: Restart the local runtime to reload an approved peer profile
+      description: |
+        Accepted only when a changed peer configuration is marked
+        `restart_required`. The response is flushed before the agent exits
+        with its dedicated reload code. This endpoint is loopback-only and is
+        not a general remote restart capability.
+      x-implementation-status: implemented-in-development-scaffold
+      security:
+        - localToken: []
+          csrfToken: []
+      responses:
+        '202':
+          description: Restart was scheduled after the response.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RuntimeRestartResponse'}
+        '403': {$ref: '#/components/responses/LoopbackForbidden'}
+        '409': {$ref: '#/components/responses/Busy'}
   /oauth/google/start:
     get:
       tags: [Google authentication]
@@ -404,6 +488,48 @@ components:
           format: uuid
           description: Correlation ID for the operation that produced this status.
       additionalProperties: true
+    PeerConfigRequest:
+      type: object
+      required: [role, node_id, onion_endpoint, invitation_secret]
+      properties:
+        role: {$ref: '#/components/schemas/Mode'}
+        node_id: {type: string, minLength: 1}
+        host_node_id: {type: string, minLength: 1}
+        onion_endpoint:
+          type: string
+          pattern: '^[a-z2-7]{56}\.onion$'
+        invitation_secret:
+          type: string
+          minLength: 1
+          writeOnly: true
+          description: Transitional development-only opaque value. Generate per run; never log, persist in plaintext, commit, ship to a Cliente, or reuse in production.
+        virtual_ip: {type: string, minLength: 1}
+      additionalProperties: false
+    PeerTransport:
+      type: string
+      enum: [unavailable, connecting, connected, retrying, disabled, restart_required]
+    PeerStatus:
+      type: object
+      required: [configured, transport, connected, approved, revoked]
+      properties:
+        configured: {type: boolean}
+        node_id: {type: [string, 'null']}
+        host_node_id: {type: [string, 'null']}
+        onion_endpoint: {type: [string, 'null']}
+        virtual_ip: {type: [string, 'null']}
+        transport: {$ref: '#/components/schemas/PeerTransport'}
+        connected:
+          type: boolean
+          description: True only with active transport, completed/validated handshake and role, and a recent data exchange; never infer from approved/configured.
+        approved: {type: boolean}
+        revoked: {type: boolean}
+      additionalProperties: false
+    RuntimeRestartResponse:
+      type: object
+      required: [restart]
+      properties:
+        restart: {type: string, const: scheduled}
+      additionalProperties: false
     SessionResponse:
       type: object
       required: [authenticated, issuer, subject]

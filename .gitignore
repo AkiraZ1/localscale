@@ -7,3 +7,6 @@ target/
 **/Flutter/ephemeral/
 **/__pycache__/
 *.iml
+.DS_Store
+deploy/tor-runtime/cache/
+linux_screen.png

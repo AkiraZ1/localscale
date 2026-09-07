@@ -63,6 +63,11 @@ class OnionDeploymentContractTests(unittest.TestCase):
             result = subprocess.run([str(VALIDATOR), "--env", str(env_file)], text=True, capture_output=True)
             self.assertEqual(0, result.returncode, result.stderr)
 
+    def test_validator_uses_portable_permission_metadata(self):
+        text = VALIDATOR.read_text()
+        self.assertIn("stat -c '%a'", text)
+        self.assertIn("stat -f '%Lp'", text)
+
     def test_torrc_is_v3_and_local_only(self):
         text = (TEMPLATES / "torrc.onion-v3.example").read_text()
         self.assertIn("HiddenServiceDir", text)
