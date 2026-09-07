@@ -6,12 +6,13 @@ import 'package:localscale_desktop/local_agent_api.dart';
 import 'package:localscale_desktop/main.dart';
 
 void main() {
-  testWidgets('application starts signed out on login screen', (tester) async {
+  testWidgets('application starts directly on the control page',
+      (tester) async {
     await tester.pumpWidget(
         LocalScaleApp(api: LocalAgentApiClient(FakeLocalAgentTransport())));
     await tester.pump();
-    expect(find.byKey(const Key('login-button')), findsOneWidget);
-    expect(find.text('Control center'), findsNothing);
+    expect(find.text('Control center'), findsOneWidget);
+    expect(find.byKey(const Key('login-button')), findsNothing);
   });
 
   testWidgets('mode selection switches between Cliente and Host',
@@ -83,8 +84,8 @@ void main() {
     await tester.pumpWidget(MaterialApp(home: ControlPage(api: api)));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 100));
-    expect(find.text('Rede Onion & Dispositivos'), findsOneWidget);
-    expect(find.text('Isolamento LAN Ativo (Tor 100%)'), findsOneWidget);
+    expect(find.text('Sua Rede & Dispositivos'), findsOneWidget);
+    expect(find.text('Conexão 100% criptografada'), findsOneWidget);
     expect(find.text('local-test'), findsAtLeastNWidgets(1));
     expect(find.text('remote-test'), findsOneWidget);
     expect(find.text('ESTE COMPUTADOR'), findsOneWidget);
@@ -131,9 +132,14 @@ void main() {
     expect(api.importCalls, 1);
     expect(api.approveCalls, 1);
     expect(api.restartCalls, 1);
+    // _importInvitation awaits the real ensureLocalAgentRestarted(), which
+    // retries against a real (in this test environment, always-failing)
+    // HTTP probe for several seconds before giving up — drain that fully so
+    // no timer is left pending when the test ends.
+    await tester.pump(const Duration(seconds: 20));
   });
 
-  testWidgets('host generates, copies and explicitly activates invitation',
+  testWidgets('host generates an invitation and auto-activates it',
       (tester) async {
     tester.view.physicalSize = const Size(1200, 1800);
     tester.view.devicePixelRatio = 1;
@@ -155,14 +161,17 @@ void main() {
     await tester.pump(const Duration(milliseconds: 50));
 
     expect(api.generateCalls, 1);
-    expect(find.byKey(const Key('activate-invitation')), findsOneWidget);
-    await tester.tap(find.byKey(const Key('activate-invitation')));
-    await tester.pump();
-    expect(find.text('Ativar este Host?'), findsOneWidget);
-    await tester.tap(find.byKey(const Key('confirm-invitation')));
-    await tester.pump(const Duration(milliseconds: 50));
+    // Generating an invitation already expresses intent to accept a peer,
+    // so _generateInvitation auto-activates (calls _approveAndRestart) —
+    // no separate manual step is needed, which is the whole point: one
+    // action, not two.
     expect(api.approveCalls, 1);
     expect(api.restartCalls, 1);
+    expect(find.byKey(const Key('activate-invitation')), findsOneWidget);
+    // _approveAndRestart awaits the real ensureLocalAgentRestarted() —
+    // several seconds of retries against an always-failing HTTP probe in
+    // this test environment — drain it so no timer is left pending.
+    await tester.pump(const Duration(seconds: 20));
   });
 }
 

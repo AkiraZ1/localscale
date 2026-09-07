@@ -317,10 +317,10 @@ class _ControlPageState extends State<ControlPage> {
     _lastServiceState = value.state;
     final onion = value.onionEndpoint ?? devices?.localDevice.onionEndpoint;
     if (_lastOnion != onion && (onion?.isNotEmpty ?? false)) {
-      _log('Endpoint Onion local: $onion');
+      _log('Endereço de conexão local: $onion');
     }
     if (onion != null && onion.isEmpty && (_lastOnion?.isNotEmpty ?? false)) {
-      _log('Endpoint Onion local ficou indisponível.');
+      _log('Endereço de conexão local ficou indisponível.');
     }
     _lastOnion = onion;
 
@@ -668,7 +668,7 @@ class _ControlPageState extends State<ControlPage> {
                                   }),
                               const SizedBox(height: 8),
                               const Text(
-                                  'Host publishes an Onion service. Cliente connects outbound.'),
+                                  'Host: cria a rede e gera o convite. Cliente: entra em uma rede existente com um convite.'),
                             ]))),
                 const SizedBox(height: 16),
                 Card(
@@ -696,10 +696,10 @@ class _ControlPageState extends State<ControlPage> {
                                       controller: _onionController,
                                       readOnly: true,
                                       decoration: InputDecoration(
-                                        labelText: 'Onion endpoint (Tor v3)',
+                                        labelText: 'Endereço de conexão',
                                         hintText: current?.mode ==
                                                 LocalScaleMode.host
-                                            ? 'Detectando endpoint Onion do Host...'
+                                            ? 'Preparando endereço de conexão...'
                                             : 'Disponível no modo Host ou ao parear',
                                         border: const OutlineInputBorder(),
                                       ),
@@ -707,7 +707,7 @@ class _ControlPageState extends State<ControlPage> {
                                   ),
                                   const SizedBox(width: 8),
                                   IconButton.filledTonal(
-                                    tooltip: 'Copiar Onion',
+                                    tooltip: 'Copiar endereço',
                                     onPressed: () {
                                       if (_onionController.text.isNotEmpty) {
                                         Clipboard.setData(ClipboardData(
@@ -716,7 +716,7 @@ class _ControlPageState extends State<ControlPage> {
                                             .showSnackBar(
                                           const SnackBar(
                                               content: Text(
-                                                  'Endereço .onion copiado!')),
+                                                  'Endereço copiado!')),
                                         );
                                       }
                                     },
@@ -760,7 +760,7 @@ class _ControlPageState extends State<ControlPage> {
                           spacing: 12,
                           runSpacing: 8,
                           children: [
-                            Text('Rede Onion & Dispositivos',
+                            Text('Sua Rede & Dispositivos',
                                 style: Theme.of(context).textTheme.titleLarge),
                             Container(
                               padding: const EdgeInsets.symmetric(
@@ -775,7 +775,7 @@ class _ControlPageState extends State<ControlPage> {
                                   Icon(Icons.shield,
                                       size: 14, color: Colors.green),
                                   SizedBox(width: 4),
-                                  Text('Isolamento LAN Ativo (Tor 100%)',
+                                  Text('Conexão 100% criptografada',
                                       style: TextStyle(
                                           color: Colors.green,
                                           fontSize: 12,
@@ -787,7 +787,7 @@ class _ControlPageState extends State<ControlPage> {
                         ),
                         const SizedBox(height: 8),
                         const Text(
-                          'Todo o tráfego dos nós é estritamente roteado via túnel Onion Tor v3 P2P. Nenhuma porta física é aberta na rede local.',
+                          'Todo o tráfego entre seus dispositivos é criptografado ponta a ponta. Nenhuma porta é aberta na sua rede local.',
                           style: TextStyle(color: Colors.grey, fontSize: 13),
                         ),
                         const SizedBox(height: 16),
@@ -832,7 +832,7 @@ class _ControlPageState extends State<ControlPage> {
                             ...devices.remotePeers.map((peer) =>
                                 _buildDeviceTile(peer, isLocal: false)),
                         ] else ...[
-                          const Text('Carregando dispositivos da rede Onion...',
+                          const Text('Carregando dispositivos...',
                               style: TextStyle(color: Colors.grey)),
                         ],
                       ],
@@ -864,7 +864,7 @@ class _ControlPageState extends State<ControlPage> {
             ),
           ]),
           const Text(
-              'Mudanças de modo, status do serviço, endpoint Onion, peers e '
+              'Mudanças de modo, status da conexão, dispositivos e '
               'reinícios aparecem aqui para acompanhar comportamento inesperado.',
               style: TextStyle(fontSize: 12, color: Colors.grey)),
           const SizedBox(height: 8),
@@ -906,27 +906,53 @@ class _ControlPageState extends State<ControlPage> {
     return '${two(time.hour)}:${two(time.minute)}:${two(time.second)}';
   }
 
+  Widget _stepLabel(String number, String text) => Padding(
+        padding: const EdgeInsets.only(bottom: 6),
+        child: Row(children: [
+          Container(
+            width: 22,
+            height: 22,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.primary,
+              shape: BoxShape.circle,
+            ),
+            child: Text(number,
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold)),
+          ),
+          const SizedBox(width: 8),
+          Text(text, style: const TextStyle(fontWeight: FontWeight.w600)),
+        ]),
+      );
+
   Widget _buildInvitationCard(ServiceStatus? current) {
     final isHost = current?.mode == LocalScaleMode.host;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(20),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('Pareamento por convite',
+          Text('Conectar dispositivos',
               style: Theme.of(context).textTheme.titleLarge),
           const SizedBox(height: 8),
           Text(isHost
-              ? 'Gere um convite de uso único e envie-o ao Cliente por um canal confiável.'
-              : 'Cole o convite recebido do Host, confira os dados e aprove localmente.'),
-          const SizedBox(height: 12),
+              ? 'Crie um convite de uso único e envie-o ao outro computador por um canal de sua confiança (mensagem, e-mail, etc).'
+              : 'Cole abaixo o convite recebido do outro computador para se conectar a ele.'),
+          const SizedBox(height: 16),
+          _stepLabel('1', 'Dê um nome a este computador'),
           TextField(
             key: const Key('pairing-node-id'),
             controller: _nodeIdController,
             decoration: const InputDecoration(
-                labelText: 'Identificador deste computador',
+                labelText: 'Nome deste computador',
+                hintText: 'Ex: notebook-trabalho',
                 border: OutlineInputBorder()),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 16),
+          _stepLabel(
+              '2', isHost ? 'Gere o convite' : 'Cole o convite recebido'),
           TextField(
             key: const Key('pairing-invitation'),
             controller: _invitationController,
@@ -934,8 +960,8 @@ class _ControlPageState extends State<ControlPage> {
             maxLines: 4,
             readOnly: isHost && _generatedInvitation != null,
             decoration: InputDecoration(
-                labelText: isHost ? 'Convite gerado' : 'Convite do Host',
-                hintText: 'lsinv1.…',
+                labelText: isHost ? 'Convite gerado' : 'Convite recebido',
+                hintText: isHost ? 'Clique em "Gerar convite" abaixo' : 'Cole aqui…',
                 border: const OutlineInputBorder(),
                 suffixIcon: IconButton(
                   tooltip: 'Copiar convite',
@@ -949,7 +975,8 @@ class _ControlPageState extends State<ControlPage> {
                   icon: const Icon(Icons.copy),
                 )),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 16),
+          _stepLabel('3', isHost ? 'Ative e compartilhe' : 'Confirme e conecte'),
           Wrap(spacing: 8, runSpacing: 8, children: [
             if (isHost)
               FilledButton.icon(
@@ -1001,8 +1028,8 @@ class _ControlPageState extends State<ControlPage> {
   /// as a bug even though the connection above it was `connected`).
   String _onionLabel(NetworkDevice dev, {required bool isLocal}) {
     if (dev.onionEndpoint?.isNotEmpty == true) return dev.onionEndpoint!;
-    if (dev.role == 'cliente') return 'Cliente não publica onion';
-    return isLocal ? 'aguardando Tor' : 'não configurado';
+    if (dev.role == 'cliente') return 'Não aplicável';
+    return isLocal ? 'preparando conexão' : 'não configurado';
   }
 
   Widget _buildDeviceTile(NetworkDevice dev, {required bool isLocal}) {
@@ -1067,7 +1094,7 @@ class _ControlPageState extends State<ControlPage> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'IP Virtual: ${dev.virtualIp?.isNotEmpty == true ? dev.virtualIp : (isLocal ? "não definido" : "aguardando peer")} | Onion: ${_onionLabel(dev, isLocal: isLocal)}',
+                  'IP: ${dev.virtualIp?.isNotEmpty == true ? dev.virtualIp : (isLocal ? "não definido" : "aguardando conexão")} | Endereço: ${_onionLabel(dev, isLocal: isLocal)}',
                   style: const TextStyle(fontSize: 12, color: Colors.grey),
                 ),
               ],
