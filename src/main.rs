@@ -471,7 +471,7 @@ mod tests {
         let mut store = PeerStore::open(&path).unwrap();
         store.configure(localscale_agent::PeerRecord {
             role: "cliente".into(), node_id: "client-01".into(), host_node_id: Some("host-01".into()),
-            endpoint: hostname.clone(), invitation_secret: "secret-value-1234".into(), approved: true, revoked: false,
+            endpoint: hostname.clone(), invitation_secret: "secret-value-1234".into(), virtual_ip: None, approved: true, revoked: false,
         }).unwrap();
         env::set_var("LOCALSCALE_PEER_STORE", &path);
         env::set_var("LOCALSCALE_TOR_DATA_DIR", &data_dir);
@@ -501,7 +501,7 @@ mod tests {
         let mut store = PeerStore::open(&path).unwrap();
         store.configure(localscale_agent::PeerRecord {
             role: "host".into(), node_id: "host-01".into(), host_node_id: None,
-            endpoint: format!("{}.onion", "b".repeat(56)), invitation_secret: "secret-value-1234".into(), approved: true, revoked: false,
+            endpoint: format!("{}.onion", "b".repeat(56)), invitation_secret: "secret-value-1234".into(), virtual_ip: None, approved: true, revoked: false,
         }).unwrap();
         env::set_var("LOCALSCALE_PEER_STORE", &path);
         env::set_var("LOCALSCALE_TOR_DATA_DIR", &data_dir);
@@ -525,7 +525,7 @@ mod tests {
         let mut store = PeerStore::open(&path).unwrap();
         store.configure(localscale_agent::PeerRecord {
             role: "unknown".into(), node_id: "node-01".into(), host_node_id: None,
-            endpoint: "not-an-onion".into(), invitation_secret: "secret-value-1234".into(), approved: true, revoked: false,
+            endpoint: "not-an-onion".into(), invitation_secret: "secret-value-1234".into(), virtual_ip: None, approved: true, revoked: false,
         }).unwrap();
         env::set_var("LOCALSCALE_PEER_STORE", &path);
         env::remove_var("LOCALSCALE_ROLE");
@@ -542,7 +542,7 @@ mod tests {
         let mut store = PeerStore::open(&path).unwrap();
         store.configure(localscale_agent::PeerRecord {
             role: "cliente".into(), node_id: "client-01".into(), host_node_id: Some("host-01".into()),
-            endpoint: format!("{}.onion", "a".repeat(56)), invitation_secret: "secret-value-1234".into(), approved: false, revoked: false,
+            endpoint: format!("{}.onion", "a".repeat(56)), invitation_secret: "secret-value-1234".into(), virtual_ip: None, approved: false, revoked: false,
         }).unwrap();
         env::set_var("LOCALSCALE_PEER_STORE", &path);
         env::remove_var("LOCALSCALE_ROLE");
@@ -554,7 +554,7 @@ mod tests {
     fn approved_cliente_record() -> localscale_agent::PeerRecord {
         localscale_agent::PeerRecord {
             role: "cliente".into(), node_id: "client-01".into(), host_node_id: Some("host-01".into()),
-            endpoint: format!("{}.onion", "a".repeat(56)), invitation_secret: "secret-value-1234".into(), approved: true, revoked: false,
+            endpoint: format!("{}.onion", "a".repeat(56)), invitation_secret: "secret-value-1234".into(), virtual_ip: None, approved: true, revoked: false,
         }
     }
 

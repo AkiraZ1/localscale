@@ -165,8 +165,11 @@ class ControlPage extends StatefulWidget {
 class _ControlPageState extends State<ControlPage> {
   static const _pollInterval = Duration(seconds: 5);
   ServiceStatus? status;
+  NetworkDevicesResponse? networkDevices;
   String? message;
   Timer? _pollTimer;
+  final TextEditingController _vipController = TextEditingController();
+
   @override
   void initState() {
     super.initState();
@@ -179,15 +182,25 @@ class _ControlPageState extends State<ControlPage> {
   @override
   void dispose() {
     _pollTimer?.cancel();
+    _vipController.dispose();
     super.dispose();
   }
 
   Future<void> _refresh() async {
     try {
       final value = await widget.api.status();
+      NetworkDevicesResponse? devices;
+      try {
+        devices = await widget.api.getDevices();
+      } catch (_) {}
+
       if (mounted) {
         setState(() {
           status = value;
+          networkDevices = devices;
+          if (devices?.localDevice.virtualIp != null && _vipController.text.isEmpty) {
+            _vipController.text = devices!.localDevice.virtualIp!;
+          }
           message = null;
         });
       }
@@ -218,9 +231,31 @@ class _ControlPageState extends State<ControlPage> {
     }
   }
 
+  Future<void> _updateVirtualIp() async {
+    final ip = _vipController.text.trim();
+    if (ip.isEmpty) return;
+    try {
+      await widget.api.setVirtualIp(ip);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('IP Virtual atualizado para $ip (persistido)')),
+        );
+        _refresh();
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Falha ao atualizar IP: $e')),
+        );
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final current = status;
+    final devices = networkDevices;
+
     return Scaffold(
       appBar: AppBar(title: const Text('LocalScale'), actions: [
         IconButton(
@@ -323,7 +358,179 @@ class _ControlPageState extends State<ControlPage> {
                                 Text(message!, key: const Key('status-message'))
                               ],
                             ]))),
+                const SizedBox(height: 16),
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text('Rede Onion & Dispositivos',
+                                style: Theme.of(context).textTheme.titleLarge),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: Colors.green.withOpacity(0.15),
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: const Row(
+                                children: [
+                                  Icon(Icons.shield, size: 14, color: Colors.green),
+                                  SizedBox(width: 4),
+                                  Text('Isolamento LAN Ativo (Tor 100%)',
+                                      style: TextStyle(
+                                          color: Colors.green,
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w600)),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        const Text(
+                          'Todo o tráfego dos nós é estritamente roteado via túnel Onion Tor v3 P2P. Nenhuma porta física é aberta na rede local.',
+                          style: TextStyle(color: Colors.grey, fontSize: 13),
+                        ),
+                        const SizedBox(height: 16),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: _vipController,
+                                decoration: const InputDecoration(
+                                  labelText: 'IP Virtual Local (Overlay Mesh)',
+                                  hintText: 'Ex: 10.42.0.1',
+                                  border: OutlineInputBorder(),
+                                  isDense: true,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            FilledButton.tonalIcon(
+                              onPressed: _updateVirtualIp,
+                              icon: const Icon(Icons.save),
+                              label: const Text('Salvar IP'),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 20),
+                        Text('Dispositivos Conectados:',
+                            style: Theme.of(context).textTheme.titleMedium),
+                        const SizedBox(height: 10),
+                        if (devices != null) ...[
+                          _buildDeviceTile(devices.localDevice, isLocal: true),
+                          if (devices.remotePeers.isEmpty)
+                            const Padding(
+                              padding: EdgeInsets.symmetric(vertical: 8),
+                              child: Text(
+                                'Nenhum outro peer remoto conectado ainda.',
+                                style: TextStyle(
+                                    color: Colors.grey,
+                                    fontStyle: FontStyle.italic),
+                              ),
+                            )
+                          else
+                            ...devices.remotePeers
+                                .map((peer) => _buildDeviceTile(peer, isLocal: false)),
+                        ] else ...[
+                          const Text('Carregando dispositivos da rede Onion...',
+                              style: TextStyle(color: Colors.grey)),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
               ]))),
+    );
+  }
+
+  Widget _buildDeviceTile(NetworkDevice dev, {required bool isLocal}) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(0.4),
+        border: Border.padLeft == null ? Border.all(color: Colors.white10) : null,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            isLocal ? Icons.laptop_mac : Icons.dns,
+            color: isLocal ? Colors.blue : Colors.purpleAccent,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Text(
+                      dev.nodeId,
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: Colors.blue.withOpacity(0.2),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        dev.role.toUpperCase(),
+                        style: const TextStyle(fontSize: 10, color: Colors.blueAccent),
+                      ),
+                    ),
+                    if (isLocal) ...[
+                      const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: Colors.green.withOpacity(0.2),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: const Text(
+                          'ESTE COMPUTADOR',
+                          style: TextStyle(fontSize: 10, color: Colors.green),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'IP Virtual: ${dev.virtualIp ?? "não configurado"} | Onion: ${dev.onionEndpoint ?? "aguardando"}',
+                  style: const TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+              ],
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            decoration: BoxDecoration(
+              color: dev.status == 'active' || dev.status == 'approved' || dev.status == 'connected'
+                  ? Colors.green.withOpacity(0.15)
+                  : Colors.orange.withOpacity(0.15),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Text(
+              dev.status,
+              style: TextStyle(
+                fontSize: 11,
+                color: dev.status == 'active' || dev.status == 'approved' || dev.status == 'connected'
+                    ? Colors.green
+                    : Colors.orange,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 

@@ -35,6 +35,19 @@ void main() {
       'POST /api/v1/sync',
     ]);
   });
+
+  test('client retrieves devices and updates virtual IP', () async {
+    final transport = _DevicesTransport();
+    final client = LocalAgentApiClient(transport);
+    final devices = await client.getDevices();
+    expect(devices.localDevice.nodeId, 'node-local');
+    expect(devices.localDevice.virtualIp, '10.42.0.1');
+    expect(devices.remotePeers.length, 1);
+    expect(devices.remotePeers.first.nodeId, 'node-peer');
+
+    await client.setVirtualIp('10.42.0.5');
+    expect(transport.lastPostedBody, {'virtual_ip': '10.42.0.5'});
+  });
 }
 
 class _RecordingTransport implements LocalAgentTransport {
@@ -54,3 +67,19 @@ class _RecordingTransport implements LocalAgentTransport {
     return response;
   }
 }
+
+class _DevicesTransport implements LocalAgentTransport {
+  Map<String, dynamic>? lastPostedBody;
+
+  @override
+  Future<String> get(String path) async {
+    return '{"transport":"Tor v3 Onion (Strict Isolation)","isolation":"tor_only_no_lan","local_device":{"node_id":"node-local","role":"host","onion_endpoint":"local.onion","virtual_ip":"10.42.0.1","status":"active"},"remote_peers":[{"node_id":"node-peer","role":"cliente","onion_endpoint":"peer.onion","virtual_ip":"10.42.0.2","status":"approved","approved":true,"revoked":false}]}';
+  }
+
+  @override
+  Future<String> post(String path, {Map<String, dynamic>? body}) async {
+    lastPostedBody = body;
+    return '{"status":"ok"}';
+  }
+}
+

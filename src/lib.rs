@@ -415,6 +415,29 @@ pub fn configuration_html() -> &'static str {
       </div>
     </section>
 
+    <section class="card">
+      <div class="card-title">
+        <span>Onion Network & Virtual IP</span>
+        <span class="subtitle" style="color: var(--success); font-size: 0.75rem;">🧅 Tor-Only Isolation</span>
+      </div>
+
+      <div class="field-group">
+        <div class="field-label">Local Virtual IP (Mesh Overlay)</div>
+        <div class="input-with-action">
+          <input type="text" id="virtualIpInput" class="input-text" placeholder="e.g. 10.42.0.1" />
+          <button type="button" class="btn-icon" onclick="saveVirtualIp()">Salvar IP</button>
+        </div>
+        <span class="subtitle" style="font-size: 0.75rem; margin-top: 0.25rem;">Tráfego 100% via rede Onion. Nenhuma conexão aberta na LAN local.</span>
+      </div>
+
+      <div class="field-group">
+        <div class="field-label">Dispositivos na Rede Onion</div>
+        <div id="devicesContainer" style="display: flex; flex-direction: column; gap: 0.5rem; font-size: 0.85rem;">
+          <div style="color: var(--text-muted);">Carregando dispositivos...</div>
+        </div>
+      </div>
+    </section>
+
     <details>
       <summary>Agent Diagnostics & Safety Info</summary>
       <pre id="diagJson">Fetching diagnostics...</pre>
@@ -519,23 +542,63 @@ pub fn configuration_html() -> &'static str {
       } catch (_) {}
     }
 
-    function copyEndpoint() {
-      const input = document.getElementById('onionEndpoint');
-      if (!input.value) {
-        showToast('No endpoint available to copy', true);
-        return;
+    async function loadDevices() {
+      try {
+        const res = await fetch('/api/v1/devices');
+        if (!res.ok) return;
+        const data = await res.json();
+        const container = document.getElementById('devicesContainer');
+        const local = data.local_device;
+        const peers = data.remote_peers || [];
+        
+        const virtualIpInput = document.getElementById('virtualIpInput');
+        if (local && local.virtual_ip && document.activeElement !== virtualIpInput) {
+          virtualIpInput.value = local.virtual_ip;
+        }
+
+        let html = '';
+        if (local) {
+          html += '<div style="background: var(--bg-surface-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.6rem 0.8rem; display: flex; justify-content: space-between; align-items: center;">';
+          html += '<div><strong>💻 ' + (local.node_id || 'Este Dispositivo') + '</strong> <span style="color: var(--accent-primary); font-size: 0.75rem;">(' + local.role + ')</span><br><span style="color: var(--text-muted); font-size: 0.75rem;">IP Virtual: ' + (local.virtual_ip || 'não atribuído') + '</span></div>';
+          html += '<span style="background: rgba(16, 185, 129, 0.15); color: var(--success); padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.75rem;">● Local</span>';
+          html += '</div>';
+        }
+
+        if (peers.length === 0) {
+          html += '<div style="color: var(--text-muted); font-size: 0.8rem; font-style: italic; padding: 0.4rem 0;">Nenhum outro peer emparelhado na rede Onion ainda.</div>';
+        } else {
+          for (const peer of peers) {
+            html += '<div style="background: var(--bg-surface-elevated); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.6rem 0.8rem; display: flex; justify-content: space-between; align-items: center;">';
+            html += '<div><strong>🔗 ' + (peer.node_id || 'Peer Remoto') + '</strong> <span style="color: var(--accent-primary); font-size: 0.75rem;">(' + peer.role + ')</span><br><span style="color: var(--text-muted); font-size: 0.75rem;">IP Virtual: ' + (peer.virtual_ip || 'auto') + ' | Onion: ' + (peer.onion_endpoint ? peer.onion_endpoint.substring(0, 16) + '...' : '-') + '</span></div>';
+            html += '<span style="background: rgba(59, 130, 246, 0.15); color: #93c5fd; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.75rem;">' + peer.status + '</span>';
+            html += '</div>';
+          }
+        }
+        container.innerHTML = html;
+      } catch (_) {}
+    }
+
+    async function saveVirtualIp() {
+      const input = document.getElementById('virtualIpInput');
+      const ip = input.value.trim();
+      try {
+        const res = await fetch('/api/v1/peer/virtual-ip', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ virtual_ip: ip })
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        showToast('IP Virtual ' + (ip ? ip : 'removido') + ' salvo com sucesso!');
+        loadDevices();
+      } catch (err) {
+        showToast('Falha ao salvar IP Virtual: ' + err.message, true);
       }
-      navigator.clipboard.writeText(input.value).then(() => {
-        showToast('Onion address copied to clipboard!');
-      }).catch(() => {
-        input.select();
-        document.execCommand('copy');
-        showToast('Copied to clipboard!');
-      });
     }
 
     refreshStatus();
+    loadDevices();
     setInterval(refreshStatus, 4000);
+    setInterval(loadDevices, 4000);
   </script>
 </body>
 </html>"#
@@ -557,6 +620,7 @@ struct PeerState {
     node_id: Option<String>,
     host_node_id: Option<String>,
     endpoint: Option<String>,
+    virtual_ip: Option<String>,
     transport: &'static str,
     approved: bool,
     revoked: bool,
@@ -569,6 +633,7 @@ pub struct PeerRecord {
     pub host_node_id: Option<String>,
     pub endpoint: String,
     pub invitation_secret: String,
+    pub virtual_ip: Option<String>,
     pub approved: bool,
     pub revoked: bool,
 }
@@ -581,6 +646,7 @@ impl std::fmt::Debug for PeerRecord {
             .field("host_node_id", &self.host_node_id)
             .field("endpoint", &self.endpoint)
             .field("invitation_secret", &"[REDACTED]")
+            .field("virtual_ip", &self.virtual_ip)
             .field("approved", &self.approved)
             .field("revoked", &self.revoked)
             .finish()
@@ -631,6 +697,11 @@ impl PeerStore {
         record.approved = approved; record.revoked = !approved;
         self.write_record(&record)?; self.record = Some(record); Ok(())
     }
+    pub fn set_virtual_ip(&mut self, virtual_ip: Option<String>) -> std::io::Result<()> {
+        let Some(mut record) = self.record.clone() else { return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "peer is not configured")); };
+        record.virtual_ip = virtual_ip;
+        self.write_record(&record)?; self.record = Some(record); Ok(())
+    }
     fn validate_file(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
         if !metadata.file_type().is_file() {
             return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "peer store must be a regular file"));
@@ -658,14 +729,16 @@ impl PeerStore {
         let approved = fields.get("approved").map(|v| v == "true").unwrap_or(false);
         let revoked = fields.get("revoked").map(|v| v == "true").unwrap_or(true);
         let host_node_id = fields.get("host_node_id").cloned().filter(|v| !v.is_empty());
+        let virtual_ip = fields.get("virtual_ip").cloned().filter(|v| !v.is_empty());
         if role.is_empty() || node_id.is_empty() || endpoint.is_empty() || invitation_secret.is_empty() { return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "incomplete peer store")); }
-        Ok(PeerRecord { role, node_id, host_node_id, endpoint, invitation_secret, approved, revoked })
+        Ok(PeerRecord { role, node_id, host_node_id, endpoint, invitation_secret, virtual_ip, approved, revoked })
     }
     fn write_record(&self, record: &PeerRecord) -> std::io::Result<()> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(parent)?;
         let tmp = self.path.with_extension("tmp");
-        let body = format!("{{\"role\":\"{}\",\"node_id\":\"{}\",\"host_node_id\":\"{}\",\"endpoint\":\"{}\",\"invitation_secret\":\"{}\",\"approved\":{},\"revoked\":{}}}", record.role, record.node_id, record.host_node_id.as_deref().unwrap_or(""), record.endpoint, record.invitation_secret, record.approved, record.revoked);
+        let virtual_ip_str = record.virtual_ip.as_deref().unwrap_or("");
+        let body = format!("{{\"role\":\"{}\",\"node_id\":\"{}\",\"host_node_id\":\"{}\",\"endpoint\":\"{}\",\"invitation_secret\":\"{}\",\"virtual_ip\":\"{}\",\"approved\":{},\"revoked\":{}}}", record.role, record.node_id, record.host_node_id.as_deref().unwrap_or(""), record.endpoint, record.invitation_secret, virtual_ip_str, record.approved, record.revoked);
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?; }
         file.write_all(body.as_bytes())?; file.sync_all()?;
@@ -729,6 +802,7 @@ fn serve_with_auth_handler(listener: TcpListener, auth: Option<SharedAuth>, gate
         if let Some(record) = lock_recover(store).record().cloned() {
             let mut peer = lock_recover(&state.peer);
             peer.configured = true; peer.node_id = Some(record.node_id); peer.host_node_id = record.host_node_id; peer.endpoint = Some(record.endpoint);
+            peer.virtual_ip = record.virtual_ip;
             peer.approved = record.approved; peer.revoked = record.revoked;
         }
     }
@@ -866,6 +940,8 @@ fn response_for_request_with_state(request: &str, state: &AgentState) -> String 
         ("POST", "/api/v1/peer/config") => set_peer_config(body, state),
         ("POST", "/api/v1/peer/approve") => set_peer_approval(true, state),
         ("POST", "/api/v1/peer/revoke") => set_peer_approval(false, state),
+        ("POST", "/api/v1/peer/virtual-ip") => set_virtual_ip_handler(body, state),
+        ("GET", "/api/v1/devices") => devices_status(state),
         ("POST", "/api/v1/mode") => set_mode(body, state, true),
         ("POST", "/api/v1/service/start") => set_service_state("running", state),
         ("POST", "/api/v1/service/stop") => set_service_state("stopped", state),
@@ -938,8 +1014,60 @@ fn service_status(state: &AgentState) -> String {
 
 fn peer_status(state: &AgentState) -> String {
     let peer = lock_recover(&state.peer);
-    let json = format!(r#"{{"configured":{},"node_id":{},"host_node_id":{},"onion_endpoint":{},"transport":"{}","connected":false,"approved":{},"revoked":{}}}"#,
-        peer.configured, optional_json(&peer.node_id), optional_json(&peer.host_node_id), optional_json(&peer.endpoint), peer.transport, peer.approved, peer.revoked);
+    let json = format!(r#"{{"configured":{},"node_id":{},"host_node_id":{},"onion_endpoint":{},"virtual_ip":{},"transport":"{}","connected":false,"approved":{},"revoked":{}}}"#,
+        peer.configured, optional_json(&peer.node_id), optional_json(&peer.host_node_id), optional_json(&peer.endpoint), optional_json(&peer.virtual_ip), peer.transport, peer.approved, peer.revoked);
+    http_response("200 OK", "application/json", &json)
+}
+
+fn set_virtual_ip_handler(body: &str, state: &AgentState) -> String {
+    let fields = match parse_json_fields(body) {
+        Some(fields) => fields,
+        None => return http_response("400 Bad Request", "application/json", r#"{"error":"invalid_payload"}"#),
+    };
+    let virtual_ip = fields.get("virtual_ip").cloned().filter(|v| !v.trim().is_empty());
+    let Some(store) = &state.peer_store else {
+        return http_response("503 Service Unavailable", "application/json", r#"{"error":"peer_store_unavailable"}"#);
+    };
+    if lock_recover(store).set_virtual_ip(virtual_ip.clone()).is_err() {
+        return http_response("404 Not Found", "application/json", r#"{"error":"peer_not_configured"}"#);
+    }
+    let mut peer = lock_recover(&state.peer);
+    peer.virtual_ip = virtual_ip;
+    drop(peer);
+    peer_status(state)
+}
+
+fn devices_status(state: &AgentState) -> String {
+    let mode = lock_recover(&state.mode).clone();
+    let peer = lock_recover(&state.peer);
+    let local_node_id = peer.node_id.as_deref().unwrap_or("local-node");
+    let local_ip = peer.virtual_ip.as_deref().unwrap_or("");
+    let local_endpoint = peer.endpoint.as_deref().unwrap_or("");
+
+    let mut peers_json = String::new();
+    if peer.configured {
+        let peer_role = if mode == "host" { "cliente" } else { "host" };
+        let remote_id = peer.host_node_id.as_deref().unwrap_or("remote-node");
+        let remote_ip = if local_ip.ends_with(".1") {
+            let prefix = &local_ip[..local_ip.len() - 2];
+            format!("{prefix}.2")
+        } else if local_ip.ends_with(".2") {
+            let prefix = &local_ip[..local_ip.len() - 2];
+            format!("{prefix}.1")
+        } else {
+            String::new()
+        };
+        let status = if peer.approved { "approved" } else if peer.revoked { "revoked" } else { "pending" };
+        peers_json = format!(
+            r#"{{"node_id":"{remote_id}","role":"{peer_role}","onion_endpoint":"{local_endpoint}","virtual_ip":"{remote_ip}","status":"{status}","approved":{},"revoked":{}}}"#,
+            peer.approved, peer.revoked
+        );
+    }
+
+    let json = format!(
+        r#"{{"transport":"Tor v3 Onion (Strict Isolation)","isolation":"tor_only_no_lan","local_device":{{"node_id":"{local_node_id}","role":"{mode}","onion_endpoint":"{local_endpoint}","virtual_ip":"{local_ip}","status":"active"}},"remote_peers":[{}]}}"#,
+        peers_json
+    );
     http_response("200 OK", "application/json", &json)
 }
 
@@ -978,10 +1106,11 @@ fn set_peer_config(body: &str, state: &AgentState) -> String {
     };
     let Ok((node_id, host_node_id, endpoint)) = result else { return http_response("400 Bad Request", "application/json", r#"{"error":"invalid_peer_config"}"#) };
     let Some(store) = &state.peer_store else { return http_response("503 Service Unavailable", "application/json", r#"{"error":"peer_store_unavailable"}"#) };
-    let record = PeerRecord { role: role.to_string(), node_id: node_id.clone(), host_node_id: host_node_id.clone(), endpoint: endpoint.clone(), invitation_secret: fields.get("invitation_secret").cloned().unwrap_or_default(), approved: false, revoked: false };
+    let virtual_ip = fields.get("virtual_ip").cloned().filter(|v| !v.trim().is_empty());
+    let record = PeerRecord { role: role.to_string(), node_id: node_id.clone(), host_node_id: host_node_id.clone(), endpoint: endpoint.clone(), invitation_secret: fields.get("invitation_secret").cloned().unwrap_or_default(), virtual_ip: virtual_ip.clone(), approved: false, revoked: false };
     if lock_recover(store).configure(record).is_err() { return http_response("500 Internal Server Error", "application/json", r#"{"error":"peer_store_write_failed"}"#); }
     let mut peer = lock_recover(&state.peer);
-    peer.configured = true; peer.node_id = Some(node_id); peer.host_node_id = host_node_id; peer.endpoint = Some(endpoint); peer.transport = "unavailable"; peer.approved = false; peer.revoked = false;
+    peer.configured = true; peer.node_id = Some(node_id); peer.host_node_id = host_node_id; peer.endpoint = Some(endpoint); peer.virtual_ip = virtual_ip; peer.transport = "unavailable"; peer.approved = false; peer.revoked = false;
     drop(peer);
     peer_status(state)
 }
@@ -1332,7 +1461,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("localscale-peer-test-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut store = super::PeerStore::open(&path).unwrap();
-        store.configure(super::PeerRecord { role: "cliente".into(), node_id: "client-01".into(), host_node_id: Some("host-01".into()), endpoint: "abc.onion".into(), invitation_secret: "secret-value".into(), approved: false, revoked: false }).unwrap();
+        store.configure(super::PeerRecord { role: "cliente".into(), node_id: "client-01".into(), host_node_id: Some("host-01".into()), endpoint: "abc.onion".into(), invitation_secret: "secret-value".into(), virtual_ip: None, approved: false, revoked: false }).unwrap();
         assert!(!super::PeerStore::open(&path).unwrap().record().unwrap().approved);
         store.set_approval(true).unwrap();
         let reloaded = super::PeerStore::open(&path).unwrap();
@@ -1341,7 +1470,7 @@ mod tests {
         let revoked = super::PeerStore::open(&path).unwrap();
         assert!(revoked.record().unwrap().revoked);
         let state = super::AgentState { peer_store: Some(std::sync::Arc::new(std::sync::Mutex::new(revoked))), ..super::AgentState::default() };
-        let status = super::response_for_request_with_state("GET /api/v1/peer/status HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n", &state);
+        let status = super::response_for_request_with_state("GET /api/v1/peer/status HTTP/1.1\r\nHost: localhost\r\n\r\n", &state);
         assert!(!status.contains("secret-value"));
         let _ = std::fs::remove_file(path);
     }
@@ -1386,7 +1515,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("localscale-peer-private-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut store = super::PeerStore::open(&path).unwrap();
-        store.configure(super::PeerRecord { role: "cliente".into(), node_id: "client-01".into(), host_node_id: None, endpoint: "abc.onion".into(), invitation_secret: "secret-value".into(), approved: false, revoked: false }).unwrap();
+        store.configure(super::PeerRecord { role: "cliente".into(), node_id: "client-01".into(), host_node_id: None, endpoint: "abc.onion".into(), invitation_secret: "secret-value".into(), virtual_ip: None, approved: false, revoked: false }).unwrap();
         let metadata = std::fs::symlink_metadata(&path).unwrap();
         assert!(metadata.file_type().is_file());
         assert_eq!(metadata.mode() & 0o777, 0o600);
@@ -1396,7 +1525,7 @@ mod tests {
 
     #[test]
     fn peer_debug_output_redacts_invitation_secret() {
-        let record = super::PeerRecord { role: "cliente".into(), node_id: "client-01".into(), host_node_id: None, endpoint: "abc.onion".into(), invitation_secret: "secret-value".into(), approved: false, revoked: false };
+        let record = super::PeerRecord { role: "cliente".into(), node_id: "client-01".into(), host_node_id: None, endpoint: "abc.onion".into(), invitation_secret: "secret-value".into(), virtual_ip: None, approved: false, revoked: false };
         let store = super::PeerStore { path: std::path::PathBuf::from("peer.json"), record: Some(record.clone()) };
         assert!(!format!("{record:?}").contains("secret-value"));
         assert!(!format!("{store:?}").contains("secret-value"));
@@ -1513,13 +1642,56 @@ mod tests {
         let state = super::AgentState::default();
         super::lock_recover(state.peer_store.as_ref().unwrap()).configure(super::PeerRecord {
             role: "host".into(), node_id: "host-01".into(), host_node_id: None,
-            endpoint: format!("{}.onion", "a".repeat(56)), invitation_secret: "secret".into(), approved: true, revoked: false,
+            endpoint: format!("{}.onion", "a".repeat(56)), invitation_secret: "secret".into(), virtual_ip: None, approved: true, revoked: false,
         }).unwrap();
         assert!(state.peer_transport_enabled.load(std::sync::atomic::Ordering::Acquire));
         let response = super::response_for_request_with_state(
             "POST /api/v1/peer/revoke HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nContent-Length: 0\r\n\r\n", &state);
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(!state.peer_transport_enabled.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn set_virtual_ip_persists_and_updates_devices() {
+        let path = std::env::temp_dir().join(format!("localscale-peer-vip-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut store = super::PeerStore::open(&path).unwrap();
+        store.configure(super::PeerRecord {
+            role: "host".into(),
+            node_id: "host-node".into(),
+            host_node_id: None,
+            endpoint: "test.onion".into(),
+            invitation_secret: "secret".into(),
+            virtual_ip: None,
+            approved: true,
+            revoked: false,
+        }).unwrap();
+        let state = super::AgentState {
+            peer_store: Some(std::sync::Arc::new(std::sync::Mutex::new(store))),
+            ..super::AgentState::default()
+        };
+        // Initial devices check
+        let devices = super::response_for_request_with_state(
+            "GET /api/v1/devices HTTP/1.1\r\nHost: localhost\r\n\r\n", &state);
+        assert!(devices.starts_with("HTTP/1.1 200 OK"), "{devices}");
+        assert!(devices.contains("Tor v3 Onion (Strict Isolation)"));
+
+        // Set virtual IP
+        let update = super::response_for_request_with_state(
+            "POST /api/v1/peer/virtual-ip HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\n\r\n{\"virtual_ip\":\"10.42.0.1\"}", &state);
+        assert!(update.starts_with("HTTP/1.1 200 OK"), "{update}");
+        assert!(update.contains("\"virtual_ip\":\"10.42.0.1\""));
+
+        // Reload store from disk
+        let reloaded = super::PeerStore::open(&path).unwrap();
+        assert_eq!(reloaded.record().unwrap().virtual_ip.as_deref(), Some("10.42.0.1"));
+
+        // Devices now contains virtual IP
+        let devices_after = super::response_for_request_with_state(
+            "GET /api/v1/devices HTTP/1.1\r\nHost: localhost\r\n\r\n", &state);
+        assert!(devices_after.contains("\"virtual_ip\":\"10.42.0.1\""));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -36,6 +36,63 @@ class ServiceStatus {
   }
 }
 
+class NetworkDevice {
+  const NetworkDevice({
+    required this.nodeId,
+    required this.role,
+    required this.onionEndpoint,
+    required this.virtualIp,
+    required this.status,
+    required this.isLocal,
+  });
+
+  final String nodeId;
+  final String role;
+  final String? onionEndpoint;
+  final String? virtualIp;
+  final String status;
+  final bool isLocal;
+
+  factory NetworkDevice.fromJson(Map<String, dynamic> json, {bool isLocal = false}) {
+    return NetworkDevice(
+      nodeId: (json['node_id'] as String?) ?? (isLocal ? 'local-node' : 'peer-node'),
+      role: (json['role'] as String?) ?? 'node',
+      onionEndpoint: json['onion_endpoint'] as String?,
+      virtualIp: json['virtual_ip'] as String?,
+      status: (json['status'] as String?) ?? (isLocal ? 'active' : 'connected'),
+      isLocal: isLocal,
+    );
+  }
+}
+
+class NetworkDevicesResponse {
+  const NetworkDevicesResponse({
+    required this.transport,
+    required this.isolation,
+    required this.localDevice,
+    required this.remotePeers,
+  });
+
+  final String transport;
+  final String isolation;
+  final NetworkDevice localDevice;
+  final List<NetworkDevice> remotePeers;
+
+  factory NetworkDevicesResponse.fromJson(Map<String, dynamic> json) {
+    final localJson = (json['local_device'] as Map<String, dynamic>?) ?? {};
+    final peersJson = (json['remote_peers'] as List<dynamic>?) ?? [];
+    return NetworkDevicesResponse(
+      transport: (json['transport'] as String?) ?? 'Tor v3 Onion (Strict Isolation)',
+      isolation: (json['isolation'] as String?) ?? 'tor_only_no_lan',
+      localDevice: NetworkDevice.fromJson(localJson, isLocal: true),
+      remotePeers: peersJson
+          .whereType<Map<String, dynamic>>()
+          .map((p) => NetworkDevice.fromJson(p, isLocal: false))
+          .toList(),
+    );
+  }
+}
+
 abstract interface class LocalAgentTransport {
   Future<String> get(String path);
   Future<String> post(String path, {Map<String, dynamic>? body});
@@ -47,6 +104,8 @@ abstract interface class LocalAgentApi {
   Future<ServiceStatus> start();
   Future<ServiceStatus> stop();
   Future<ServiceStatus> sync();
+  Future<NetworkDevicesResponse> getDevices();
+  Future<void> setVirtualIp(String virtualIp);
 }
 
 class LocalAgentApiClient implements LocalAgentApi {
@@ -79,16 +138,35 @@ class LocalAgentApiClient implements LocalAgentApi {
 
   @override
   Future<ServiceStatus> sync() => _parse(transport.post('/api/v1/sync'));
+
+  @override
+  Future<NetworkDevicesResponse> getDevices() async {
+    final raw = await transport.get('/api/v1/devices');
+    final json = jsonDecode(raw);
+    if (json is! Map<String, dynamic>) {
+      throw const FormatException('devices response must be an object');
+    }
+    return NetworkDevicesResponse.fromJson(json);
+  }
+
+  @override
+  Future<void> setVirtualIp(String virtualIp) async {
+    await transport.post('/api/v1/peer/virtual-ip', body: {'virtual_ip': virtualIp});
+  }
 }
 
 class FakeLocalAgentTransport implements LocalAgentTransport {
   FakeLocalAgentTransport(
       {this.initial = const ServiceStatus(
-          mode: LocalScaleMode.cliente, state: ServiceState.stopped)})
-      : current = initial;
+          mode: LocalScaleMode.cliente, state: ServiceState.stopped),
+       this.initialVirtualIp = '10.42.0.1'})
+      : current = initial,
+        virtualIp = initialVirtualIp;
 
   final ServiceStatus initial;
+  final String? initialVirtualIp;
   ServiceStatus current;
+  String? virtualIp;
 
   String _encode() => jsonEncode({
         'mode': current.mode.name,
@@ -97,7 +175,33 @@ class FakeLocalAgentTransport implements LocalAgentTransport {
       });
 
   @override
-  Future<String> get(String path) async => _encode();
+  Future<String> get(String path) async {
+    if (path == '/api/v1/devices') {
+      return jsonEncode({
+        'transport': 'Tor v3 Onion (Strict Isolation)',
+        'isolation': 'tor_only_no_lan',
+        'local_device': {
+          'node_id': 'local-node-test',
+          'role': current.mode.name,
+          'onion_endpoint': current.onionEndpoint,
+          'virtual_ip': virtualIp,
+          'status': 'active',
+        },
+        'remote_peers': [
+          {
+            'node_id': 'remote-node-test',
+            'role': current.mode == LocalScaleMode.host ? 'cliente' : 'host',
+            'onion_endpoint': 'remotetest.onion',
+            'virtual_ip': virtualIp == '10.42.0.1' ? '10.42.0.2' : '10.42.0.1',
+            'status': 'connected',
+            'approved': true,
+            'revoked': false,
+          }
+        ],
+      });
+    }
+    return _encode();
+  }
 
   @override
   Future<String> post(String path, {Map<String, dynamic>? body}) async {
@@ -119,6 +223,9 @@ class FakeLocalAgentTransport implements LocalAgentTransport {
           mode: current.mode,
           state: ServiceState.stopped,
           onionEndpoint: current.onionEndpoint);
+    } else if (path == '/api/v1/peer/virtual-ip') {
+      virtualIp = body?['virtual_ip'] as String?;
+      return jsonEncode({'status': 'ok', 'virtual_ip': virtualIp});
     }
     return _encode();
   }

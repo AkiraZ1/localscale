@@ -67,6 +67,17 @@ void main() {
         findsOneWidget);
     expect(find.text('Stopped'), findsNothing);
   });
+
+  testWidgets('displays Onion network card, virtual IP, and devices', (tester) async {
+    final api = ControlledApi();
+    await tester.pumpWidget(MaterialApp(home: ControlPage(api: api)));
+    await tester.pump();
+    expect(find.text('Rede Onion & Dispositivos'), findsOneWidget);
+    expect(find.text('Isolamento LAN Ativo (Tor 100%)'), findsOneWidget);
+    expect(find.text('local-test'), findsOneWidget);
+    expect(find.text('remote-test'), findsOneWidget);
+    expect(find.text('ESTE COMPUTADOR'), findsOneWidget);
+  });
 }
 
 class ControlledApi implements LocalAgentApi {
@@ -96,4 +107,32 @@ class ControlledApi implements LocalAgentApi {
 
   @override
   Future<ServiceStatus> sync() => Future.value(nextStatus);
+
+  @override
+  Future<NetworkDevicesResponse> getDevices() async => NetworkDevicesResponse(
+        transport: 'Tor v3 Onion (Strict Isolation)',
+        isolation: 'tor_only_no_lan',
+        localDevice: const NetworkDevice(
+          nodeId: 'local-test',
+          role: 'cliente',
+          onionEndpoint: null,
+          virtualIp: '10.42.0.1',
+          status: 'active',
+          isLocal: true,
+        ),
+        remotePeers: const [
+          NetworkDevice(
+            nodeId: 'remote-test',
+            role: 'host',
+            onionEndpoint: 'remote.onion',
+            virtualIp: '10.42.0.2',
+            status: 'connected',
+            isLocal: false,
+          ),
+        ],
+      );
+
+  @override
+  Future<void> setVirtualIp(String virtualIp) async {}
 }
+
