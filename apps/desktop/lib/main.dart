@@ -376,7 +376,9 @@ class _ControlPageState extends State<ControlPage> {
       );
       await widget.api.approvePeer();
       await widget.api.restartRuntime();
-      _pairingMessage('Convite aprovado. O agente será reiniciado.');
+      _pairingMessage('Convite aprovado. Aguardando o agente reiniciar…');
+      await ensureLocalAgentRestarted();
+      if (mounted) _pairingMessage('Agente reiniciado com sucesso.');
     } catch (error) {
       _pairingMessage('Falha ao importar convite: $error');
     } finally {
@@ -389,7 +391,9 @@ class _ControlPageState extends State<ControlPage> {
     try {
       await widget.api.approvePeer();
       await widget.api.restartRuntime();
-      _pairingMessage(success);
+      _pairingMessage('Aguardando o agente reiniciar…');
+      await ensureLocalAgentRestarted();
+      if (mounted) _pairingMessage(success);
     } catch (error) {
       _pairingMessage('Falha ao ativar convite: $error');
     } finally {
