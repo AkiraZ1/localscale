@@ -1769,10 +1769,7 @@ fn devices_status(state: &AgentState) -> String {
 
     let local_json = format!(
         r#"{{"node_id":{},"role":{},"onion_endpoint":{},"virtual_ip":{},"status":"active"}}"#,
-        json_string(local_node_id),
-        json_string(&mode),
-        json_string(local_onion),
-        json_string(local_ip)
+        json_string(local_node_id), json_string(&mode), json_string(local_onion), json_string(local_ip)
     );
 
     let mut peers_json = String::new();
@@ -1780,9 +1777,9 @@ fn devices_status(state: &AgentState) -> String {
         let peer_role = if mode == "host" { "cliente" } else { "host" };
         let remote_id = peer.host_node_id.as_deref().unwrap_or_else(|| {
             if mode == "host" {
-                "cliente-linux"
+                "remote-client"
             } else {
-                "host-mac"
+                "remote-host"
             }
         });
         let remote_ip = if let Some(prefix) = local_ip.strip_suffix(".1") {

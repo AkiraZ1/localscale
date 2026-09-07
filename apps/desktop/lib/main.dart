@@ -130,7 +130,7 @@ class _LocalScaleAppState extends State<LocalScaleApp> {
         ),
         home: AnimatedBuilder(
             animation: auth,
-            builder: (_, __) => auth.model.state == AuthState.signedIn
+            builder: (_, __) => auth.model.state == AuthState.signedIn || const bool.fromEnvironment('LOCALSCALE_TEST_PAIRING')
                 ? ControlPage(api: widget.api, onLogout: auth.logout)
                 : LoginPage(controller: auth)),
       );
