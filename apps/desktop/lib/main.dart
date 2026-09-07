@@ -128,7 +128,7 @@ class _LocalScaleAppState extends State<LocalScaleApp> {
           useMaterial3: true,
           scaffoldBackgroundColor: const Color(0xff0b0f19),
         ),
-        home: ControlPage(api: widget.api, onLogout: () {}),
+        home: ControlPage(api: widget.api, onLogout: () async {}),
       );
 }
 
