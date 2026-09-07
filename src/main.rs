@@ -474,8 +474,21 @@ fn spawn_tun_bridge(status: &PeerTransportStatus, packets: PacketChannel) {
 /// macOS `utun` point-to-point interface — see `tun_macos` module docs for
 /// why its read/write path differs from Linux's (an address-family header
 /// frames every packet). `utun` is inherently point-to-point (no ARP/L2 to
-/// resolve), so both addresses go on at configure time and there is no
-/// separate "wait for peer IP, then add a route" step like Linux needs.
+/// resolve), so both addresses go on at configure time — meaning, unlike
+/// Linux, this can't configure anything until the peer's virtual IP has
+/// arrived over the heartbeat.
+///
+/// Critically, this whole function returns immediately (the wait for the
+/// peer's IP happens on a spawned thread): the caller is the *same* thread
+/// that runs the ping/pong loop responsible for ever populating
+/// `status.remote_virtual_ip()` in the first place. An earlier version of
+/// this function waited synchronously before returning — which blocked
+/// that thread from ever sending its own heartbeat, so the peer IP it was
+/// waiting for could never arrive, guaranteeing a ~60s stall on every
+/// single connection before the transport gave up and reconnected. Found
+/// by noticing a real Mac<->Linux pairing cycle endlessly between
+/// "connected" and "retrying" despite the underlying Tor connection itself
+/// being fine.
 #[cfg(target_os = "macos")]
 fn spawn_tun_bridge(status: &PeerTransportStatus, packets: PacketChannel) {
     let local_ip = status.local_virtual_ip();
@@ -483,87 +496,91 @@ fn spawn_tun_bridge(status: &PeerTransportStatus, packets: PacketChannel) {
         log_event("tun: no local virtual IP configured, skipping TUN bridge");
         return;
     }
-    let device = match tun_macos::TunDevice::create(0) {
-        Ok(device) => device,
-        Err(error) => {
+    let status = status.clone();
+    std::thread::spawn(move || {
+        let device = match tun_macos::TunDevice::create(0) {
+            Ok(device) => device,
+            Err(error) => {
+                log_event(&format!(
+                    "tun: failed to create utun device (needs root — see scripts/install-macos.sh): {error}"
+                ));
+                return;
+            }
+        };
+        // The peer's virtual IP may not be known yet (learned from its first
+        // heartbeat, sent by the very thread that called this function);
+        // poll briefly rather than failing the whole bridge.
+        let peer_ip = {
+            let mut found = None;
+            for _ in 0..60 {
+                if let Some(ip) = status.remote_virtual_ip() {
+                    if !ip.is_empty() {
+                        found = Some(ip);
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+            found
+        };
+        let Some(peer_ip) = peer_ip else {
+            log_event("tun: peer virtual IP never arrived, skipping TUN bridge");
+            return;
+        };
+        if let Err(error) = device.configure_address(&local_ip, &peer_ip) {
             log_event(&format!(
-                "tun: failed to create utun device (needs root — see scripts/install-macos.sh): {error}"
+                "tun: failed to configure {}: {error}",
+                device.name()
             ));
             return;
         }
-    };
-    // The peer's virtual IP may not be known yet (learned from its first
-    // heartbeat); poll briefly rather than failing the whole bridge.
-    let peer_ip = {
-        let mut found = None;
-        for _ in 0..60 {
-            if let Some(ip) = status.remote_virtual_ip() {
-                if !ip.is_empty() {
-                    found = Some(ip);
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_secs(1));
-        }
-        found
-    };
-    let Some(peer_ip) = peer_ip else {
-        log_event("tun: peer virtual IP never arrived, skipping TUN bridge");
-        return;
-    };
-    if let Err(error) = device.configure_address(&local_ip, &peer_ip) {
         log_event(&format!(
-            "tun: failed to configure {}: {error}",
+            "tun: {} up ({local_ip} -> {peer_ip}) — bridging to peer",
             device.name()
         ));
-        return;
-    }
-    log_event(&format!(
-        "tun: {} up ({local_ip} -> {peer_ip}) — bridging to peer",
-        device.name()
-    ));
-    let reader = match device.try_clone_handle() {
-        Ok(handle) => handle,
-        Err(error) => {
-            log_event(&format!("tun: failed to clone utun handle: {error}"));
-            return;
-        }
-    };
-    let writer = match device.try_clone_handle() {
-        Ok(handle) => handle,
-        Err(error) => {
-            log_event(&format!("tun: failed to clone utun handle: {error}"));
-            return;
-        }
-    };
-    let sender = packets.sender();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 65535];
-        loop {
-            let n = match reader.read_packet(&mut buf) {
-                Ok(0) => continue,
-                Ok(n) => n,
-                Err(_) => break,
-            };
-            if sender.send_packet(&buf[..n]).is_err() {
-                break;
+        let reader = match device.try_clone_handle() {
+            Ok(handle) => handle,
+            Err(error) => {
+                log_event(&format!("tun: failed to clone utun handle: {error}"));
+                return;
             }
-        }
-    });
-    std::thread::spawn(move || loop {
-        match packets.receive_packet(Duration::from_secs(30)) {
-            Ok(packet) => {
-                if writer.write_packet(&packet).is_err() {
+        };
+        let writer = match device.try_clone_handle() {
+            Ok(handle) => handle,
+            Err(error) => {
+                log_event(&format!("tun: failed to clone utun handle: {error}"));
+                return;
+            }
+        };
+        let sender = packets.sender();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65535];
+            loop {
+                let n = match reader.read_packet(&mut buf) {
+                    Ok(0) => continue,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if sender.send_packet(&buf[..n]).is_err() {
                     break;
                 }
             }
-            Err(localscale_agent_transport::TransportError::Timeout) => continue,
-            Err(_) => break,
-        }
+        });
+        std::thread::spawn(move || loop {
+            match packets.receive_packet(Duration::from_secs(30)) {
+                Ok(packet) => {
+                    if writer.write_packet(&packet).is_err() {
+                        break;
+                    }
+                }
+                Err(localscale_agent_transport::TransportError::Timeout) => continue,
+                Err(_) => break,
+            }
+        });
+        // Keep the device alive for the process's lifetime: it must stay
+        // open as long as either forwarding thread holds a cloned/dup'd fd.
+        std::mem::forget(device);
     });
-    // Keep the device alive for the process's lifetime: it must stay open
-    // as long as either forwarding thread holds a cloned/dup'd fd.
-    std::mem::forget(device);
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
