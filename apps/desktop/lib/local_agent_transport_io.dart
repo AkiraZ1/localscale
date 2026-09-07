@@ -18,8 +18,6 @@ Future<bool> ensureLocalAgentRunning({
   Duration retryDelay = const Duration(milliseconds: 500),
   int attempts = 10,
 }) async {
-  final logFile = File('/tmp/flutter_app.log');
-  logFile.writeAsStringSync('ensureLocalAgentRunning started\n', mode: FileMode.append);
   final agentBase = base ??
       Uri(
           scheme: 'http',
@@ -27,36 +25,30 @@ Future<bool> ensureLocalAgentRunning({
           port: nativeLocalAgentPort(macOS: Platform.isMacOS));
   final probe = healthProbe ?? _probeAgentHealth;
   if (await probe(agentBase)) {
-    logFile.writeAsStringSync('Probe succeeded initially\n', mode: FileMode.append);
     return true;
   }
 
   final desktopExecutable = resolvedExecutable ?? Platform.resolvedExecutable;
   final agentExecutable = File(
       '${File(desktopExecutable).parent.path}${Platform.pathSeparator}localscaled');
-  logFile.writeAsStringSync('Agent path: ${agentExecutable.path}, exists: ${await agentExecutable.exists()}\n', mode: FileMode.append);
   if (!await agentExecutable.exists()) return false;
 
   final start = processStarter ?? _startAgentDetached;
   try {
     await start(agentExecutable.path,
         <String>['--port', '${agentBase.port}', '--no-open']);
-    logFile.writeAsStringSync('Process.start called\n', mode: FileMode.append);
   } catch (error, stackTrace) {
     // Keep the desktop UI available so it can report/retry an unavailable
     // agent instead of crashing during application bootstrap.
-    logFile.writeAsStringSync('Failed to start agent: $error\n$stackTrace\n', mode: FileMode.append);
     print('Failed to start agent: $error\n$stackTrace');
     return false;
   }
   for (var attempt = 0; attempt < attempts; attempt++) {
     if (await probe(agentBase)) {
-      logFile.writeAsStringSync('Probe succeeded after start\n', mode: FileMode.append);
       return true;
     }
     if (attempt + 1 < attempts) await Future<void>.delayed(retryDelay);
   }
-  logFile.writeAsStringSync('Probe failed after all attempts\n', mode: FileMode.append);
   return false;
 }
 
