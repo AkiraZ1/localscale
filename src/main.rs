@@ -369,55 +369,77 @@ fn retry_delay(failures: u32) -> Duration {
 /// plugs into; on any other platform this logs once and does nothing, so
 /// enabling the flag elsewhere is a safe no-op rather than a build error.
 #[cfg(target_os = "linux")]
+static LINUX_TUN_DEVICE: std::sync::OnceLock<Option<tun_linux::TunDevice>> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "linux")]
 fn spawn_tun_bridge(status: &PeerTransportStatus, packets: PacketChannel) {
     let local_ip = status.local_virtual_ip();
     if local_ip.is_empty() {
         log_event("tun: no local virtual IP configured, skipping TUN bridge");
         return;
     }
-    // Overridable only for running two instances side by side on one box
-    // during development (see README test scenario) — every real deployment
-    // has exactly one agent per machine and never needs this set.
-    let requested_name =
-        env::var("LOCALSCALE_TUN_NAME").unwrap_or_else(|_| "localscale0".to_string());
-    let device = match tun_linux::TunDevice::create(&requested_name) {
-        Ok(device) => device,
-        Err(error) => {
-            log_event(&format!(
-                "tun: failed to create TUN device (needs CAP_NET_ADMIN — see scripts/install-linux.sh): {error}"
-            ));
-            return;
+    // The interface itself is created and addressed only once per process
+    // (a fixed name like "localscale0" can't have two live instances, and
+    // the local address never changes across reconnects) — every
+    // subsequent call, including after a dropped-and-reestablished peer
+    // connection, reuses it and just wires up fresh forwarding threads
+    // against the new `PacketChannel`. Recreating the interface on every
+    // reconnect (the previous behavior) either collided with the still-live
+    // old one ("Device or resource busy") or, if the old one had already
+    // died some other way, silently produced ambiguous duplicate
+    // interfaces. A creation failure (e.g. missing CAP_NET_ADMIN) is
+    // memoized as `None` — logged once, not retried until the whole
+    // process restarts — rather than panicking, which would otherwise take
+    // down this reconnect loop's whole thread on the very first failure.
+    let Some(device) = LINUX_TUN_DEVICE.get_or_init(|| {
+        // Overridable only for running two instances side by side on one
+        // box during development (see README test scenario) — every real
+        // deployment has exactly one agent per machine and never needs
+        // this set.
+        let requested_name =
+            env::var("LOCALSCALE_TUN_NAME").unwrap_or_else(|_| "localscale0".to_string());
+        match tun_linux::TunDevice::create(&requested_name).and_then(|device| {
+            device.configure_address(&format!("{local_ip}/24"))?;
+            Ok(device)
+        }) {
+            Ok(device) => {
+                log_event(&format!(
+                    "tun: {} up with {local_ip}/24 — bridging to peer",
+                    device.name()
+                ));
+                Some(device)
+            }
+            Err(error) => {
+                log_event(&format!(
+                    "tun: failed to create/configure TUN device (needs CAP_NET_ADMIN — see scripts/install-linux.sh): {error}; TUN bridging disabled for this process's lifetime"
+                ));
+                None
+            }
         }
-    };
-    if let Err(error) = device.configure_address(&format!("{local_ip}/24")) {
-        log_event(&format!("tun: failed to configure {}: {error}", device.name()));
+    }) else {
         return;
-    }
-    log_event(&format!(
-        "tun: {} up with {local_ip}/24 — bridging to peer",
-        device.name()
-    ));
+    };
     // The peer's virtual IP may not be known yet (learned from its first
     // heartbeat), and the connection can drop and reconnect at any time
     // during the process's life — so this polls indefinitely rather than
     // giving up after a fixed window, re-applying the route (`ip route
-    // replace` is idempotent) whenever a peer IP is present. This is a
-    // background thread for the process's whole lifetime, not a one-shot.
-    {
-        let device_for_route = device.file().try_clone();
+    // replace` is idempotent) whenever a peer IP is present. Guarded to
+    // start only once (the device itself is created only once too) rather
+    // than stacking a redundant poller per reconnect.
+    static ROUTE_THREAD_STARTED: std::sync::Once = std::sync::Once::new();
+    ROUTE_THREAD_STARTED.call_once(|| {
         let status = status.clone();
         let name = device.name().to_string();
-        if device_for_route.is_ok() {
-            std::thread::spawn(move || loop {
-                if let Some(peer_ip) = status.remote_virtual_ip() {
-                    if !peer_ip.is_empty() {
-                        let _ = tun_linux::TunDevice::route_to_peer(&name, &peer_ip);
-                    }
+        std::thread::spawn(move || loop {
+            if let Some(peer_ip) = status.remote_virtual_ip() {
+                if !peer_ip.is_empty() {
+                    let _ = tun_linux::TunDevice::route_to_peer(&name, &peer_ip);
                 }
-                thread::sleep(Duration::from_secs(2));
-            });
-        }
-    }
+            }
+            thread::sleep(Duration::from_secs(2));
+        });
+    });
     let mut reader_file = match device.file().try_clone() {
         Ok(file) => file,
         Err(error) => {
@@ -433,7 +455,12 @@ fn spawn_tun_bridge(status: &PeerTransportStatus, packets: PacketChannel) {
         }
     };
     // TUN device → peer: read whatever the kernel hands back from this
-    // interface and forward it as a packet frame.
+    // interface and forward it as a packet frame. A stale reader thread
+    // from a previous, now-dead connection may still be blocked in read()
+    // here too (harmless: whichever thread the kernel wakes for a given
+    // packet either forwards it correctly over the live channel, or — if
+    // it's the stale thread — fails on `send_packet` against its dead
+    // channel and exits right there).
     let sender = packets.sender();
     std::thread::spawn(move || {
         let mut buf = [0u8; 65535];
@@ -466,9 +493,6 @@ fn spawn_tun_bridge(status: &PeerTransportStatus, packets: PacketChannel) {
             Err(_) => break,
         }
     });
-    // Keep the device alive for the process's lifetime by leaking it: it
-    // must stay open as long as either forwarding thread holds a cloned fd.
-    std::mem::forget(device);
 }
 
 /// macOS `utun` point-to-point interface — see `tun_macos` module docs for
@@ -490,26 +514,36 @@ fn spawn_tun_bridge(status: &PeerTransportStatus, packets: PacketChannel) {
 /// "connected" and "retrying" despite the underlying Tor connection itself
 /// being fine.
 #[cfg(target_os = "macos")]
+static MACOS_TUN_DEVICE: std::sync::OnceLock<Option<tun_macos::TunDevice>> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
 fn spawn_tun_bridge(status: &PeerTransportStatus, packets: PacketChannel) {
     let local_ip = status.local_virtual_ip();
     if local_ip.is_empty() {
         log_event("tun: no local virtual IP configured, skipping TUN bridge");
         return;
     }
+    // Once the interface is created and addressed (which needs the peer's
+    // virtual IP up front, unlike Linux — see module docs), it's reused for
+    // the rest of the process's life: recreating a `utun` on every
+    // reconnect (the previous behavior) left the old one dangling forever
+    // (macOS auto-assigns a fresh unit each time, so nothing ever
+    // collided), producing multiple ambiguous interfaces all claiming the
+    // same address pair with no way to tell which one a live connection
+    // was actually using.
+    if let Some(cached) = MACOS_TUN_DEVICE.get() {
+        let Some(device) = cached else { return };
+        spawn_macos_tun_forwarders(device, packets);
+        return;
+    }
     let status = status.clone();
     std::thread::spawn(move || {
-        let device = match tun_macos::TunDevice::create(0) {
-            Ok(device) => device,
-            Err(error) => {
-                log_event(&format!(
-                    "tun: failed to create utun device (needs root — see scripts/install-macos.sh): {error}"
-                ));
-                return;
-            }
-        };
-        // The peer's virtual IP may not be known yet (learned from its first
-        // heartbeat, sent by the very thread that called this function);
-        // poll briefly rather than failing the whole bridge.
+        // The peer's virtual IP may not be known yet on this, the first
+        // connection ever (learned from its first heartbeat, sent by the
+        // very thread that called this function); poll briefly rather than
+        // failing the whole bridge. Only reached once — later reconnects
+        // hit the cached-device path above and skip this wait entirely.
         let peer_ip = {
             let mut found = None;
             for _ in 0..60 {
@@ -527,59 +561,80 @@ fn spawn_tun_bridge(status: &PeerTransportStatus, packets: PacketChannel) {
             log_event("tun: peer virtual IP never arrived, skipping TUN bridge");
             return;
         };
-        if let Err(error) = device.configure_address(&local_ip, &peer_ip) {
-            log_event(&format!(
-                "tun: failed to configure {}: {error}",
-                device.name()
-            ));
+        let device = MACOS_TUN_DEVICE.get_or_init(|| {
+            match tun_macos::TunDevice::create(0).and_then(|device| {
+                device.configure_address(&local_ip, &peer_ip)?;
+                Ok(device)
+            }) {
+                Ok(device) => {
+                    log_event(&format!(
+                        "tun: {} up ({local_ip} -> {peer_ip}) — bridging to peer",
+                        device.name()
+                    ));
+                    Some(device)
+                }
+                Err(error) => {
+                    log_event(&format!(
+                        "tun: failed to create/configure utun device (needs root — see scripts/install-macos.sh): {error}; TUN bridging disabled for this process's lifetime"
+                    ));
+                    None
+                }
+            }
+        });
+        let Some(device) = device else { return };
+        spawn_macos_tun_forwarders(device, packets);
+    });
+}
+
+/// Wires up the read/write forwarding threads between an already-created
+/// `utun` device and one connection's `PacketChannel` — split out so a
+/// reconnect (which reuses the cached device, see `MACOS_TUN_DEVICE`) can
+/// call it directly without repeating the device setup above.
+#[cfg(target_os = "macos")]
+fn spawn_macos_tun_forwarders(device: &tun_macos::TunDevice, packets: PacketChannel) {
+    let reader = match device.try_clone_handle() {
+        Ok(handle) => handle,
+        Err(error) => {
+            log_event(&format!("tun: failed to clone utun handle: {error}"));
             return;
         }
-        log_event(&format!(
-            "tun: {} up ({local_ip} -> {peer_ip}) — bridging to peer",
-            device.name()
-        ));
-        let reader = match device.try_clone_handle() {
-            Ok(handle) => handle,
-            Err(error) => {
-                log_event(&format!("tun: failed to clone utun handle: {error}"));
-                return;
+    };
+    let writer = match device.try_clone_handle() {
+        Ok(handle) => handle,
+        Err(error) => {
+            log_event(&format!("tun: failed to clone utun handle: {error}"));
+            return;
+        }
+    };
+    let sender = packets.sender();
+    // A stale reader thread from a previous, now-dead connection may still
+    // be blocked in a read here too — harmless, same reasoning as the Linux
+    // version: whichever thread the kernel wakes for a given packet either
+    // forwards it over the live channel, or fails on `send_packet` against
+    // its dead channel and exits right there.
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65535];
+        loop {
+            let n = match reader.read_packet(&mut buf) {
+                Ok(0) => continue,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if sender.send_packet(&buf[..n]).is_err() {
+                break;
             }
-        };
-        let writer = match device.try_clone_handle() {
-            Ok(handle) => handle,
-            Err(error) => {
-                log_event(&format!("tun: failed to clone utun handle: {error}"));
-                return;
-            }
-        };
-        let sender = packets.sender();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 65535];
-            loop {
-                let n = match reader.read_packet(&mut buf) {
-                    Ok(0) => continue,
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-                if sender.send_packet(&buf[..n]).is_err() {
+        }
+    });
+    std::thread::spawn(move || loop {
+        match packets.receive_packet(Duration::from_secs(30)) {
+            Ok(packet) => {
+                if writer.write_packet(&packet).is_err() {
                     break;
                 }
             }
-        });
-        std::thread::spawn(move || loop {
-            match packets.receive_packet(Duration::from_secs(30)) {
-                Ok(packet) => {
-                    if writer.write_packet(&packet).is_err() {
-                        break;
-                    }
-                }
-                Err(localscale_agent_transport::TransportError::Timeout) => continue,
-                Err(_) => break,
-            }
-        });
-        // Keep the device alive for the process's lifetime: it must stay
-        // open as long as either forwarding thread holds a cloned/dup'd fd.
-        std::mem::forget(device);
+            Err(localscale_agent_transport::TransportError::Timeout) => continue,
+            Err(_) => break,
+        }
     });
 }
 
