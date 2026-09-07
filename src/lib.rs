@@ -698,7 +698,16 @@ impl PeerStore {
         self.write_record(&record)?; self.record = Some(record); Ok(())
     }
     pub fn set_virtual_ip(&mut self, virtual_ip: Option<String>) -> std::io::Result<()> {
-        let Some(mut record) = self.record.clone() else { return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "peer is not configured")); };
+        let mut record = self.record.clone().unwrap_or_else(|| PeerRecord {
+            role: "cliente".into(),
+            node_id: "local-node".into(),
+            host_node_id: None,
+            endpoint: "pending.onion".into(),
+            invitation_secret: "unconfigured".into(),
+            virtual_ip: None,
+            approved: false,
+            revoked: false,
+        });
         record.virtual_ip = virtual_ip;
         self.write_record(&record)?; self.record = Some(record); Ok(())
     }
