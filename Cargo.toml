@@ -1,0 +1,36 @@
+[package]
+name = "localscale-agent"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = [".", "agent/protocol", "control-plane", "agent/protocol/agent/transport"]
+
+[dependencies]
+localscale-control-plane = { path = "control-plane" }
+localscale-agent-protocol = { path = "agent/protocol" }
+localscale-agent-transport = { path = "agent/protocol/agent/transport" }
+base64 = "=0.22.1"
+getrandom = "=0.2.17"
+serde = { version = "=1.0.219", features = ["derive"] }
+serde_json = "=1.0.140"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Already present transitively (pulled in by `ring`) at this exact version;
+# declaring it directly only adds raw ioctl/fd bindings for the Linux TUN
+# device, not a new dependency tree — kept to raw FFI on purpose instead of
+# a higher-level "tun" crate, to stay self-contained.
+libc = "=0.2.189"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Same rationale as the Linux target above, for the macOS `utun` device
+# (PF_SYSTEM/SYSPROTO_CONTROL raw sockets) in src/tun_macos.rs.
+libc = "=0.2.189"
+
+[lib]
+name = "localscale_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "localscaled"
+path = "src/main.rs"

@@ -1,0 +1,572 @@
+openapi: 3.1.0
+info:
+  title: LocalScale local loopback API
+  version: 0.1.0
+  description: |
+    Implementation-ready contract for the LocalScale agent's local control API
+    and its loopback hand-off endpoints for Google OIDC. This is a local
+    administrative API, not the remote control-plane API and not the
+    LocalScale peer/data protocol.
+
+    Implementation status is intentionally recorded in x-implementation-status
+    fields. A documented route is not evidence that the route is currently
+    implemented.
+  license:
+    name: LocalScale project
+x-implementation-status:
+  state: development
+  summary: |
+    /health, /version, and the /api/v1 service routes exist in the Rust
+    development scaffold. Google OAuth loopback routes are wired through an
+    injectable control-plane AuthService adapter and fail closed with 503 when
+    SSO is not configured.
+  source-of-truth:
+    - ../architecture.md
+    - ../operations.md
+    - ../google-sso.md
+servers:
+  - url: http://127.0.0.1:{port}
+    description: Local agent loopback listener only; never expose on LAN, WAN, or Onion.
+    variables:
+      port:
+        default: '8765'
+        description: Configured per-user loopback port.
+tags:
+  - name: Local agent
+    description: Loopback-only operations executed by the local agent.
+  - name: Google authentication
+    description: Loopback browser hand-off for the Host/control-plane OIDC flow.
+security:
+  - localToken: []
+paths:
+  /health:
+    get:
+      tags: [Local agent]
+      summary: Process health/readiness probe
+      description: Proves only that the local process can answer. It does not prove peer or Onion connectivity.
+      security: []
+      x-implementation-status: implemented-in-development-scaffold
+      responses:
+        '200':
+          description: Local process is responding.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              examples:
+                healthy:
+                  value: {status: ok, service: localscale}
+        '503':
+          $ref: '#/components/responses/NotReady'
+  /version:
+    get:
+      tags: [Local agent]
+      summary: Get local agent version
+      security: []
+      x-implementation-status: implemented-in-development-scaffold
+      responses:
+        '200':
+          description: Version information.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api/v1/status:
+    get:
+      tags: [Local agent]
+      summary: Read local agent status
+      description: Returns the selected role, lifecycle state, and public Host endpoint when available.
+      x-implementation-status: implemented-in-development-scaffold-not-production-integrated
+      security:
+        - localToken: []
+      responses:
+        '200':
+          description: Current local status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/LoopbackForbidden'
+  /api/v1/mode:
+    post:
+      tags: [Local agent]
+      summary: Select Host or Cliente mode
+      description: |
+        Changes the local operating role. The agent must reject unsafe changes
+        during a lifecycle transition and require explicit UI confirmation
+        before a Host becomes externally reachable.
+      x-implementation-status: implemented-in-development-scaffold-not-production-integrated
+      security:
+        - localToken: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModeRequest'
+      responses:
+        '200':
+          description: Resulting status after the mode change.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceStatus'
+        '400':
+          $ref: '#/components/responses/InvalidMode'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/LoopbackForbidden'
+        '409':
+          $ref: '#/components/responses/Busy'
+  /api/v1/service/start:
+    post:
+      tags: [Local agent]
+      summary: Start the selected local service role
+      description: Returns `starting` while asynchronous role and transport initialization proceeds.
+      x-implementation-status: implemented-in-development-scaffold-not-production-integrated
+      security:
+        - localToken: []
+          csrfToken: []
+      responses:
+        '200':
+          description: Start accepted; poll status for a terminal state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/LoopbackForbidden'
+        '409':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/OnionUnavailable'
+  /api/v1/service/stop:
+    post:
+      tags: [Local agent]
+      summary: Stop the local service role
+      description: Returns `stopping` until protocol and transport cleanup completes.
+      x-implementation-status: implemented-in-development-scaffold-not-production-integrated
+      security:
+        - localToken: []
+          csrfToken: []
+      responses:
+        '200':
+          description: Stop accepted; poll status for `stopped` or `error`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/LoopbackForbidden'
+        '409':
+          $ref: '#/components/responses/Busy'
+  /api/v1/sync:
+    post:
+      tags: [Local agent]
+      summary: Request peer/protocol synchronization
+      description: Requests a refresh using the selected role; it never changes mode or exposes the local API externally.
+      x-implementation-status: implemented-in-development-scaffold-not-production-integrated
+      security:
+        - localToken: []
+          csrfToken: []
+      responses:
+        '200':
+          description: Sync accepted or completed; status is authoritative for the local lifecycle.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/LoopbackForbidden'
+        '409':
+          $ref: '#/components/responses/Busy'
+        '503':
+          $ref: '#/components/responses/NotReady'
+  /api/v1/peer/status:
+    get:
+      tags: [Local agent]
+      summary: Read persisted peer and transport state
+      description: Does not return invitation material or any Host private key material. `connected` is transport/session state, not peer approval.
+      x-implementation-status: implemented-in-development-scaffold
+      security:
+        - localToken: []
+      responses:
+        '200':
+          description: Current peer configuration and transport state.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PeerStatus'}
+        '403': {$ref: '#/components/responses/LoopbackForbidden'}
+  /api/v1/peer/config:
+    post:
+      tags: [Local agent]
+      summary: Persist a validated peer configuration without approving it
+      description: |
+        Stores an invitation-derived configuration. A changed configuration is
+        unapproved and reports `restart_required`; clients must explicitly
+        approve it, then use the narrow runtime-restart route to load it. The
+        current development scaffold retains a write-only opaque invitation
+        field for compatibility; callers must generate it per test run and
+        never use a static secret. Production pairing is expected to use a
+        signed, one-use envelope with nonce and expiry.
+        Repeating the exact persisted configuration is idempotent and retains
+        its existing approval state.
+      x-implementation-status: implemented-in-development-scaffold
+      security:
+        - localToken: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PeerConfigRequest'}
+      responses:
+        '200':
+          description: Persisted peer status; no secret is returned.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PeerStatus'}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '403': {$ref: '#/components/responses/LoopbackForbidden'}
+  /api/v1/peer/approve:
+    post:
+      tags: [Local agent]
+      summary: Explicitly approve the persisted peer
+      description: Approval is separate from configuration and may still require runtime restart.
+      x-implementation-status: implemented-in-development-scaffold
+      security:
+        - localToken: []
+          csrfToken: []
+      responses:
+        '200':
+          description: Updated peer status.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PeerStatus'}
+        '403': {$ref: '#/components/responses/LoopbackForbidden'}
+        '404': {$ref: '#/components/responses/NotReady'}
+  /api/v1/runtime/restart:
+    post:
+      tags: [Local agent]
+      summary: Restart the local runtime to reload an approved peer profile
+      description: |
+        Accepted only when a changed peer configuration is marked
+        `restart_required`. The response is flushed before the agent exits
+        with its dedicated reload code. This endpoint is loopback-only and is
+        not a general remote restart capability.
+      x-implementation-status: implemented-in-development-scaffold
+      security:
+        - localToken: []
+          csrfToken: []
+      responses:
+        '202':
+          description: Restart was scheduled after the response.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/RuntimeRestartResponse'}
+        '403': {$ref: '#/components/responses/LoopbackForbidden'}
+        '409': {$ref: '#/components/responses/Busy'}
+  /oauth/google/start:
+    get:
+      tags: [Google authentication]
+      summary: Begin Google OIDC Authorization Code + PKCE
+      description: |
+        Starts a browser flow coordinated with the Host/control plane. The
+        agent creates a cryptographically random, single-use transaction bound
+        to this loopback origin, then redirects to the control plane's Google
+        authorization URL. `state`, `nonce`, and the PKCE verifier are retained
+        server-side; the verifier and client secret never go to the browser.
+        The control plane, not this local API, owns Google credentials and token
+        validation.
+      security: []
+      x-implementation-status: implemented-with-injected-control-plane
+      parameters:
+        - $ref: '#/components/parameters/ReturnTo'
+      responses:
+        '302':
+          description: Redirect to the control-plane authorization endpoint.
+          headers:
+            Location:
+              description: Absolute HTTPS control-plane authorization URL containing state and S256 challenge.
+              schema: {type: string, format: uri}
+        '400':
+          $ref: '#/components/responses/InvalidRequest'
+        '503':
+          $ref: '#/components/responses/ControlPlaneUnavailable'
+  /oauth/google/callback:
+    get:
+      tags: [Google authentication]
+      summary: Complete the Google OIDC loopback hand-off
+      description: |
+        Receives the browser's loopback callback after the remote control plane
+        completes Google authorization. The agent must validate the exact,
+        unexpired, single-use state transaction before accepting the code or
+        session result. It must reject callbacks with both `error` and `code`,
+        missing or reused state, an unexpected redirect URI, or a callback on a
+        non-loopback Host header. Google ID-token signature, issuer, audience,
+        expiry, nonce, and email verification are validated by the control
+        plane according to docs/google-sso.md; this endpoint does not turn an
+        email address into authorization.
+      security: []
+      x-implementation-status: implemented-with-injected-control-plane
+      parameters:
+        - $ref: '#/components/parameters/OAuthCode'
+        - $ref: '#/components/parameters/OAuthState'
+        - $ref: '#/components/parameters/OAuthError'
+        - $ref: '#/components/parameters/OAuthErrorDescription'
+      responses:
+        '303':
+          description: Redirect to the local control page after successful one-time hand-off. No token is placed in the URL.
+          headers:
+            Location:
+              description: Fixed, pre-registered local control-page URL without credentials or arbitrary return targets.
+              schema: {type: string, format: uri}
+        '400':
+          $ref: '#/components/responses/InvalidOAuthCallback'
+        '403':
+          $ref: '#/components/responses/LoopbackForbidden'
+        '409':
+          $ref: '#/components/responses/OAuthStateReplay'
+        '502':
+          $ref: '#/components/responses/ControlPlaneAuthError'
+  /auth/session:
+    get:
+      tags: [Google authentication]
+      summary: Read the local authenticated session
+      security: []
+      x-implementation-status: implemented-with-injected-control-plane
+      responses:
+        '200': {description: Authenticated session, content: {application/json: {schema: {$ref: '#/components/schemas/SessionResponse'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/LoopbackForbidden'}
+        '503': {$ref: '#/components/responses/ControlPlaneUnavailable'}
+  /auth/logout:
+    post:
+      tags: [Google authentication]
+      summary: Revoke the local authenticated session
+      security:
+        - csrfToken: []
+      x-implementation-status: implemented-with-injected-control-plane
+      responses:
+        '204': {description: Session revoked}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/LoopbackForbidden'}
+        '503': {$ref: '#/components/responses/ControlPlaneUnavailable'}
+components:
+  securitySchemes:
+    localToken:
+      type: apiKey
+      in: header
+      name: X-Local-Token
+      description: Short-lived per-user token delivered through the local trusted startup path; never a Google token or a remote API credential.
+    csrfToken:
+      type: apiKey
+      in: header
+      name: X-CSRF-Token
+      description: Required on browser-originated state-changing requests and bound to the local session.
+  parameters:
+    ReturnTo:
+      name: return_to
+      in: query
+      required: false
+      description: Named local UI route only; arbitrary URLs are rejected to prevent open redirects.
+      schema: {type: string, pattern: '^/[A-Za-z0-9._~/-]*$'}
+    OAuthCode:
+      name: code
+      in: query
+      required: false
+      description: One-time authorization code or control-plane hand-off code; never log or persist in the UI.
+      schema: {type: string, minLength: 1, maxLength: 4096}
+    OAuthState:
+      name: state
+      in: query
+      required: true
+      description: Opaque, cryptographically random, single-use transaction identifier.
+      schema: {type: string, minLength: 16, maxLength: 512}
+    OAuthError:
+      name: error
+      in: query
+      required: false
+      schema:
+        type: string
+        enum: [access_denied, invalid_request, temporarily_unavailable]
+    OAuthErrorDescription:
+      name: error_description
+      in: query
+      required: false
+      description: Display-safe diagnostic; never treated as an authentication result.
+      schema: {type: string, maxLength: 1024}
+  responses:
+    Unauthorized:
+      description: Missing, expired, or invalid local authentication.
+      content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}
+    LoopbackForbidden:
+      description: Request did not arrive from an allowed loopback address or Host header.
+      content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}
+    InvalidRequest:
+      description: Request violates the local contract.
+      content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}
+    InvalidMode:
+      description: Mode is not exactly `host` or `cliente`.
+      content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}
+    Busy:
+      description: Operation conflicts with a lifecycle transition.
+      content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}
+    NotReady:
+      description: Local process or selected role is not ready.
+      content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}
+    OnionUnavailable:
+      description: Required Onion transport is unavailable.
+      content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}
+    InternalError:
+      description: Unexpected local agent failure.
+      content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}
+    ControlPlaneUnavailable:
+      description: Remote control plane could not be reached.
+      content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}
+    InvalidOAuthCallback:
+      description: Callback parameters are missing, malformed, or rejected.
+      content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}
+    OAuthStateReplay:
+      description: State transaction is expired or has already been consumed.
+      content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}
+    ControlPlaneAuthError:
+      description: Control plane rejected or failed the authentication hand-off.
+      content: {application/json: {schema: {$ref: '#/components/schemas/ErrorResponse'}}}
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status, service]
+      properties:
+        status: {type: string, const: ok}
+        service: {type: string, const: localscale}
+      additionalProperties: false
+    VersionResponse:
+      type: object
+      required: [version, service]
+      properties:
+        version: {type: string, minLength: 1}
+        service: {type: string, const: localscale}
+      additionalProperties: false
+    Mode:
+      type: string
+      enum: [host, cliente]
+    ServiceState:
+      type: string
+      enum: [stopped, starting, running, stopping, error]
+    ModeRequest:
+      type: object
+      required: [mode]
+      properties:
+        mode: {$ref: '#/components/schemas/Mode'}
+      additionalProperties: false
+    ServiceStatus:
+      type: object
+      required: [mode, state, onion_endpoint]
+      properties:
+        mode: {$ref: '#/components/schemas/Mode'}
+        state: {$ref: '#/components/schemas/ServiceState'}
+        onion_endpoint:
+          type: [string, 'null']
+          description: Public v3 Onion hostname in Host mode when available; null in Cliente mode or before publication.
+          pattern: '^(?:[a-z2-7]{56}\.onion)?$'
+        request_id:
+          type: [string, 'null']
+          format: uuid
+          description: Correlation ID for the operation that produced this status.
+      additionalProperties: true
+    PeerConfigRequest:
+      type: object
+      required: [role, node_id, onion_endpoint, invitation_secret]
+      properties:
+        role: {$ref: '#/components/schemas/Mode'}
+        node_id: {type: string, minLength: 1}
+        host_node_id: {type: string, minLength: 1}
+        onion_endpoint:
+          type: string
+          pattern: '^[a-z2-7]{56}\.onion$'
+        invitation_secret:
+          type: string
+          minLength: 1
+          writeOnly: true
+          description: Transitional development-only opaque value. Generate per run; never log, persist in plaintext, commit, ship to a Cliente, or reuse in production.
+        virtual_ip: {type: string, minLength: 1}
+      additionalProperties: false
+    PeerTransport:
+      type: string
+      enum: [unavailable, connecting, connected, retrying, disabled, restart_required]
+    PeerStatus:
+      type: object
+      required: [configured, transport, connected, approved, revoked]
+      properties:
+        configured: {type: boolean}
+        node_id: {type: [string, 'null']}
+        host_node_id: {type: [string, 'null']}
+        onion_endpoint: {type: [string, 'null']}
+        virtual_ip: {type: [string, 'null']}
+        transport: {$ref: '#/components/schemas/PeerTransport'}
+        connected:
+          type: boolean
+          description: True only with active transport, completed/validated handshake and role, and a recent data exchange; never infer from approved/configured.
+        approved: {type: boolean}
+        revoked: {type: boolean}
+      additionalProperties: false
+    RuntimeRestartResponse:
+      type: object
+      required: [restart]
+      properties:
+        restart: {type: string, const: scheduled}
+      additionalProperties: false
+    SessionResponse:
+      type: object
+      required: [authenticated, issuer, subject]
+      properties:
+        authenticated: {type: boolean, const: true}
+        issuer: {type: string}
+        subject: {type: string}
+      additionalProperties: false
+    ErrorCategory:
+      type: string
+      enum:
+        - invalid_request
+        - invalid_mode
+        - unauthorized
+        - loopback_forbidden
+        - csrf_failed
+        - busy
+        - not_ready
+        - onion_unavailable
+        - control_plane_unavailable
+        - oauth_callback_invalid
+        - oauth_state_replay
+        - control_plane_auth_failed
+        - internal_error
+    ErrorResponse:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorCategory'
+        message:
+          type: string
+          description: Human-readable and safe to display; never include tokens, codes, secrets, or PKCE material.
+        request_id:
+          type: [string, 'null']
+          format: uuid
+      additionalProperties: false
+externalDocs:
+  description: Google SSO runbook and authoritative callback/security semantics
+  url: ../google-sso.md

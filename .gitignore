@@ -1,6 +1,12 @@
-*.env
-auth.json
-connections.json
-*.key
-*.private
-__pycache__/
+target/
+
+# Generated Flutter and Python artifacts
+**/.dart_tool/
+**/build/
+**/.idea/
+**/Flutter/ephemeral/
+**/__pycache__/
+*.iml
+.DS_Store
+deploy/tor-runtime/cache/
+linux_screen.png
