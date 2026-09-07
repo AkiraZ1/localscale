@@ -365,8 +365,11 @@ class _ControlPageState extends State<ControlPage> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        Wrap(
+                          alignment: WrapAlignment.spaceBetween,
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          spacing: 12,
+                          runSpacing: 8,
                           children: [
                             Text('Rede Onion & Dispositivos',
                                 style: Theme.of(context).textTheme.titleLarge),
@@ -378,6 +381,7 @@ class _ControlPageState extends State<ControlPage> {
                                 borderRadius: BorderRadius.circular(6),
                               ),
                               child: const Row(
+                                mainAxisSize: MainAxisSize.min,
                                 children: [
                                   Icon(Icons.shield, size: 14, color: Colors.green),
                                   SizedBox(width: 4),
