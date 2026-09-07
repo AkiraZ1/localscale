@@ -242,42 +242,65 @@ impl AuthenticatedStream {
 
     /// Sends a versioned liveness probe. The monotonically increasing sequence
     /// number lets the caller reject delayed or replayed acknowledgements.
-    pub fn send_ping(&mut self, node_id: &str, sequence: u64) -> Result<(), TransportError> {
-        self.send(heartbeat_frame("ping", node_id, unix_now(), sequence).as_bytes())
+    /// `virtual_ip` is this side's own configured overlay address (empty if
+    /// unset) — piggybacked on the heartbeat that already proves liveness,
+    /// so the peer can learn it in real time instead of it only ever being
+    /// known locally and guessed (or left blank) on the other side.
+    pub fn send_ping(
+        &mut self,
+        node_id: &str,
+        sequence: u64,
+        virtual_ip: &str,
+    ) -> Result<(), TransportError> {
+        self.send(heartbeat_frame("ping", node_id, unix_now(), sequence, virtual_ip).as_bytes())
     }
 
-    /// Receives a liveness probe and returns its sequence number after checking
-    /// the protocol version, message kind, and authenticated peer identity.
-    pub fn receive_ping(&mut self) -> Result<u64, TransportError> {
+    /// Receives a liveness probe and returns its sequence number and the
+    /// sender's advertised virtual IP (empty if it has none configured)
+    /// after checking the protocol version, message kind, and authenticated
+    /// peer identity.
+    pub fn receive_ping(&mut self) -> Result<(u64, String), TransportError> {
         let payload = self.receive()?;
         parse_heartbeat(&payload, "ping", &self.peer_node_id)
     }
 
-    pub fn send_pong(&mut self, node_id: &str, sequence: u64) -> Result<(), TransportError> {
-        self.send(heartbeat_frame("pong", node_id, unix_now(), sequence).as_bytes())
+    pub fn send_pong(
+        &mut self,
+        node_id: &str,
+        sequence: u64,
+        virtual_ip: &str,
+    ) -> Result<(), TransportError> {
+        self.send(heartbeat_frame("pong", node_id, unix_now(), sequence, virtual_ip).as_bytes())
     }
 
-    /// Receives an acknowledgement for `expected_sequence`. A connection is
-    /// considered live only after this validation succeeds.
-    pub fn receive_pong(&mut self, expected_sequence: u64) -> Result<(), TransportError> {
+    /// Receives an acknowledgement for `expected_sequence` and returns the
+    /// peer's advertised virtual IP. A connection is considered live only
+    /// after this validation succeeds.
+    pub fn receive_pong(&mut self, expected_sequence: u64) -> Result<String, TransportError> {
         let payload = self.receive()?;
-        let sequence = parse_heartbeat(&payload, "pong", &self.peer_node_id)?;
+        let (sequence, virtual_ip) = parse_heartbeat(&payload, "pong", &self.peer_node_id)?;
         if sequence != expected_sequence {
             return Err(TransportError::Protocol("unexpected pong sequence"));
         }
-        Ok(())
+        Ok(virtual_ip)
     }
 }
 
-fn heartbeat_frame(kind: &str, node_id: &str, timestamp: u64, sequence: u64) -> String {
-    format!("v{VERSION}|{kind}|{node_id}|{timestamp}|{sequence}")
+fn heartbeat_frame(
+    kind: &str,
+    node_id: &str,
+    timestamp: u64,
+    sequence: u64,
+    virtual_ip: &str,
+) -> String {
+    format!("v{VERSION}|{kind}|{node_id}|{timestamp}|{sequence}|{virtual_ip}")
 }
 
 fn parse_heartbeat(
     payload: &[u8],
     expected_kind: &str,
     expected_node_id: &str,
-) -> Result<u64, TransportError> {
+) -> Result<(u64, String), TransportError> {
     let text = std::str::from_utf8(payload)
         .map_err(|_| TransportError::Protocol("invalid heartbeat encoding"))?;
     let mut fields = text.split('|');
@@ -286,6 +309,7 @@ fn parse_heartbeat(
     let node_id = fields.next();
     let timestamp = fields.next().and_then(|value| value.parse::<u64>().ok());
     let sequence = fields.next().and_then(|value| value.parse::<u64>().ok());
+    let virtual_ip = fields.next();
     let expected_version = format!("v{VERSION}");
     if fields.next().is_some()
         || version != Some(expected_version.as_str())
@@ -293,6 +317,7 @@ fn parse_heartbeat(
         || node_id != Some(expected_node_id)
         || timestamp.is_none()
         || sequence.is_none()
+        || virtual_ip.is_none()
     {
         return Err(TransportError::Protocol("invalid heartbeat"));
     }
@@ -300,7 +325,10 @@ fn parse_heartbeat(
     if unix_now().abs_diff(timestamp) > 30 {
         return Err(TransportError::Protocol("stale heartbeat"));
     }
-    Ok(sequence.expect("checked above"))
+    Ok((
+        sequence.expect("checked above"),
+        virtual_ip.expect("checked above").to_string(),
+    ))
 }
 
 /// Host-side transport with an explicit caller-owned nonce allocator.
@@ -700,13 +728,14 @@ mod tests {
         let j = std::thread::spawn(move || {
             let mut s = host.accept().unwrap();
             assert_eq!(s.peer_node_id(), "cliente-1");
-            let sequence = s.receive_ping().unwrap();
+            let (sequence, peer_virtual_ip) = s.receive_ping().unwrap();
             assert_eq!(sequence, 7);
-            s.send_pong("host-1", sequence).unwrap();
+            assert_eq!(peer_virtual_ip, "10.0.0.5");
+            s.send_pong("host-1", sequence, "10.0.0.6").unwrap();
         });
         let mut c = client.connect("host.onion", 1234).unwrap();
-        c.send_ping("cliente-1", 7).unwrap();
-        c.receive_pong(7).unwrap();
+        c.send_ping("cliente-1", 7, "10.0.0.5").unwrap();
+        assert_eq!(c.receive_pong(7).unwrap(), "10.0.0.6");
         j.join().unwrap();
     }
 
@@ -715,21 +744,29 @@ mod tests {
         let now = unix_now();
         assert_eq!(
             parse_heartbeat(
-                format!("v{VERSION}|ping|client-1|{now}|9").as_bytes(),
+                format!("v{VERSION}|ping|client-1|{now}|9|10.0.0.5").as_bytes(),
                 "ping",
                 "client-1"
             )
             .unwrap(),
-            9
+            (9, "10.0.0.5".to_string())
         );
         assert!(parse_heartbeat(
-            format!("v{VERSION}|pong|client-1|{now}|9").as_bytes(),
+            format!("v{VERSION}|pong|client-1|{now}|9|10.0.0.5").as_bytes(),
             "ping",
             "client-1"
         )
         .is_err());
         assert!(parse_heartbeat(
-            format!("v{VERSION}|ping|other|{now}|9").as_bytes(),
+            format!("v{VERSION}|ping|other|{now}|9|10.0.0.5").as_bytes(),
+            "ping",
+            "client-1"
+        )
+        .is_err());
+        // Missing virtual_ip field entirely (old wire format) must also be
+        // rejected rather than silently accepted with a default.
+        assert!(parse_heartbeat(
+            format!("v{VERSION}|ping|client-1|{now}|9").as_bytes(),
             "ping",
             "client-1"
         )

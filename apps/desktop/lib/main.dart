@@ -190,6 +190,7 @@ class ControlPage extends StatefulWidget {
 
 class _ControlPageState extends State<ControlPage> {
   static const _pollInterval = Duration(seconds: 5);
+  static const _maxLogEntries = 300;
   ServiceStatus? status;
   NetworkDevicesResponse? networkDevices;
   String? message;
@@ -201,9 +202,36 @@ class _ControlPageState extends State<ControlPage> {
   GeneratedInvitation? _generatedInvitation;
   bool _pairingBusy = false;
 
+  // Rolling event log so status/port/restart/transport transitions and
+  // unexpected agent behavior can be reported back here, instead of only
+  // flashing as a snackbar and disappearing.
+  final List<_LogEntry> _eventLog = [];
+  ServiceState? _lastServiceState;
+  LocalScaleMode? _lastMode;
+  String? _lastOnion;
+  String? _lastRemotePeerStatus;
+  int? _lastRemotePeerCount;
+  bool _lastRefreshFailed = false;
+  int _backendLogLinesSeen = 0;
+
+  void _log(String text, {DateTime? time}) {
+    final entry = _LogEntry(time ?? DateTime.now(), text);
+    if (!mounted) {
+      _eventLog.insert(0, entry);
+      return;
+    }
+    setState(() {
+      _eventLog.insert(0, entry);
+      if (_eventLog.length > _maxLogEntries) {
+        _eventLog.removeRange(_maxLogEntries, _eventLog.length);
+      }
+    });
+  }
+
   @override
   void initState() {
     super.initState();
+    _log('Painel iniciado. Porta local do agente: $localAgentPort.');
     _refresh();
     _pollTimer = Timer.periodic(_pollInterval, (_) {
       if (mounted) _refresh();
@@ -228,6 +256,9 @@ class _ControlPageState extends State<ControlPage> {
         devices = await widget.api.getDevices();
       } catch (_) {}
 
+      _logStatusTransitions(value, devices);
+      unawaited(_syncBackendLog());
+
       if (mounted) {
         setState(() {
           status = value;
@@ -250,6 +281,10 @@ class _ControlPageState extends State<ControlPage> {
         });
       }
     } catch (error) {
+      if (!_lastRefreshFailed) {
+        _lastRefreshFailed = true;
+        _log('Falha ao ler o agente local: $error');
+      }
       if (mounted) {
         setState(() {
           status = null;
@@ -257,6 +292,88 @@ class _ControlPageState extends State<ControlPage> {
         });
       }
     }
+  }
+
+  /// Compares the freshly-polled status/devices against what was shown
+  /// before this refresh and appends a timestamped entry for anything that
+  /// actually changed — mode, service state, Onion endpoint, and remote peer
+  /// status (pending/approved/connecting/connected/etc, and count). This is
+  /// what lets unexpected behavior (a peer stuck in "connecting", a restart
+  /// that silently failed, an Onion endpoint disappearing) be reported here
+  /// instead of only being visible as a transient snackbar or not at all.
+  void _logStatusTransitions(
+      ServiceStatus value, NetworkDevicesResponse? devices) {
+    if (_lastRefreshFailed) {
+      _lastRefreshFailed = false;
+      _log('Agente voltou a responder.');
+    }
+    if (_lastMode != null && _lastMode != value.mode) {
+      _log('Modo alterado: ${_lastMode!.name} -> ${value.mode.name}.');
+    }
+    _lastMode = value.mode;
+    if (_lastServiceState != null && _lastServiceState != value.state) {
+      _log('Estado do serviço: ${_lastServiceState!.name} -> ${value.state.name}.');
+    }
+    _lastServiceState = value.state;
+    final onion = value.onionEndpoint ?? devices?.localDevice.onionEndpoint;
+    if (_lastOnion != onion && (onion?.isNotEmpty ?? false)) {
+      _log('Endpoint Onion local: $onion');
+    }
+    if (onion != null && onion.isEmpty && (_lastOnion?.isNotEmpty ?? false)) {
+      _log('Endpoint Onion local ficou indisponível.');
+    }
+    _lastOnion = onion;
+
+    final remotePeers = devices?.remotePeers ?? const <NetworkDevice>[];
+    if (_lastRemotePeerCount != null &&
+        _lastRemotePeerCount != remotePeers.length) {
+      _log(remotePeers.isEmpty
+          ? 'Dispositivo remoto removido/desconfigurado.'
+          : 'Dispositivo remoto configurado (${remotePeers.length}).');
+    }
+    _lastRemotePeerCount = remotePeers.length;
+    final remoteStatus = remotePeers.isEmpty ? null : remotePeers.first.status;
+    if (remoteStatus != null && _lastRemotePeerStatus != remoteStatus) {
+      final name = remotePeers.first.nodeId;
+      _log('Peer "$name": ${_lastRemotePeerStatus ?? "?"} -> $remoteStatus.');
+    }
+    _lastRemotePeerStatus = remoteStatus;
+  }
+
+  /// Pulls new lines from the backend's own event log (Tor start failures,
+  /// dial/handshake errors) and merges them into the same panel as the UI's
+  /// own status-transition entries. Without this, the daemon can fail a real
+  /// connection attempt with a specific, actionable error and the desktop UI
+  /// would only ever show a generic "connecting"/"retrying" label — this is
+  /// what actually lets unexpected agent behavior be diagnosed from here.
+  Future<void> _syncBackendLog() async {
+    String tail;
+    try {
+      tail = await widget.api.backendLogTail();
+    } catch (_) {
+      return;
+    }
+    final lines = tail.split('\n').where((line) => line.isNotEmpty).toList();
+    if (lines.length <= _backendLogLinesSeen) {
+      if (lines.length < _backendLogLinesSeen) {
+        // The log file was rotated/cleared (e.g. a fresh agent start); reset
+        // tracking so future lines are not skipped forever.
+        _backendLogLinesSeen = 0;
+      }
+      return;
+    }
+    for (final line in lines.skip(_backendLogLinesSeen)) {
+      final spaceIndex = line.indexOf(' ');
+      final epochText =
+          spaceIndex > 0 ? line.substring(0, spaceIndex) : null;
+      final epoch = epochText == null ? null : int.tryParse(epochText);
+      final text = epoch == null ? line : line.substring(spaceIndex + 1);
+      final time = epoch == null
+          ? DateTime.now()
+          : DateTime.fromMillisecondsSinceEpoch(epoch * 1000);
+      _log('[agente] $text', time: time);
+    }
+    _backendLogLinesSeen = lines.length;
   }
 
   Future<void> _run(
@@ -320,8 +437,15 @@ class _ControlPageState extends State<ControlPage> {
         _generatedInvitation = generated;
         _invitationController.text = generated.invitation;
       });
-      _pairingMessage(
-          'Convite criado. Confira, copie e ative o Host para utilizá-lo.');
+      // Generating an invitation already expresses the Host's intent to
+      // accept a peer; previously the Host still had to press a separate
+      // "Ativar Host" button before its accept loop actually started
+      // listening, so a generated-but-not-activated invite left the Cliente
+      // stuck showing "pending" forever with no indication anything was
+      // missing on the Host side. Auto-activate so Host and Cliente behave
+      // symmetrically (Cliente auto-approves right after import).
+      await _approveAndRestart(
+          'Convite criado e Host ativado. Copie o convite e envie ao Cliente.');
     } catch (error) {
       _pairingMessage('Não foi possível gerar o convite: $error');
     } finally {
@@ -430,7 +554,12 @@ class _ControlPageState extends State<ControlPage> {
         _nodeIdController.clear();
         _vipController.clear();
         _onionController.clear();
+        // Reflect the removal immediately instead of waiting for the next
+        // 5s poll tick — otherwise the "Remover dispositivo" button and the
+        // stale peer tile stay on screen until the next _refresh() fires.
+        networkDevices = null;
       });
+      await _refresh();
       _pairingMessage('Dispositivo removido. Pronto para novo pareamento.');
     } catch (error) {
       _pairingMessage('Falha ao remover dispositivo: $error');
@@ -471,6 +600,7 @@ class _ControlPageState extends State<ControlPage> {
   }
 
   void _pairingMessage(String text) {
+    _log(text);
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   }
@@ -529,6 +659,10 @@ class _ControlPageState extends State<ControlPage> {
                                     _vipController.clear();
                                     _onionController.clear();
                                     _nodeIdController.clear();
+                                    _invitationController.clear();
+                                    setState(() {
+                                      _generatedInvitation = null;
+                                    });
                                     _run(() => widget.api.setMode(s.first),
                                         'Mode update');
                                   }),
@@ -707,8 +841,69 @@ class _ControlPageState extends State<ControlPage> {
                 ),
                 const SizedBox(height: 16),
                 _buildInvitationCard(current),
+                const SizedBox(height: 16),
+                _buildEventLogCard(),
               ]))),
     );
+  }
+
+  Widget _buildEventLogCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+            Text('Log de eventos',
+                style: Theme.of(context).textTheme.titleLarge),
+            IconButton(
+              key: const Key('clear-event-log'),
+              tooltip: 'Limpar log',
+              onPressed:
+                  _eventLog.isEmpty ? null : () => setState(_eventLog.clear),
+              icon: const Icon(Icons.delete_sweep),
+            ),
+          ]),
+          const Text(
+              'Mudanças de modo, status do serviço, endpoint Onion, peers e '
+              'reinícios aparecem aqui para acompanhar comportamento inesperado.',
+              style: TextStyle(fontSize: 12, color: Colors.grey)),
+          const SizedBox(height: 8),
+          Container(
+            key: const Key('event-log'),
+            height: 220,
+            width: double.infinity,
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              border: Border.all(color: Colors.grey.shade400),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: _eventLog.isEmpty
+                ? const Center(
+                    child: Text('Nenhum evento registrado ainda.',
+                        style: TextStyle(color: Colors.grey)))
+                : SingleChildScrollView(
+                    // A single SelectableText spanning every line, instead of
+                    // one per list item, so drag-select (or Cmd/Ctrl+A) can
+                    // span the whole log instead of being limited to one
+                    // line at a time.
+                    child: SelectableText(
+                      _eventLog
+                          .map((entry) =>
+                              '${_formatLogTime(entry.time)}  ${entry.text}')
+                          .join('\n'),
+                      style: const TextStyle(
+                          fontFamily: 'monospace', fontSize: 12),
+                    ),
+                  ),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  String _formatLogTime(DateTime time) {
+    String two(int value) => value.toString().padLeft(2, '0');
+    return '${two(time.hour)}:${two(time.minute)}:${two(time.second)}';
   }
 
   Widget _buildInvitationCard(ServiceStatus? current) {
@@ -774,7 +969,7 @@ class _ControlPageState extends State<ControlPage> {
                   onPressed: _pairingBusy ? null : _activateGeneratedInvitation,
                   icon: const Icon(Icons.verified_user),
                   label: const Text('Ativar Host')),
-            if (networkDevices != null)
+            if (networkDevices?.remotePeers.isNotEmpty == true)
               OutlinedButton.icon(
                   key: const Key('reset-peer'),
                   onPressed: _pairingBusy ? null : _resetPeer,
@@ -796,6 +991,18 @@ class _ControlPageState extends State<ControlPage> {
         ]),
       ),
     );
+  }
+
+  /// A Cliente never runs a hidden service — only a Host publishes one — so
+  /// an empty onion for a `cliente`-role device is permanent by design, not
+  /// a pending/error state. Labels like "aguardando Tor" or "não
+  /// configurado" implied something was wrong or about to resolve itself,
+  /// which confused testing (a Cliente tile correctly showing no onion read
+  /// as a bug even though the connection above it was `connected`).
+  String _onionLabel(NetworkDevice dev, {required bool isLocal}) {
+    if (dev.onionEndpoint?.isNotEmpty == true) return dev.onionEndpoint!;
+    if (dev.role == 'cliente') return 'Cliente não publica onion';
+    return isLocal ? 'aguardando Tor' : 'não configurado';
   }
 
   Widget _buildDeviceTile(NetworkDevice dev, {required bool isLocal}) {
@@ -860,7 +1067,7 @@ class _ControlPageState extends State<ControlPage> {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'IP Virtual: ${dev.virtualIp?.isNotEmpty == true ? dev.virtualIp : "não configurado"} | Onion: ${dev.onionEndpoint?.isNotEmpty == true ? dev.onionEndpoint : (isLocal ? "aguardando Tor" : "não configurado")}',
+                  'IP Virtual: ${dev.virtualIp?.isNotEmpty == true ? dev.virtualIp : (isLocal ? "não definido" : "aguardando peer")} | Onion: ${_onionLabel(dev, isLocal: isLocal)}',
                   style: const TextStyle(fontSize: 12, color: Colors.grey),
                 ),
               ],
@@ -886,6 +1093,16 @@ class _ControlPageState extends State<ControlPage> {
               ),
             ),
           ),
+          if (!isLocal) ...[
+            const SizedBox(width: 4),
+            IconButton(
+              key: const Key('remove-device-tile'),
+              tooltip: 'Remover dispositivo',
+              onPressed: _pairingBusy ? null : _resetPeer,
+              icon: const Icon(Icons.link_off, size: 18),
+              color: Colors.redAccent,
+            ),
+          ],
         ],
       ),
     );
@@ -905,4 +1122,10 @@ class _ControlPageState extends State<ControlPage> {
         ServiceState.stopped => 'Stopped',
         null => 'Status unavailable',
       };
+}
+
+class _LogEntry {
+  const _LogEntry(this.time, this.text);
+  final DateTime time;
+  final String text;
 }

@@ -1,7 +1,7 @@
 use localscale_agent::tor_runtime::{resolve_bundled_tor, TorMode, TorProcess, TorRuntime};
 use localscale_agent::{
-    serve_with_auth_and_peer_transport, AuthHandler, PeerStore, PeerTransportStatus, RoleStore,
-    TransportState,
+    log_event, serve_with_auth_and_peer_transport, AuthHandler, PeerStore, PeerTransportStatus,
+    RoleStore, TransportState,
 };
 use localscale_agent_protocol::{ClientConfig, HostInvitation};
 use localscale_agent_transport::{
@@ -84,6 +84,7 @@ impl RuntimeConfig {
             Ok(store) => store,
             Err(error) => {
                 eprintln!("LocalScale peer bootstrap disabled: invalid peer store ({error})");
+                log_event(&format!("peer bootstrap disabled: invalid peer store ({error})"));
                 return Ok(None);
             }
         };
@@ -119,6 +120,7 @@ impl RuntimeConfig {
             Ok(config) => Ok(Some(config)),
             Err(error) => {
                 eprintln!("LocalScale peer bootstrap disabled: invalid approved peer configuration ({error})");
+                log_event(&format!("peer bootstrap disabled: invalid approved peer configuration ({error})"));
                 Ok(None)
             }
         }
@@ -278,6 +280,7 @@ fn start_tor(bundle_root: &std::path::Path, config: &RuntimeConfig) -> Result<Ru
         let _ = process.terminate();
         return Err(error.to_string());
     }
+    process.drain_log_into(|line| log_event(&format!("tor: {line}")));
     Ok(RunningTor { process })
 }
 
@@ -338,14 +341,25 @@ fn start_peer_transport(
             host.set_acceptance_gate(gate.clone());
             let host_status = status.clone();
             let local_node_id = record.node_id.clone();
+            host_status.set_local_virtual_ip(record.virtual_ip.clone().unwrap_or_default());
             std::thread::spawn(move || loop {
                 host_status.set(TransportState::Connecting);
                 match host.accept() {
                     Ok(mut stream) => {
+                        // The handshake authenticates the connecting Cliente's real
+                        // node id (see `AuthenticatedStream::peer_node_id`); record it
+                        // so `devices_status()` can show it instead of a generic
+                        // "remote-client" placeholder that never changed.
+                        host_status.set_remote_node_id(stream.peer_node_id().to_string());
                         while gate.load(Ordering::Acquire) {
                             match stream.receive_ping() {
-                                Ok(sequence) => {
-                                    if stream.send_pong(&local_node_id, sequence).is_err() {
+                                Ok((sequence, peer_virtual_ip)) => {
+                                    host_status.set_remote_virtual_ip(peer_virtual_ip);
+                                    let local_virtual_ip = host_status.local_virtual_ip();
+                                    if stream
+                                        .send_pong(&local_node_id, sequence, &local_virtual_ip)
+                                        .is_err()
+                                    {
                                         break;
                                     }
                                     // One authenticated ping received and one matching pong sent.
@@ -353,6 +367,7 @@ fn start_peer_transport(
                                 }
                                 Err(error) => {
                                     eprintln!("LocalScale peer heartbeat failed: {error}");
+                                    log_event(&format!("host: peer heartbeat failed: {error}"));
                                     break;
                                 }
                             }
@@ -360,6 +375,7 @@ fn start_peer_transport(
                     }
                     Err(error) => {
                         eprintln!("LocalScale peer handshake failed: {error}");
+                        log_event(&format!("host: peer handshake failed: {error}"));
                         thread::sleep(Duration::from_secs(1));
                     }
                 }
@@ -384,6 +400,7 @@ fn start_peer_transport(
             wait_for_socks(tor.process.socks_endpoint(), TOR_READY_TIMEOUT)?;
             let socks = tor.process.socks_endpoint();
             let node_id = record.node_id.clone();
+            status.set_local_virtual_ip(record.virtual_ip.clone().unwrap_or_default());
             let hostname = hostname.clone();
             std::thread::spawn(move || {
                 let mut client = ClienteTransport::new(
@@ -411,21 +428,30 @@ fn start_peer_transport(
                             let mut sequence = 0u64;
                             while gate.load(Ordering::Acquire) {
                                 sequence = sequence.wrapping_add(1);
-                                if stream.send_ping(&node_id, sequence).is_err()
-                                    || stream.receive_pong(sequence).is_err()
+                                let local_virtual_ip = status.local_virtual_ip();
+                                if stream
+                                    .send_ping(&node_id, sequence, &local_virtual_ip)
+                                    .is_err()
                                 {
                                     break;
                                 }
+                                let peer_virtual_ip = match stream.receive_pong(sequence) {
+                                    Ok(peer_virtual_ip) => peer_virtual_ip,
+                                    Err(_) => break,
+                                };
+                                status.set_remote_virtual_ip(peer_virtual_ip);
                                 // One ping sent and its authenticated-session pong received.
                                 status.record_peer_activity(2);
                                 if sequence == 1 {
                                     println!("LocalScale peer: connected through bundled Tor");
+                                    log_event("cliente: connected through bundled Tor");
                                 }
                                 thread::sleep(localscale_agent_transport::HEARTBEAT_INTERVAL);
                             }
                         }
                         Err(error) => {
-                            eprintln!("LocalScale cliente connection attempt failed: {error}")
+                            eprintln!("LocalScale cliente connection attempt failed: {error}");
+                            log_event(&format!("cliente: connection attempt failed: {error}"))
                         }
                     }
                     failures = failures.saturating_add(1);
@@ -619,9 +645,11 @@ fn main() -> std::io::Result<()> {
                         peer_transport_enabled.store(false, Ordering::Release);
                         peer_transport_status.set(TransportState::WaitingForInvitation);
                         eprintln!("LocalScale Host Onion is ready and waiting for an invitation");
+                        log_event("host: Onion ready, waiting for an invitation");
                         Some(running)
                     } else {
                         eprintln!("LocalScale peer transport disabled: {error}");
+                        log_event(&format!("peer transport disabled: {error}"));
                         stop_tor(running);
                         None
                     }

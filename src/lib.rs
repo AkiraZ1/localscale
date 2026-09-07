@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
@@ -32,7 +33,11 @@ const MAX_REQUEST_BYTES: usize = 16 * 1024;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 16;
 const INVITATION_PREFIX: &str = "lsinv1.";
-const DEFAULT_INVITATION_TTL_SECS: u64 = 600;
+// 10 minutes was tight for a manually-copied invite (walking between two
+// physical machines, reading/typing a long string, or just being slower on
+// one side) — long enough to feel "fresh" but easy to blow through in
+// practice, producing a confusing 410 on a convite the user just generated.
+const DEFAULT_INVITATION_TTL_SECS: u64 = 1800;
 const MIN_INVITATION_TTL_SECS: u64 = 60;
 const MAX_INVITATION_TTL_SECS: u64 = 86_400;
 const MAX_INVITATION_CLOCK_SKEW_SECS: u64 = 60;
@@ -671,6 +676,30 @@ pub struct PeerTransportStatus {
     state: Arc<std::sync::atomic::AtomicU8>,
     last_peer_activity_unix: Arc<AtomicU64>,
     messages_exchanged: Arc<AtomicU64>,
+    // The peer node id actually learned from a completed, authenticated
+    // handshake (see `AuthenticatedStream::peer_node_id`). This is distinct
+    // from `PeerState::host_node_id`, which is only ever populated for the
+    // Cliente role (the Host's approved-peer record intentionally omits it,
+    // see `validate_approved_peer_record`). Without this, `devices_status()`
+    // had no way to learn the real identity of a connected client and fell
+    // back to a generic "remote-client" label forever.
+    remote_node_id: Arc<Mutex<Option<String>>>,
+    // The peer's own configured virtual/overlay IP, learned the same way as
+    // `remote_node_id` — piggybacked on the ping/pong heartbeat (see
+    // `heartbeat_frame` in the transport crate) — since nothing else ever
+    // told either side what address the other actually chose. Without this,
+    // `devices_status()` either fabricated a guess (swapping the last IP
+    // octet between .1/.2) or, once that was removed, showed nothing at all.
+    remote_virtual_ip: Arc<Mutex<Option<String>>>,
+    // This device's own configured virtual IP, mirrored here so the running
+    // transport thread (host accept-loop or client dial-loop) can read the
+    // *current* value on every heartbeat instead of the value it captured
+    // once at thread-spawn time. Without this, changing the virtual IP while
+    // already connected silently did nothing until the next restart, even
+    // though nothing about applying it actually requires tearing down the
+    // Tor/peer connection — see `set_virtual_ip_handler`, which updates this
+    // alongside the persisted record.
+    local_virtual_ip: Arc<Mutex<String>>,
 }
 
 impl Default for PeerTransportStatus {
@@ -681,6 +710,9 @@ impl Default for PeerTransportStatus {
             )),
             last_peer_activity_unix: Arc::new(AtomicU64::new(0)),
             messages_exchanged: Arc::new(AtomicU64::new(0)),
+            remote_node_id: Arc::new(Mutex::new(None)),
+            remote_virtual_ip: Arc::new(Mutex::new(None)),
+            local_virtual_ip: Arc::new(Mutex::new(String::new())),
         }
     }
 }
@@ -737,6 +769,52 @@ impl PeerTransportStatus {
             TransportState::RestartRequired => "restart_required",
             TransportState::WaitingForInvitation => "waiting_for_invitation",
         }
+    }
+
+    /// Records the peer node id authenticated during the most recent
+    /// handshake (Host side: the connecting Cliente's real node id).
+    pub fn set_remote_node_id(&self, node_id: impl Into<String>) {
+        *lock_recover(&self.remote_node_id) = Some(node_id.into());
+    }
+
+    /// Clears any handshake-learned remote node id, e.g. on peer reset.
+    pub fn clear_remote_node_id(&self) {
+        *lock_recover(&self.remote_node_id) = None;
+    }
+
+    pub fn remote_node_id(&self) -> Option<String> {
+        lock_recover(&self.remote_node_id).clone()
+    }
+
+    /// Records the peer's own advertised virtual IP from the most recent
+    /// heartbeat. An empty string means the peer authenticated but has no
+    /// virtual IP configured, which is treated the same as unknown.
+    pub fn set_remote_virtual_ip(&self, virtual_ip: impl Into<String>) {
+        let virtual_ip = virtual_ip.into();
+        *lock_recover(&self.remote_virtual_ip) = if virtual_ip.is_empty() {
+            None
+        } else {
+            Some(virtual_ip)
+        };
+    }
+
+    /// Clears any handshake-learned remote virtual IP, e.g. on peer reset.
+    pub fn clear_remote_virtual_ip(&self) {
+        *lock_recover(&self.remote_virtual_ip) = None;
+    }
+
+    pub fn remote_virtual_ip(&self) -> Option<String> {
+        lock_recover(&self.remote_virtual_ip).clone()
+    }
+
+    /// Updates this device's own virtual IP for any already-running
+    /// transport thread to pick up on its next heartbeat — no restart.
+    pub fn set_local_virtual_ip(&self, virtual_ip: impl Into<String>) {
+        *lock_recover(&self.local_virtual_ip) = virtual_ip.into();
+    }
+
+    pub fn local_virtual_ip(&self) -> String {
+        lock_recover(&self.local_virtual_ip).clone()
     }
 }
 
@@ -1100,7 +1178,18 @@ impl Default for AgentState {
     fn default() -> Self {
         Self {
             mode: Arc::new(Mutex::new("cliente".to_string())),
-            service_state: Arc::new(Mutex::new("stopped".to_string())),
+            // The agent has no real "stopped" mode of its own: it always
+            // starts and starts serving immediately, and whether a peer
+            // connection is actually up is governed entirely by
+            // `peer_transport_enabled`/approval, not by this cosmetic label.
+            // Defaulting it to "stopped" meant that every process restart
+            // (which happens routinely — approving a peer, importing an
+            // invitation, or just reloading config) made the UI flash
+            // "Stopped" even though the daemon and any approved peer
+            // connection kept working exactly as before, which reads as a
+            // spurious outage to anyone actually depending on the agent
+            // staying reachable.
+            service_state: Arc::new(Mutex::new("running".to_string())),
             peer: Arc::new(Mutex::new(PeerState {
                 transport: "unavailable",
                 ..PeerState::default()
@@ -1532,6 +1621,7 @@ fn response_for_request_with_state(request: &str, state: &AgentState) -> String 
         ("POST", "/api/v1/peer/virtual-ip") => set_virtual_ip_handler(body, state),
         ("POST", "/api/v1/runtime/restart") => request_runtime_restart(state),
         ("GET", "/api/v1/devices") => devices_status(state),
+        ("GET", "/api/v1/logs") => agent_logs(state),
         ("POST", "/api/v1/mode") => set_mode(body, state, true),
         ("POST", "/api/v1/service/start") => set_service_state("running", state),
         ("POST", "/api/v1/service/stop") => set_service_state("stopped", state),
@@ -1622,6 +1712,139 @@ fn auth_http_response(response: AuthResponse) -> String {
     output
 }
 
+/// Stable, persisted identity for *this* machine, independent of the
+/// current Host/Cliente mode. Previously `devices_status()` fell back to a
+/// hardcoded, mode-dependent name ("host-mac" / "cliente-linux") whenever no
+/// peer record had a `node_id` set yet, which made the local device appear to
+/// rename itself every time the user switched mode. This generates a name
+/// once (hostname + short random suffix), persists it to disk, and reuses it
+/// forever after, regardless of mode.
+static LOCAL_DEVICE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Backend event log, persisted to a plain file so real dial/handshake/Tor
+/// errors survive regardless of how `localscaled` was launched (systemd
+/// captures stdout/stderr via journald, but the desktop app spawns it
+/// detached, which discards them entirely — this file is the one place
+/// those errors are guaranteed to land). Read back by `GET /api/v1/logs` so
+/// the desktop UI's event log panel can show them, not just local UI-side
+/// state changes.
+static AGENT_LOG_LOCK: Mutex<()> = Mutex::new(());
+
+fn agent_log_path() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("LOCALSCALE_LOG_FILE") {
+        return std::path::PathBuf::from(path);
+    }
+    local_identity_path()
+        .parent()
+        .map(|dir| dir.join("agent.log"))
+        .unwrap_or_else(|| std::env::temp_dir().join("localscale-agent.log"))
+}
+
+/// Appends one timestamped line to the backend log file. Best-effort: a
+/// logging failure must never take down the agent, so errors are swallowed.
+pub fn log_event(message: &str) {
+    let path = agent_log_path();
+    let _guard = lock_recover(&AGENT_LOG_LOCK);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let now = unix_time_secs().unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{now} {message}");
+    }
+}
+
+const MAX_LOG_RESPONSE_BYTES: usize = 64 * 1024;
+
+fn agent_logs(_state: &AgentState) -> String {
+    let path = agent_log_path();
+    let contents = std::fs::read_to_string(&path).unwrap_or_default();
+    let tail = if contents.len() > MAX_LOG_RESPONSE_BYTES {
+        let start = contents.len() - MAX_LOG_RESPONSE_BYTES;
+        contents[start..].splitn(2, '\n').nth(1).unwrap_or("")
+    } else {
+        contents.as_str()
+    };
+    http_response(
+        "200 OK",
+        "application/json",
+        &format!("{{\"lines\":{}}}", json_string(tail)),
+    )
+}
+
+fn local_identity_path() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("LOCALSCALE_DEVICE_IDENTITY_FILE") {
+        return std::path::PathBuf::from(path);
+    }
+    let base = std::env::var_os("LOCALSCALE_TOR_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_STATE_HOME")
+                .map(std::path::PathBuf::from)
+                .map(|p| p.join("localscale"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".local/state/localscale"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("localscale"));
+    base.join("device-identity.json")
+}
+
+fn generate_local_device_name() -> String {
+    let hostname = std::env::var("LOCALSCALE_DEVICE_HOSTNAME")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| {
+            Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "localscale-device".to_string());
+    let suffix = unix_time_secs().unwrap_or(0) % 100_000;
+    format!("{hostname}-{suffix:05}")
+}
+
+fn load_or_create_local_device_id() -> String {
+    let path = local_identity_path();
+    if let Ok(contents) = std::fs::read_to_string(&path) {
+        if let Some(fields) = parse_json_fields(&contents) {
+            if let Some(id) = fields.get("node_id") {
+                if !id.is_empty() {
+                    return id.clone();
+                }
+            }
+        }
+    }
+    let node_id = generate_local_device_name();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let payload = format!(r#"{{"node_id":{}}}"#, json_string(&node_id));
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, payload).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        let _ = std::fs::rename(&tmp, &path);
+    }
+    node_id
+}
+
+fn local_device_id() -> &'static str {
+    LOCAL_DEVICE_ID.get_or_init(load_or_create_local_device_id)
+}
+
 fn detect_local_onion_endpoint() -> Option<String> {
     if let Ok(endpoint) = std::env::var("LOCALSCALE_ONION_ENDPOINT") {
         let ep = endpoint.trim();
@@ -1638,8 +1861,16 @@ fn detect_local_onion_endpoint() -> Option<String> {
         candidates.push(data_dir.join("onion").join("hostname"));
     }
     if let Some(ref h) = home {
-        candidates.push(h.join(".local/state/hermes-bridge-test/macos/tor/onion/hostname"));
-        candidates.push(h.join(".local/state/hermes-bridge-test/linux/tor/onion/hostname"));
+        // NOTE: this used to also probe `~/.local/state/hermes-bridge-test/*`
+        // paths — leftover from early bootstrapping against an unrelated Tor
+        // project on the same dev machine. Since those candidates were
+        // checked *before* LocalScale's own state path, whenever both
+        // happened to exist (e.g. the Linux dev box), this function silently
+        // advertised hermes-bridge's onion address as LocalScale's own. Every
+        // invitation generated from that host then pointed at a hidden
+        // service LocalScale never controlled, which explains descriptor
+        // lookups failing forever ("No more HSDir available to query") no
+        // matter how long the real peer connection was left running.
         candidates.push(h.join(".local/state/localscale/tor/hidden_service/hostname"));
         candidates.push(h.join(".local/state/localscale/tor/onion/hostname"));
         candidates.push(h.join(".local/share/localscale/tor/hidden_service/hostname"));
@@ -1663,13 +1894,25 @@ fn service_status(state: &AgentState) -> String {
     let mode = lock_recover(&state.mode).clone();
     let service_state = lock_recover(&state.service_state).clone();
     let peer = lock_recover(&state.peer);
-    let detected = detect_local_onion_endpoint();
+    // A Cliente never runs a hidden service — `render_torrc` only ever
+    // writes a `HiddenServiceDir` section for the Host role — so it has no
+    // onion of its own, full stop. This used to fall back to `peer.endpoint`
+    // (actually the *Host's* onion — see `ImportInvitationRequest`), and
+    // even after fixing that to call `detect_local_onion_endpoint()` in both
+    // modes, a Cliente machine that had *previously* run as Host still had a
+    // stale `hidden_service/hostname` file on disk from that (Tor no longer
+    // publishes it without a `HiddenServiceDir` line, but the file survives),
+    // so the scan kept finding and reporting a dead address. Only look at
+    // all in Host mode, where an onion is actually possible.
     let endpoint = if mode == "host" {
-        detected.as_deref().or(peer.endpoint.as_deref())
+        detect_local_onion_endpoint()
+            .as_deref()
+            .or(peer.endpoint.as_deref())
+            .map(String::from)
     } else {
-        peer.endpoint.as_deref()
+        None
     };
-    let onion_endpoint = optional_json(&endpoint.map(String::from));
+    let onion_endpoint = optional_json(&endpoint);
     http_response(
         "200 OK",
         "application/json",
@@ -1720,6 +1963,19 @@ fn set_virtual_ip_handler(body: &str, state: &AgentState) -> String {
         .get("virtual_ip")
         .cloned()
         .filter(|v| !v.trim().is_empty());
+    // The heartbeat now piggybacks this value to the peer as a
+    // pipe-delimited field (see `heartbeat_frame` in the transport crate);
+    // a '|' or line break here would corrupt that frame and break the
+    // peer's own liveness parsing, not just this side's.
+    if let Some(value) = &virtual_ip {
+        if value.bytes().any(|b| b == b'|' || b == b'\n' || b == b'\r') {
+            return http_response(
+                "400 Bad Request",
+                "application/json",
+                r#"{"error":"invalid_virtual_ip"}"#,
+            );
+        }
+    }
     let Some(store) = &state.peer_store else {
         return http_response(
             "503 Service Unavailable",
@@ -1738,21 +1994,27 @@ fn set_virtual_ip_handler(body: &str, state: &AgentState) -> String {
         );
     }
     let mut peer = lock_recover(&state.peer);
-    peer.virtual_ip = virtual_ip;
+    peer.virtual_ip = virtual_ip.clone();
     drop(peer);
+    // Applying a new virtual IP is deliberately NOT restart-required: unlike
+    // approval/invitation changes, it doesn't change who we're talking to or
+    // invalidate any key, so there is no reason to tear down a live Tor
+    // connection just to pick it up. The running transport thread reads this
+    // fresh on its next heartbeat (see `PeerTransportStatus::local_virtual_ip`).
+    state
+        .peer_transport_status
+        .set_local_virtual_ip(virtual_ip.unwrap_or_default());
     peer_status(state)
 }
 
 fn devices_status(state: &AgentState) -> String {
     let mode = lock_recover(&state.mode).clone();
     let peer = lock_recover(&state.peer);
-    let local_node_id = peer.node_id.as_deref().unwrap_or_else(|| {
-        if mode == "host" {
-            "host-mac"
-        } else {
-            "cliente-linux"
-        }
-    });
+    // Use the stable, persisted local device identity rather than a
+    // mode-dependent hardcoded fallback ("host-mac"/"cliente-linux"), which
+    // used to make the local device appear to rename itself on every
+    // Host/Cliente mode switch (see `local_device_id`).
+    let local_node_id = peer.node_id.as_deref().unwrap_or_else(|| local_device_id());
     let local_ip = peer.virtual_ip.as_deref().unwrap_or("");
     let detected_endpoint = detect_local_onion_endpoint();
 
@@ -1776,30 +2038,45 @@ fn devices_status(state: &AgentState) -> String {
     let mut peers_json = String::new();
     if peer.configured {
         let peer_role = if mode == "host" { "cliente" } else { "host" };
-        let remote_id = peer.host_node_id.as_deref().unwrap_or_else(|| {
-            if mode == "host" {
-                "remote-client"
-            } else {
-                "remote-host"
-            }
-        });
-        let remote_ip = if let Some(prefix) = local_ip.strip_suffix(".1") {
-            format!("{prefix}.2")
-        } else if let Some(prefix) = local_ip.strip_suffix(".2") {
-            format!("{prefix}.1")
-        } else {
-            if mode == "host" {
-                "10.42.0.2".into()
-            } else {
-                "10.42.0.1".into()
-            }
-        };
-        let status = if peer.approved {
-            "approved"
-        } else if peer.revoked {
+        // Prefer the node id actually learned from a completed, authenticated
+        // handshake (Host side only: `peer.host_node_id` is never populated
+        // for the Host role, see `validate_approved_peer_record`). Falling
+        // back to `peer.host_node_id` keeps Cliente-side behavior unchanged.
+        let handshake_remote_id = state.peer_transport_status.remote_node_id();
+        let remote_id = handshake_remote_id
+            .as_deref()
+            .or(peer.host_node_id.as_deref())
+            .unwrap_or_else(|| {
+                if mode == "host" {
+                    "remote-client"
+                } else {
+                    "remote-host"
+                }
+            });
+        // The peer's real virtual IP, learned from its own heartbeat (see
+        // `PeerTransportStatus::remote_virtual_ip`) — this used to guess by
+        // swapping the last octet between .1 and .2 (or hardcoding
+        // 10.42.0.1/.2), which silently fabricated an address that had
+        // nothing to do with whatever the user actually typed on the other
+        // machine. Empty until the peer has sent at least one heartbeat
+        // carrying a configured address.
+        let remote_ip = state.peer_transport_status.remote_virtual_ip().unwrap_or_default();
+        // Report the actual transport state rather than the local approval
+        // flag alone. Previously this showed "approved" forever once a peer
+        // was approved, even when the two agents never actually established
+        // real communication (no transport handshake, dead onion service,
+        // wrong node id, etc). That made "approved" look like "connected" to
+        // the user when it was not, and gave no visibility into what stage
+        // the transport was actually stuck in (connecting/retrying/needs a
+        // restart/etc).
+        let status = if peer.revoked {
             "revoked"
-        } else {
+        } else if !peer.approved {
             "pending"
+        } else if state.peer_transport_status.is_connected() {
+            "connected"
+        } else {
+            state.peer_transport_status.label()
         };
         peers_json = format!(
             r#"{{"node_id":{},"role":{},"onion_endpoint":{},"virtual_ip":{},"status":{},"approved":{},"revoked":{}}}"#,
@@ -1953,6 +2230,11 @@ fn mark_peer_changed(record: PeerRecord, state: &AgentState) -> Result<(), ()> {
     state
         .peer_transport_status
         .set(TransportState::RestartRequired);
+    // A reconfigured peer (new invitation/approval) invalidates any node id
+    // learned from a previous handshake; otherwise a stale remote name could
+    // survive across a device swap until the next successful handshake.
+    state.peer_transport_status.clear_remote_node_id();
+    state.peer_transport_status.clear_remote_virtual_ip();
     Ok(())
 }
 
@@ -1982,6 +2264,11 @@ fn reset_peer(state: &AgentState) -> String {
     drop(peer);
     state.peer_transport_enabled.store(false, Ordering::Release);
     state.peer_transport_status.set(TransportState::Disabled);
+    // Fixes the "removed device still shows in the list" bug: without this,
+    // the handshake-learned remote node id (see `PeerTransportStatus`)
+    // survived a reset and `devices_status()` kept reporting the old device.
+    state.peer_transport_status.clear_remote_node_id();
+    state.peer_transport_status.clear_remote_virtual_ip();
     peer_status(state)
 }
 
@@ -2134,6 +2421,13 @@ fn import_invitation(body: &str, state: &AgentState) -> String {
 }
 
 fn invitation_error(status: &str, error: &str) -> String {
+    // Unlike the transport thread's errors (dial/handshake failures, wired
+    // to the same log via `log_event` in main.rs), invitation generate/
+    // import failures happen entirely inside this HTTP handler and never
+    // reached the backend log — so a 410/409/400 the user hit while pairing
+    // left no trace anywhere but a snackbar that had already disappeared by
+    // the time anyone asked what went wrong.
+    log_event(&format!("invitation {status}: {error}"));
     http_response(
         status,
         "application/json",
@@ -2760,13 +3054,23 @@ mod tests {
     }
 
     #[test]
-    fn control_page_status_contract_defaults_to_cliente_stopped() {
+    fn control_page_status_contract_defaults_to_cliente_running() {
+        // The agent has no meaningful "stopped" mode of its own — it always
+        // starts serving immediately, and every internal restart (approving
+        // a peer, importing an invitation) must not read back as an outage.
         let response =
             super::response_for_request("GET /api/v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
         assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.contains(r#""mode":"cliente""#));
-        assert!(response.contains(r#""state":"stopped""#));
-        assert!(response.contains(r#""onion_endpoint":null"#));
+        assert!(response.contains(r#""state":"running""#));
+        // `onion_endpoint` for an unconfigured Cliente now depends only on
+        // `detect_local_onion_endpoint()` (real local Tor state), not on
+        // `AgentState::default()` — deliberately, since it used to fall back
+        // to the peer record's `endpoint` field, which for a Cliente is the
+        // *Host's* onion, not this device's own (see `service_status`). That
+        // makes it environment-dependent rather than a fixed default, so
+        // this test only pins the two properties above that must always
+        // hold on any machine.
     }
 
     #[test]
@@ -2776,7 +3080,7 @@ mod tests {
             "POST /api/v1/mode HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n{\"mode\":\"host\"}", &state);
         assert!(mode.starts_with("HTTP/1.1 200 OK"), "{mode}");
         assert!(mode.contains(r#""mode":"host""#));
-        assert!(mode.contains(r#""state":"stopped""#));
+        assert!(mode.contains(r#""state":"running""#));
 
         let start = super::response_for_request_with_state(
             "POST /api/v1/service/start HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n", &state);

@@ -197,6 +197,11 @@ abstract interface class LocalAgentApi {
     required String invitationSecret,
     String? virtualIp,
   });
+
+  /// Tail of the backend's own event log (Tor/dial/handshake errors that
+  /// never surface anywhere else when the agent is spawned detached by the
+  /// desktop app instead of run under a supervisor like systemd).
+  Future<String> backendLogTail();
 }
 
 class LocalAgentApiClient implements LocalAgentApi {
@@ -251,6 +256,16 @@ class LocalAgentApiClient implements LocalAgentApi {
   @override
   Future<PeerStatus> peerStatus() =>
       _parsePeer(transport.get('/api/v1/peer/status'));
+
+  @override
+  Future<String> backendLogTail() async {
+    final raw = await transport.get('/api/v1/logs');
+    final json = jsonDecode(raw);
+    if (json is! Map<String, dynamic>) {
+      throw const FormatException('logs response must be an object');
+    }
+    return (json['lines'] as String?) ?? '';
+  }
 
   @override
   Future<PeerStatus> approvePeer() =>

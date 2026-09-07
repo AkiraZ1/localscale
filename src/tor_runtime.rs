@@ -398,6 +398,25 @@ impl TorProcess {
         }
         Err(TorRuntimeError::ReadinessTimeout)
     }
+
+    /// After readiness, `wait_for_readiness` stops draining Tor's own stderr
+    /// (notice/warning lines): the background reader thread keeps calling
+    /// `sender.send(line)` on a channel nobody reads anymore, so every line
+    /// Tor logs afterwards — circuit failures, "unable to fetch descriptor
+    /// for ... onion", SOCKS rejections and why — was silently discarded.
+    /// That was the single biggest hole in diagnosing why a peer connection
+    /// never completed: the Rust-side error was a generic "SOCKS5 connection
+    /// rejected", while Tor's own log carries the actual reason. This hands
+    /// off the (still-live) receiver to a thread that keeps forwarding every
+    /// line to `sink` for the rest of the process's life.
+    pub fn drain_log_into(&mut self, mut sink: impl FnMut(String) + Send + 'static) {
+        let receiver = std::mem::replace(&mut self.readiness, mpsc::channel().1);
+        std::thread::spawn(move || {
+            for line in receiver {
+                sink(line);
+            }
+        });
+    }
 }
 
 #[allow(dead_code)]

@@ -286,6 +286,18 @@ class ControlledApi implements LocalAgentApi {
   @override
   Future<void> setVirtualIp(String virtualIp) async {}
 
+  int resetCalls = 0;
+
+  @override
+  Future<PeerStatus> resetPeer() {
+    resetCalls++;
+    return Future.value(const PeerStatus(
+        configured: false,
+        transport: 'unavailable',
+        connected: false,
+        approved: false));
+  }
+
   @override
   Future<PeerStatus> setPeerConfig({
     required String role,
@@ -300,4 +312,7 @@ class ControlledApi implements LocalAgentApi {
           transport: 'unavailable',
           connected: false,
           approved: false);
+
+  @override
+  Future<String> backendLogTail() async => '';
 }

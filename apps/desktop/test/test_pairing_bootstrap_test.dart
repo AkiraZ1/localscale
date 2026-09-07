@@ -206,4 +206,8 @@ class _RecordingApi implements LocalAgentApi {
   Future<void> setVirtualIp(String virtualIp) => throw UnimplementedError();
   @override
   Future<NetworkDevicesResponse> getDevices() => throw UnimplementedError();
+  @override
+  Future<PeerStatus> resetPeer() => throw UnimplementedError();
+  @override
+  Future<String> backendLogTail() => throw UnimplementedError();
 }
