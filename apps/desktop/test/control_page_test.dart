@@ -71,7 +71,7 @@ void main() {
   testWidgets('displays Onion network card, virtual IP, and devices', (tester) async {
     final api = ControlledApi();
     await tester.pumpWidget(MaterialApp(home: ControlPage(api: api)));
-    await tester.pump();
+    await tester.pumpAndSettle();
     expect(find.text('Rede Onion & Dispositivos'), findsOneWidget);
     expect(find.text('Isolamento LAN Ativo (Tor 100%)'), findsOneWidget);
     expect(find.text('local-test'), findsOneWidget);
