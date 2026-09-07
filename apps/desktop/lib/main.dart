@@ -455,7 +455,7 @@ class _ControlPageState extends State<ControlPage> {
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(0.4),
-        border: Border.padLeft == null ? Border.all(color: Colors.white10) : null,
+        border: Border.all(color: Colors.white10),
         borderRadius: BorderRadius.circular(8),
       ),
       child: Row(
