@@ -128,7 +128,9 @@ Future<void> _startAgentDetached(
 }
 
 Future<bool> _probeAgentHealth(Uri base) async {
-  final client = HttpClient()..connectionTimeout = const Duration(seconds: 1);
+  final client = HttpClient()
+    ..connectionTimeout = const Duration(seconds: 1)
+    ..findProxy = (uri) => 'DIRECT';
   try {
     final request = await client
         .getUrl(base.replace(path: '/health'))
@@ -160,7 +162,7 @@ class HttpLocalAgentTransport implements LocalAgentTransport {
   final Uri base;
   Future<String> _request(String method, String path,
       [Map<String, dynamic>? body]) async {
-    final client = HttpClient();
+    final client = HttpClient()..findProxy = (uri) => 'DIRECT';
     try {
       final request = method == 'GET'
           ? await client.getUrl(base.replace(path: path))
