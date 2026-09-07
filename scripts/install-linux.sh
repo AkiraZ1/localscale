@@ -88,11 +88,26 @@ log "linked $XDG_BIN_HOME/localscaled -> $AGENT_INSTALL_DIR/localscaled"
 # Grant it directly to the installed binary rather than requiring the whole
 # daemon to run as root or under sudo; harmless (and a no-op capability)
 # for everyone who leaves the feature disabled.
-if command -v setcap >/dev/null 2>&1; then
-  if setcap cap_net_admin+ep "$AGENT_INSTALL_DIR/localscaled" 2>/dev/null; then
+# setcap lives in /usr/sbin, which a non-interactive shell (e.g. an SSH
+# command, or this script run from cron) often doesn't have on PATH even
+# though the binary is installed — check the standard sbin locations
+# directly instead of relying on `command -v` alone.
+SETCAP_BIN=$(command -v setcap 2>/dev/null || true)
+for candidate in /usr/sbin/setcap /sbin/setcap; do
+  [ -n "$SETCAP_BIN" ] && break
+  [ -x "$candidate" ] && SETCAP_BIN="$candidate"
+done
+if [ -n "$SETCAP_BIN" ]; then
+  # +eip, not just +ep: the daemon shells out to `ip addr`/`ip route` (see
+  # tun_linux.rs) rather than reimplementing netlink itself, and a plain
+  # exec'd child does not inherit capabilities unless they're both
+  # inheritable on the file (the "i") and raised into this process's
+  # ambient set at runtime (see ensure_net_admin_ambient in tun_linux.rs).
+  if sudo -n "$SETCAP_BIN" cap_net_admin+eip "$AGENT_INSTALL_DIR/localscaled" 2>/dev/null \
+    || "$SETCAP_BIN" cap_net_admin+eip "$AGENT_INSTALL_DIR/localscaled" 2>/dev/null; then
     log "granted cap_net_admin to localscaled (needed only if LOCALSCALE_ENABLE_TUN=1)"
   else
-    log "could not setcap localscaled (not fatal — only needed for the opt-in TUN bridge, run this script as a user with sudo/setcap access to enable it)"
+    log "could not setcap localscaled (not fatal — only needed for the opt-in TUN bridge, run: sudo $SETCAP_BIN cap_net_admin+eip '$AGENT_INSTALL_DIR/localscaled')"
   fi
 else
   log "setcap not found; skipping (only needed for the opt-in TUN bridge)"

@@ -1070,7 +1070,12 @@ impl PeerStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            if metadata.uid() != effective_uid() {
+            // Root already has unrestricted access to every file on the
+            // system regardless of this check, so it protects nothing when
+            // the daemon itself runs as root (e.g. the opt-in TUN bridge on
+            // macOS, which needs root to open a `utun` socket) — only
+            // exempt uid 0 here, every other uid still must own the file.
+            if metadata.uid() != effective_uid() && effective_uid() != 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "peer store has the wrong owner",

@@ -110,12 +110,138 @@ fn interface_name_from(raw: &[libc::c_char; IFNAMSIZ]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// `setcap cap_net_admin+eip` on the installed binary (see
+/// `scripts/install-linux.sh`) gives *this* process `CAP_NET_ADMIN` — but a
+/// plain `Command::new("ip")` execs a fresh binary that does not inherit it
+/// (file capabilities don't propagate to children by default), which is why
+/// the `ip addr`/`ip route` calls below would otherwise fail with
+/// "RTNETLINK answers: Operation not permitted" despite the TUN device
+/// itself opening fine. Raising `CAP_NET_ADMIN` into this process's
+/// *ambient* capability set (once, lazily) makes every child process exec'd
+/// afterward inherit it too, without needing to setcap `ip` itself (a
+/// shared system binary this project has no business modifying).
+/// Mirrors the kernel's `struct __user_cap_header_struct` — see
+/// capabilities(7) / capget(2). Not in the `libc` crate (that's `libcap`
+/// territory, which this project avoids depending on).
+#[repr(C)]
+struct CapUserHeader {
+    version: u32,
+    pid: libc::c_int,
+}
+
+/// Mirrors `struct __user_cap_data_struct`. One entry covers capability
+/// bits 0-31; version 3 always transfers two entries (bits 32-63 in the
+/// second), even though every capability this project touches (CAP_NET_ADMIN
+/// = 12) fits in the first.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapUserData {
+    effective: u32,
+    permitted: u32,
+    inheritable: u32,
+}
+
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+
+fn ensure_net_admin_ambient() {
+    use std::sync::Once;
+    static RAISE_AMBIENT: Once = Once::new();
+    // Linux's <linux/capability.h> CAP_NET_ADMIN, not exposed by the `libc`
+    // crate itself (that header belongs to `libcap`, which this project
+    // intentionally doesn't depend on to stay self-contained) — the value
+    // is a stable kernel ABI constant, unchanged since capabilities were
+    // introduced.
+    const CAP_NET_ADMIN: u32 = 12;
+    RAISE_AMBIENT.call_once(|| {
+        // `setcap cap_net_admin+eip` on this binary (see
+        // scripts/install-linux.sh) grants CAP_NET_ADMIN in this process's
+        // *permitted* set at exec time — but NOT its *inheritable* set:
+        // despite the file's own "i" bit, a file's inheritable bit only
+        // takes effect combined with whatever the *launching* process
+        // already had inheritable (which is nothing, for an ordinary shell
+        // or systemd unit). Ambient-capability raising requires the
+        // capability in both the permitted AND inheritable sets of this
+        // process, so we move it from permitted into inheritable ourselves
+        // via capset(2) before raising it into the ambient set — that's
+        // legal because a process can always add a capability it already
+        // holds in its permitted set to its own inheritable set.
+        let mut header = CapUserHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapUserData::default(); 2];
+        // SAFETY: `header`/`data` are correctly-sized, in-scope buffers
+        // matching what capget(2) expects for version 3.
+        let get_result = unsafe {
+            libc::syscall(
+                libc::SYS_capget,
+                &mut header as *mut CapUserHeader,
+                data.as_mut_ptr(),
+            )
+        };
+        if get_result != 0 {
+            crate::log_event(&format!(
+                "tun: capget failed: {}",
+                io::Error::last_os_error()
+            ));
+            return;
+        }
+        data[0].inheritable |= 1 << CAP_NET_ADMIN;
+        // capset(2) re-reads `header.pid`/`version` from what we pass, same
+        // as the capget call above.
+        let mut set_header = CapUserHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        // SAFETY: same layout contract as the capget call above; `data` now
+        // holds the current capability sets with CAP_NET_ADMIN added to
+        // "inheritable" only (effective/permitted are left exactly as the
+        // kernel reported them, so this can't grant anything new).
+        let set_result = unsafe {
+            libc::syscall(
+                libc::SYS_capset,
+                &mut set_header as *mut CapUserHeader,
+                data.as_ptr(),
+            )
+        };
+        if set_result != 0 {
+            crate::log_event(&format!(
+                "tun: capset failed (needs CAP_NET_ADMIN already in the permitted set — see scripts/install-linux.sh): {}",
+                io::Error::last_os_error()
+            ));
+            return;
+        }
+        let raise_result = unsafe {
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_RAISE,
+                CAP_NET_ADMIN as libc::c_ulong,
+                0,
+                0,
+            )
+        };
+        if raise_result != 0 {
+            crate::log_event(&format!(
+                "tun: prctl(PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN) failed: {}",
+                io::Error::last_os_error()
+            ));
+        }
+    });
+}
+
 fn run_ip(args: &[&str]) -> io::Result<()> {
-    let status = Command::new("ip").args(args).status()?;
-    if !status.success() {
+    ensure_net_admin_ambient();
+    let output = Command::new("ip").args(args).output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!("`ip {}` exited with {status}", args.join(" ")),
+            format!(
+                "`ip {}` exited with {}: {}",
+                args.join(" "),
+                output.status,
+                stderr.trim()
+            ),
         ));
     }
     Ok(())

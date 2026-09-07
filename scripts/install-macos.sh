@@ -95,5 +95,14 @@ log "installing to $TARGET"
 rm -rf "$TARGET"
 cp -R "$BUILT_APP" "$TARGET"
 
+# The virtual-network bridge (see spawn_tun_bridge in src/main.rs) opens a
+# `utun` control socket, which macOS only allows root to do — there is no
+# per-binary capability grant like Linux's setcap. Rather than require a
+# privileged step in this script (infeasible for someone who only ever
+# drags the app out of a DMG, and awkward to run non-interactively here),
+# the app itself grants this to its own bundled binary on first launch via
+# a native "app wants to make changes" dialog — see
+# _ensureMacOSTunPrivilege in lib/local_agent_transport_io.dart.
+
 log "done. Launch with: open \"$TARGET\""
 log "re-run any time with: $0"

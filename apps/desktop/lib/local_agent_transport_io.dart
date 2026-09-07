@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'local_agent_api.dart';
@@ -54,6 +55,17 @@ Future<bool> ensureLocalAgentRunning({
   }
 
   if (!await agentExecutable.exists()) return false;
+
+  if (Platform.isMacOS) {
+    // Fire-and-forget: this shows a native admin-password dialog the first
+    // time (or after a binary update), which must never block the app's
+    // own startup or ordinary (non-TUN) pairing — those work with no
+    // privilege at all. If the user approves it, the *next* restart of the
+    // peer transport (which already retries on its own) picks up the
+    // newly-privileged binary and the TUN bridge starts working; if they
+    // dismiss it, everything else keeps working without a virtual network.
+    unawaited(_ensureMacOSTunPrivilege(agentExecutable));
+  }
 
   final start = processStarter ?? _startAgentDetached;
   try {
@@ -120,6 +132,37 @@ Future<bool> ensureLocalAgentRestarted({
     await Future<void>.delayed(retryDelay);
   }
   return false;
+}
+
+/// macOS has no per-binary capability grant like Linux's `setcap` — opening
+/// a `utun` control socket (see `tun_macos.rs`, used by the opt-in virtual
+/// network bridge) requires root. Rather than ask the user to run a
+/// terminal install script — infeasible for someone who just dragged the
+/// app out of a DMG — set the setuid bit on the bundled agent binary once,
+/// via the same native "app wants to make changes" dialog macOS shows for
+/// any admin-privileged action. Every launch after that is a no-op: the
+/// setuid bit is already there, so no further dialog appears.
+Future<void> _ensureMacOSTunPrivilege(File executable) async {
+  try {
+    const setuidBit = 0x800; // POSIX S_ISUID
+    final stat = await executable.stat();
+    if ((stat.mode & setuidBit) != 0) return;
+    final path = executable.path;
+    final shellCommand =
+        "chown root:wheel '${path.replaceAll("'", "'\\''")}' && chmod u+s '${path.replaceAll("'", "'\\''")}'";
+    final appleScriptSafeCommand =
+        shellCommand.replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+    final result = await Process.run('osascript', [
+      '-e',
+      'do shell script "$appleScriptSafeCommand" with administrator privileges '
+          'with prompt "LocalScale precisa de uma permissão única para habilitar a rede virtual entre seus dispositivos."',
+    ]);
+    if (result.exitCode != 0) {
+      print('LocalScale: could not grant TUN privilege: ${result.stderr}');
+    }
+  } catch (error) {
+    print('LocalScale: TUN privilege check failed: $error');
+  }
 }
 
 Future<void> _startAgentDetached(

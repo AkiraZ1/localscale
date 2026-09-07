@@ -329,7 +329,12 @@ fn spawn_tun_bridge(status: &PeerTransportStatus, packets: PacketChannel) {
         log_event("tun: no local virtual IP configured, skipping TUN bridge");
         return;
     }
-    let device = match tun_linux::TunDevice::create("localscale0") {
+    // Overridable only for running two instances side by side on one box
+    // during development (see README test scenario) — every real deployment
+    // has exactly one agent per machine and never needs this set.
+    let requested_name =
+        env::var("LOCALSCALE_TUN_NAME").unwrap_or_else(|_| "localscale0".to_string());
+    let device = match tun_linux::TunDevice::create(&requested_name) {
         Ok(device) => device,
         Err(error) => {
             log_event(&format!(
@@ -347,23 +352,23 @@ fn spawn_tun_bridge(status: &PeerTransportStatus, packets: PacketChannel) {
         device.name()
     ));
     // The peer's virtual IP may not be known yet (learned from its first
-    // heartbeat); poll briefly rather than failing the whole bridge if the
-    // route can't be added the instant the interface comes up.
+    // heartbeat), and the connection can drop and reconnect at any time
+    // during the process's life — so this polls indefinitely rather than
+    // giving up after a fixed window, re-applying the route (`ip route
+    // replace` is idempotent) whenever a peer IP is present. This is a
+    // background thread for the process's whole lifetime, not a one-shot.
     {
         let device_for_route = device.file().try_clone();
         let status = status.clone();
         let name = device.name().to_string();
         if device_for_route.is_ok() {
-            std::thread::spawn(move || {
-                for _ in 0..20 {
-                    if let Some(peer_ip) = status.remote_virtual_ip() {
-                        if !peer_ip.is_empty() {
-                            let _ = tun_linux::TunDevice::route_to_peer(&name, &peer_ip);
-                            return;
-                        }
+            std::thread::spawn(move || loop {
+                if let Some(peer_ip) = status.remote_virtual_ip() {
+                    if !peer_ip.is_empty() {
+                        let _ = tun_linux::TunDevice::route_to_peer(&name, &peer_ip);
                     }
-                    thread::sleep(Duration::from_secs(1));
                 }
+                thread::sleep(Duration::from_secs(2));
             });
         }
     }
@@ -445,7 +450,7 @@ fn spawn_tun_bridge(status: &PeerTransportStatus, packets: PacketChannel) {
     // heartbeat); poll briefly rather than failing the whole bridge.
     let peer_ip = {
         let mut found = None;
-        for _ in 0..20 {
+        for _ in 0..60 {
             if let Some(ip) = status.remote_virtual_ip() {
                 if !ip.is_empty() {
                     found = Some(ip);
@@ -552,12 +557,13 @@ fn start_peer_transport(
     let key = key_from_stored_transport_key(&record.invitation_secret)
         .map_err(|_| "peer record contains an invalid transport key".to_string())?;
     let nonce_path = config.data_dir.join("handshake-nonce");
-    // Off by default: the ping/pong path above this feature flag is the
-    // proven, stable connection users depend on today. The TUN datapath is
-    // new, Linux-only so far (see `tun_linux`), and only ever activates when
-    // explicitly requested, so it can be developed and tested without any
-    // risk of regressing ordinary pairing.
-    let tun_enabled = env::var("LOCALSCALE_ENABLE_TUN").as_deref() == Ok("1");
+    // On by default: this is the actual product (a real virtual network
+    // between paired devices, not just informational virtual IPs), and it
+    // degrades safely on its own — `spawn_tun_bridge` logs and returns
+    // without touching anything else if it lacks the privilege to open a
+    // TUN/utun device (see tun_linux/tun_macos). Set LOCALSCALE_ENABLE_TUN=0
+    // to force it off (e.g. a sandboxed CI environment).
+    let tun_enabled = env::var("LOCALSCALE_ENABLE_TUN").as_deref() != Ok("0");
     match &config.mode {
         TorMode::Host { upstream, .. } => {
             let address: std::net::SocketAddr = upstream
