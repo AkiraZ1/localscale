@@ -31,6 +31,52 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
+/// A raw SIGTERM/SIGINT is the default way `open`/window-close/`pkill`
+/// signal this process to quit, and the kernel honors it by tearing the
+/// process down immediately — it does NOT run Rust destructors (there is no
+/// unwinding), so `TorProcess`'s own `Drop` impl (which kills its child)
+/// never gets a chance to run. Without this, every ordinary app close or
+/// daemon stop orphans the bundled Tor process, which then holds onto the
+/// SOCKS/control ports and blocks the *next* start from ever becoming
+/// ready. Track the live Tor child's pid here so a signal handler — which
+/// must stick to async-signal-safe calls, so no Rust-level cleanup — can
+/// kill it directly before exiting.
+#[cfg(unix)]
+static TOR_CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn handle_shutdown_signal(_signum: libc::c_int) {
+    let pid = TOR_CHILD_PID.load(std::sync::atomic::Ordering::SeqCst);
+    if pid > 0 {
+        // SAFETY: kill(2) is async-signal-safe; `pid` is a plain integer we
+        // stored ourselves after a successful spawn.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+    // SAFETY: _exit(2) is async-signal-safe and is the correct way to end
+    // the process from inside a signal handler (unlike std::process::exit,
+    // which is not signal-safe).
+    unsafe {
+        libc::_exit(0);
+    }
+}
+
+#[cfg(unix)]
+fn install_shutdown_signal_handlers() {
+    // SAFETY: `handle_shutdown_signal` has the exact `extern "C" fn(c_int)`
+    // signature signal(2) expects, and only calls async-signal-safe
+    // functions.
+    unsafe {
+        libc::signal(libc::SIGTERM, handle_shutdown_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handle_shutdown_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, handle_shutdown_signal as *const () as libc::sighandler_t);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_shutdown_signal_handlers() {}
+
 const CURL_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const CURL_TIMEOUT_SECONDS: u64 = 5;
 const TOR_READY_TIMEOUT: Duration = Duration::from_secs(300);
@@ -845,6 +891,7 @@ fn auth_provider(port: u16) -> Option<Box<dyn AuthHandler>> {
 }
 
 fn main() -> std::io::Result<()> {
+    install_shutdown_signal_handlers();
     let args: Vec<String> = env::args().collect();
     let options = parse_args(&args).map_err(std::io::Error::other)?;
     // The control API and the bootstrap path must use the same durable peer
@@ -872,6 +919,11 @@ fn main() -> std::io::Result<()> {
                 });
             let running =
                 start_tor(&bundle_root, &runtime_config).map_err(std::io::Error::other)?;
+            #[cfg(unix)]
+            TOR_CHILD_PID.store(
+                running.process.pid() as i32,
+                std::sync::atomic::Ordering::SeqCst,
+            );
             let fresh_host = matches!(runtime_config.mode, TorMode::Host { .. })
                 && PeerStore::open(
                     env::var_os("LOCALSCALE_PEER_STORE")

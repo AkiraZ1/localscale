@@ -21,7 +21,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+// 10s was tuned against loopback/same-host testing; a real cross-machine Tor
+// circuit can legitimately take longer than that under normal guard
+// rotation or path-restriction churn (observed directly: "All current
+// guards excluded by path restriction type 2" during testing), which was
+// enough on its own to blow through 10s and make the heartbeat loop treat a
+// healthy-but-slow circuit as dead — tearing down and reconnecting
+// indefinitely instead of just waiting a bit longer.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 

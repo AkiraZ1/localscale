@@ -366,6 +366,12 @@ impl TorProcess {
     pub fn socks_endpoint(&self) -> std::net::SocketAddr {
         (std::net::Ipv4Addr::LOCALHOST, self.socks_port).into()
     }
+    /// The OS pid of the running Tor child — for a signal handler to kill
+    /// directly on shutdown, since a raw SIGTERM/SIGINT skips Rust's normal
+    /// unwinding (and therefore this struct's own `Drop` impl) entirely.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
     pub fn try_exit(&mut self) -> Result<Option<ExitStatus>, TorRuntimeError> {
         Ok(self.child.try_wait()?)
     }
