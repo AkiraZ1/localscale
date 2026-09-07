@@ -82,6 +82,22 @@ mkdir -p "$XDG_BIN_HOME"
 ln -sf "$AGENT_INSTALL_DIR/localscaled" "$XDG_BIN_HOME/localscaled"
 log "linked $XDG_BIN_HOME/localscaled -> $AGENT_INSTALL_DIR/localscaled"
 
+# Opt-in virtual-network bridge (LOCALSCALE_ENABLE_TUN=1, off by default —
+# see spawn_tun_bridge in src/main.rs) opens /dev/net/tun via TUNSETIFF and
+# runs `ip addr`/`ip link`/`ip route`, both of which need CAP_NET_ADMIN.
+# Grant it directly to the installed binary rather than requiring the whole
+# daemon to run as root or under sudo; harmless (and a no-op capability)
+# for everyone who leaves the feature disabled.
+if command -v setcap >/dev/null 2>&1; then
+  if setcap cap_net_admin+ep "$AGENT_INSTALL_DIR/localscaled" 2>/dev/null; then
+    log "granted cap_net_admin to localscaled (needed only if LOCALSCALE_ENABLE_TUN=1)"
+  else
+    log "could not setcap localscaled (not fatal — only needed for the opt-in TUN bridge, run this script as a user with sudo/setcap access to enable it)"
+  fi
+else
+  log "setcap not found; skipping (only needed for the opt-in TUN bridge)"
+fi
+
 if [ "$SKIP_DESKTOP" -eq 0 ]; then
   if ! command -v "$FLUTTER_BIN" >/dev/null 2>&1 && [ ! -x "$FLUTTER_BIN" ]; then
     echo "flutter executable not found: $FLUTTER_BIN (pass --flutter or set FLUTTER_BIN)" >&2

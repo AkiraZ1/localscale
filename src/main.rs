@@ -1,3 +1,6 @@
+#[cfg(target_os = "linux")]
+mod tun_linux;
+
 use localscale_agent::tor_runtime::{resolve_bundled_tor, TorMode, TorProcess, TorRuntime};
 use localscale_agent::{
     log_event, serve_with_auth_and_peer_transport, AuthHandler, PeerStore, PeerTransportStatus,
@@ -6,7 +9,7 @@ use localscale_agent::{
 use localscale_agent_protocol::{ClientConfig, HostInvitation};
 use localscale_agent_transport::{
     key_from_stored_transport_key, ClienteTransport, FileNonceAllocator, HostTransport,
-    TorRuntime as PeerTorRuntime,
+    PacketChannel, TorRuntime as PeerTorRuntime,
 };
 use localscale_control_plane::{
     google_oidc::{
@@ -305,6 +308,129 @@ fn retry_delay(failures: u32) -> Duration {
     Duration::from_secs(1u64 << failures.saturating_sub(1).min(5))
 }
 
+/// Bridges a live `PacketChannel` to a real TUN network interface: one
+/// thread copies packets read off the interface onto the peer connection,
+/// another writes whatever the peer sends back onto the interface. This is
+/// what turns the virtual IPs the two sides already exchange (see
+/// `PeerTransportStatus`) into an actual routable link between them, instead
+/// of being informational only.
+///
+/// Gated behind `LOCALSCALE_ENABLE_TUN=1` (see `start_peer_transport`) and,
+/// for now, only implemented for Linux — macOS (`utun`) and Windows
+/// (Wintun) are follow-up work using the same `PacketChannel` this already
+/// plugs into; on any other platform this logs once and does nothing, so
+/// enabling the flag elsewhere is a safe no-op rather than a build error.
+#[cfg(target_os = "linux")]
+fn spawn_tun_bridge(status: &PeerTransportStatus, packets: PacketChannel) {
+    let local_ip = status.local_virtual_ip();
+    if local_ip.is_empty() {
+        log_event("tun: no local virtual IP configured, skipping TUN bridge");
+        return;
+    }
+    let device = match tun_linux::TunDevice::create("localscale0") {
+        Ok(device) => device,
+        Err(error) => {
+            log_event(&format!(
+                "tun: failed to create TUN device (needs CAP_NET_ADMIN — see scripts/install-linux.sh): {error}"
+            ));
+            return;
+        }
+    };
+    if let Err(error) = device.configure_address(&format!("{local_ip}/24")) {
+        log_event(&format!("tun: failed to configure {}: {error}", device.name()));
+        return;
+    }
+    log_event(&format!(
+        "tun: {} up with {local_ip}/24 — bridging to peer",
+        device.name()
+    ));
+    // The peer's virtual IP may not be known yet (learned from its first
+    // heartbeat); poll briefly rather than failing the whole bridge if the
+    // route can't be added the instant the interface comes up.
+    {
+        let device_for_route = device.file().try_clone();
+        let status = status.clone();
+        let name = device.name().to_string();
+        if device_for_route.is_ok() {
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    if let Some(peer_ip) = status.remote_virtual_ip() {
+                        if !peer_ip.is_empty() {
+                            let _ = tun_linux::TunDevice::route_to_peer(&name, &peer_ip);
+                            return;
+                        }
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
+            });
+        }
+    }
+    let mut reader_file = match device.file().try_clone() {
+        Ok(file) => file,
+        Err(error) => {
+            log_event(&format!("tun: failed to clone TUN handle: {error}"));
+            return;
+        }
+    };
+    let mut writer_file = match device.file().try_clone() {
+        Ok(file) => file,
+        Err(error) => {
+            log_event(&format!("tun: failed to clone TUN handle: {error}"));
+            return;
+        }
+    };
+    // TUN device → peer: read whatever the kernel hands back from this
+    // interface and forward it as a packet frame.
+    let sender = packets.sender();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65535];
+        loop {
+            let n = match reader_file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if sender.send_packet(&buf[..n]).is_err() {
+                break;
+            }
+        }
+    });
+    // Peer → TUN device: whatever the peer forwards gets written straight
+    // back onto the interface for the kernel to route locally. This thread
+    // exits on its own once `receive_packet` starts erroring — which
+    // happens once the demultiplexing reader thread inside
+    // `AuthenticatedStream::into_multiplexed` exits and drops its sender,
+    // i.e. once the underlying connection itself is gone — so it needs no
+    // separate shutdown signal.
+    std::thread::spawn(move || loop {
+        match packets.receive_packet(Duration::from_secs(30)) {
+            Ok(packet) => {
+                if writer_file.write_all(&packet).is_err() {
+                    break;
+                }
+            }
+            Err(localscale_agent_transport::TransportError::Timeout) => continue,
+            Err(_) => break,
+        }
+    });
+    // Keep the device alive for the process's lifetime by leaking it: it
+    // must stay open as long as either forwarding thread holds a cloned fd.
+    std::mem::forget(device);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_tun_bridge(_status: &PeerTransportStatus, packets: PacketChannel) {
+    log_event("tun: LOCALSCALE_ENABLE_TUN is set but this platform has no TUN implementation yet (Linux only so far)");
+    // Nothing reads `receive_packet` on this platform; if the peer has TUN
+    // enabled and starts forwarding real traffic, its packets would pile up
+    // forever in the channel's internal queue with no consumer. Drain and
+    // discard them so enabling the flag on an unsupported platform degrades
+    // to "no network," not a slow memory leak.
+    std::thread::spawn(move || {
+        while packets.receive_packet(Duration::from_secs(3600)).is_ok() {}
+    });
+}
+
 fn start_peer_transport(
     config: &RuntimeConfig,
     tor: &RunningTor,
@@ -329,6 +455,12 @@ fn start_peer_transport(
     let key = key_from_stored_transport_key(&record.invitation_secret)
         .map_err(|_| "peer record contains an invalid transport key".to_string())?;
     let nonce_path = config.data_dir.join("handshake-nonce");
+    // Off by default: the ping/pong path above this feature flag is the
+    // proven, stable connection users depend on today. The TUN datapath is
+    // new, Linux-only so far (see `tun_linux`), and only ever activates when
+    // explicitly requested, so it can be developed and tested without any
+    // risk of regressing ordinary pairing.
+    let tun_enabled = env::var("LOCALSCALE_ENABLE_TUN").as_deref() == Ok("1");
     match &config.mode {
         TorMode::Host { upstream, .. } => {
             let address: std::net::SocketAddr = upstream
@@ -345,18 +477,22 @@ fn start_peer_transport(
             std::thread::spawn(move || loop {
                 host_status.set(TransportState::Connecting);
                 match host.accept() {
-                    Ok(mut stream) => {
+                    Ok(stream) => {
                         // The handshake authenticates the connecting Cliente's real
                         // node id (see `AuthenticatedStream::peer_node_id`); record it
                         // so `devices_status()` can show it instead of a generic
                         // "remote-client" placeholder that never changed.
                         host_status.set_remote_node_id(stream.peer_node_id().to_string());
+                        let (heartbeat, packets) = stream.into_multiplexed();
+                        if tun_enabled {
+                            spawn_tun_bridge(&host_status, packets);
+                        }
                         while gate.load(Ordering::Acquire) {
-                            match stream.receive_ping() {
+                            match heartbeat.receive_ping(localscale_agent_transport::DEFAULT_TIMEOUT) {
                                 Ok((sequence, peer_virtual_ip)) => {
                                     host_status.set_remote_virtual_ip(peer_virtual_ip);
                                     let local_virtual_ip = host_status.local_virtual_ip();
-                                    if stream
+                                    if heartbeat
                                         .send_pong(&local_node_id, sequence, &local_virtual_ip)
                                         .is_err()
                                     {
@@ -423,19 +559,26 @@ fn start_peer_transport(
                         TransportState::Retrying
                     });
                     match client.connect(&hostname, port) {
-                        Ok(mut stream) => {
+                        Ok(stream) => {
                             failures = 0;
+                            let (heartbeat, packets) = stream.into_multiplexed();
+                            if tun_enabled {
+                                spawn_tun_bridge(&status, packets);
+                            }
                             let mut sequence = 0u64;
                             while gate.load(Ordering::Acquire) {
                                 sequence = sequence.wrapping_add(1);
                                 let local_virtual_ip = status.local_virtual_ip();
-                                if stream
+                                if heartbeat
                                     .send_ping(&node_id, sequence, &local_virtual_ip)
                                     .is_err()
                                 {
                                     break;
                                 }
-                                let peer_virtual_ip = match stream.receive_pong(sequence) {
+                                let peer_virtual_ip = match heartbeat.receive_pong(
+                                    sequence,
+                                    localscale_agent_transport::DEFAULT_TIMEOUT,
+                                ) {
                                     Ok(peer_virtual_ip) => peer_virtual_ip,
                                     Err(_) => break,
                                 };

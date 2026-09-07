@@ -296,6 +296,202 @@ fn heartbeat_frame(
     format!("v{VERSION}|{kind}|{node_id}|{timestamp}|{sequence}|{virtual_ip}")
 }
 
+/// Frame-kind discriminator prefixed to every frame once a connection is
+/// running in multiplexed mode (see `AuthenticatedStream::into_multiplexed`).
+/// A plain (non-multiplexed) connection never writes this byte — it's only
+/// meaningful to the demultiplexing reader thread spawned by
+/// `into_multiplexed`, which is why it lives as a private implementation
+/// detail here rather than a public wire-format constant.
+const FRAME_KIND_HEARTBEAT: u8 = 1;
+const FRAME_KIND_PACKET: u8 = 2;
+
+/// One side of a connection that has been split into a heartbeat channel and
+/// a raw-packet channel sharing the same underlying authenticated stream —
+/// the foundation for tunneling arbitrary IP traffic (a virtual network
+/// interface) over the same connection that already proves liveness,
+/// instead of needing a second connection per peer. A background thread
+/// demultiplexes inbound frames by their leading kind byte; writes from
+/// either channel are serialized through a shared, mutex-guarded clone of
+/// the socket.
+pub struct HeartbeatChannel {
+    writer: Arc<std::sync::Mutex<TcpStream>>,
+    peer_node_id: String,
+    inbox: std::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+impl HeartbeatChannel {
+    pub fn peer_node_id(&self) -> &str {
+        &self.peer_node_id
+    }
+
+    pub fn send_ping(
+        &self,
+        node_id: &str,
+        sequence: u64,
+        virtual_ip: &str,
+    ) -> Result<(), TransportError> {
+        write_multiplexed(
+            &self.writer,
+            FRAME_KIND_HEARTBEAT,
+            heartbeat_frame("ping", node_id, unix_now(), sequence, virtual_ip).as_bytes(),
+        )
+    }
+
+    pub fn send_pong(
+        &self,
+        node_id: &str,
+        sequence: u64,
+        virtual_ip: &str,
+    ) -> Result<(), TransportError> {
+        write_multiplexed(
+            &self.writer,
+            FRAME_KIND_HEARTBEAT,
+            heartbeat_frame("pong", node_id, unix_now(), sequence, virtual_ip).as_bytes(),
+        )
+    }
+
+    pub fn receive_ping(&self, timeout: Duration) -> Result<(u64, String), TransportError> {
+        let payload = self
+            .inbox
+            .recv_timeout(timeout)
+            .map_err(|_| TransportError::Timeout)?;
+        parse_heartbeat(&payload, "ping", &self.peer_node_id)
+    }
+
+    pub fn receive_pong(
+        &self,
+        expected_sequence: u64,
+        timeout: Duration,
+    ) -> Result<String, TransportError> {
+        let payload = self
+            .inbox
+            .recv_timeout(timeout)
+            .map_err(|_| TransportError::Timeout)?;
+        let (sequence, virtual_ip) = parse_heartbeat(&payload, "pong", &self.peer_node_id)?;
+        if sequence != expected_sequence {
+            return Err(TransportError::Protocol("unexpected pong sequence"));
+        }
+        Ok(virtual_ip)
+    }
+}
+
+/// The raw-packet side of a multiplexed connection — this is what a future
+/// TUN device reader/writer thread uses: whatever bytes go in on one side's
+/// `send_packet` come out of the other side's `receive_packet` (or
+/// `try_receive_packet` for a non-blocking poll), with no interpretation of
+/// their contents (an IP packet, in the intended use, but this layer does
+/// not care).
+pub struct PacketChannel {
+    writer: Arc<std::sync::Mutex<TcpStream>>,
+    inbox: std::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+impl PacketChannel {
+    pub fn send_packet(&self, packet: &[u8]) -> Result<(), TransportError> {
+        write_multiplexed(&self.writer, FRAME_KIND_PACKET, packet)
+    }
+
+    pub fn receive_packet(&self, timeout: Duration) -> Result<Vec<u8>, TransportError> {
+        self.inbox
+            .recv_timeout(timeout)
+            .map_err(|_| TransportError::Timeout)
+    }
+
+    pub fn try_receive_packet(&self) -> Option<Vec<u8>> {
+        self.inbox.try_recv().ok()
+    }
+
+    /// A cheap, independently-owned handle for the send side only — since
+    /// `receive_packet` needs `&self` on the one `PacketChannel` that owns
+    /// the inbound `mpsc::Receiver` (which has a single consumer), a bridge
+    /// with one thread reading the peer and one thread reading a local
+    /// device needs the write half split out like this rather than trying
+    /// to share one `PacketChannel` across both threads.
+    pub fn sender(&self) -> PacketSender {
+        PacketSender {
+            writer: self.writer.clone(),
+        }
+    }
+}
+
+/// The send-only half of a `PacketChannel`, freely cloneable/shareable
+/// across threads (see `PacketChannel::sender`).
+#[derive(Clone)]
+pub struct PacketSender {
+    writer: Arc<std::sync::Mutex<TcpStream>>,
+}
+
+impl PacketSender {
+    pub fn send_packet(&self, packet: &[u8]) -> Result<(), TransportError> {
+        write_multiplexed(&self.writer, FRAME_KIND_PACKET, packet)
+    }
+}
+
+fn write_multiplexed(
+    writer: &Arc<std::sync::Mutex<TcpStream>>,
+    kind: u8,
+    payload: &[u8],
+) -> Result<(), TransportError> {
+    let mut framed = Vec::with_capacity(payload.len() + 1);
+    framed.push(kind);
+    framed.extend_from_slice(payload);
+    let mut guard = writer.lock().map_err(|_| TransportError::Protocol("writer poisoned"))?;
+    write_frame(&mut guard, &framed)
+}
+
+impl AuthenticatedStream {
+    /// Splits this connection into a `HeartbeatChannel` and a `PacketChannel`
+    /// that can be driven concurrently from separate threads, sharing the
+    /// same underlying socket. Spawns one background thread that reads
+    /// frames off the wire and routes each to the channel matching its
+    /// leading kind byte — the only place that byte is ever interpreted.
+    pub fn into_multiplexed(self) -> (HeartbeatChannel, PacketChannel) {
+        let AuthenticatedStream {
+            stream,
+            peer_node_id,
+        } = self;
+        let writer_handle = stream
+            .try_clone()
+            .expect("cloning a connected TcpStream handle does not fail in practice");
+        let writer = Arc::new(std::sync::Mutex::new(writer_handle));
+        let (heartbeat_tx, heartbeat_rx) = std::sync::mpsc::channel();
+        let (packet_tx, packet_rx) = std::sync::mpsc::channel();
+        let mut reader = stream;
+        std::thread::spawn(move || loop {
+            let framed = match read_frame(&mut reader) {
+                Ok(framed) => framed,
+                Err(_) => break,
+            };
+            if framed.is_empty() {
+                continue;
+            }
+            let (kind, payload) = (framed[0], framed[1..].to_vec());
+            let delivered = match kind {
+                FRAME_KIND_HEARTBEAT => heartbeat_tx.send(payload).is_ok(),
+                FRAME_KIND_PACKET => packet_tx.send(payload).is_ok(),
+                // An unrecognized kind byte is dropped rather than treated as
+                // a fatal error: a future frame kind added by a newer peer
+                // must not be able to kill an older peer's connection.
+                _ => true,
+            };
+            if !delivered {
+                break;
+            }
+        });
+        (
+            HeartbeatChannel {
+                writer: writer.clone(),
+                peer_node_id,
+                inbox: heartbeat_rx,
+            },
+            PacketChannel {
+                writer,
+                inbox: packet_rx,
+            },
+        )
+    }
+}
+
 fn parse_heartbeat(
     payload: &[u8],
     expected_kind: &str,
@@ -736,6 +932,64 @@ mod tests {
         let mut c = client.connect("host.onion", 1234).unwrap();
         c.send_ping("cliente-1", 7, "10.0.0.5").unwrap();
         assert_eq!(c.receive_pong(7).unwrap(), "10.0.0.6");
+        j.join().unwrap();
+    }
+
+    #[test]
+    fn multiplexed_heartbeat_and_packets_do_not_interfere() {
+        // Foundation for tunneling arbitrary IP traffic (a virtual network
+        // interface) over the same connection that already proves
+        // liveness: a heartbeat exchange and raw "packet" frames (standing
+        // in for what a TUN device would produce) must both arrive intact
+        // and in order on their own channel, even when interleaved on the
+        // wire, and neither must be mistaken for the other.
+        let key_bytes = CryptoKey::generate().to_bytes();
+        let host_key = CryptoKey::from_bytes(&key_bytes).unwrap();
+        let client_key = CryptoKey::from_bytes(&key_bytes).unwrap();
+        let mut host = HostTransport::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            host_key,
+            "host-1",
+            Box::new(TestNonceAllocator { next: 1 }),
+        )
+        .unwrap();
+        let addr = host.local_addr().unwrap();
+        let proxy = proxy(addr);
+        let rt = LoopbackRuntime(proxy.addr, true);
+        let mut client = ClienteTransport::new(
+            Box::new(rt),
+            client_key,
+            "cliente-1",
+            "host-1",
+            Box::new(TestNonceAllocator { next: 2 }),
+        );
+        let j = std::thread::spawn(move || {
+            let s = host.accept().unwrap();
+            let (heartbeat, packets) = s.into_multiplexed();
+            // A "packet" arrives before the ping does; it must not corrupt
+            // or get consumed by the heartbeat channel.
+            let received = packets.receive_packet(Duration::from_secs(5)).unwrap();
+            assert_eq!(received, b"fake-ip-packet-1");
+            let (sequence, peer_virtual_ip) = heartbeat
+                .receive_ping(Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(sequence, 1);
+            assert_eq!(peer_virtual_ip, "10.0.0.5");
+            heartbeat.send_pong("host-1", sequence, "10.0.0.6").unwrap();
+            packets.send_packet(b"fake-ip-packet-2").unwrap();
+        });
+        let c = client.connect("host.onion", 1234).unwrap();
+        let (heartbeat, packets) = c.into_multiplexed();
+        packets.send_packet(b"fake-ip-packet-1").unwrap();
+        heartbeat.send_ping("cliente-1", 1, "10.0.0.5").unwrap();
+        assert_eq!(
+            heartbeat.receive_pong(1, Duration::from_secs(5)).unwrap(),
+            "10.0.0.6"
+        );
+        assert_eq!(
+            packets.receive_packet(Duration::from_secs(5)).unwrap(),
+            b"fake-ip-packet-2"
+        );
         j.join().unwrap();
     }
 

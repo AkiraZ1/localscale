@@ -254,6 +254,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "getrandom",
+ "libc",
  "localscale-agent-protocol",
  "localscale-agent-transport",
  "localscale-control-plane",
