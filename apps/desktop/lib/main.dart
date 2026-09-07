@@ -774,7 +774,7 @@ class _ControlPageState extends State<ControlPage> {
                   onPressed: _pairingBusy ? null : _activateGeneratedInvitation,
                   icon: const Icon(Icons.verified_user),
                   label: const Text('Ativar Host')),
-            if (status?.configured == true)
+            if (networkDevices != null)
               OutlinedButton.icon(
                   key: const Key('reset-peer'),
                   onPressed: _pairingBusy ? null : _resetPeer,
