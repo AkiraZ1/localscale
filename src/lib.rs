@@ -1528,6 +1528,7 @@ fn response_for_request_with_state(request: &str, state: &AgentState) -> String 
         ("POST", "/api/v1/peer/config") => set_peer_config(body, state),
         ("POST", "/api/v1/peer/approve") => set_peer_approval(true, state),
         ("POST", "/api/v1/peer/revoke") => set_peer_approval(false, state),
+        ("POST", "/api/v1/peer/reset") => reset_peer(state),
         ("POST", "/api/v1/peer/virtual-ip") => set_virtual_ip_handler(body, state),
         ("POST", "/api/v1/runtime/restart") => request_runtime_restart(state),
         ("GET", "/api/v1/devices") => devices_status(state),
@@ -1953,6 +1954,35 @@ fn mark_peer_changed(record: PeerRecord, state: &AgentState) -> Result<(), ()> {
         .peer_transport_status
         .set(TransportState::RestartRequired);
     Ok(())
+}
+
+fn reset_peer(state: &AgentState) -> String {
+    let Some(store) = &state.peer_store else {
+        return http_response(
+            "503 Service Unavailable",
+            "application/json",
+            r#"{"error":"peer_store_unavailable"}"#,
+        );
+    };
+    if lock_recover(store).clear().is_err() {
+        return http_response(
+            "500 Internal Server Error",
+            "application/json",
+            r#"{"error":"peer_store_clear_failed"}"#,
+        );
+    }
+    let mut peer = lock_recover(&state.peer);
+    peer.configured = false;
+    peer.node_id = None;
+    peer.host_node_id = None;
+    peer.endpoint = None;
+    peer.virtual_ip = None;
+    peer.approved = false;
+    peer.revoked = false;
+    drop(peer);
+    state.peer_transport_enabled.store(false, Ordering::Release);
+    state.peer_transport_status.set(TransportState::Disabled);
+    peer_status(state)
 }
 
 fn generate_invitation(body: &str, state: &AgentState) -> String {

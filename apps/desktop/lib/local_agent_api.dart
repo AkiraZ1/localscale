@@ -181,6 +181,9 @@ abstract interface class LocalAgentApi {
   Future<void> restartRuntime();
   Future<void> setVirtualIp(String virtualIp);
 
+  /// Clears the persisted peer record so a fresh pairing can be performed.
+  Future<PeerStatus> resetPeer();
+
   /// Persists an invitation-derived peer configuration without approving it.
   ///
   /// Approval is deliberately a separate local-agent action: callers must not
@@ -293,6 +296,10 @@ class LocalAgentApiClient implements LocalAgentApi {
     await transport
         .post('/api/v1/peer/virtual-ip', body: {'virtual_ip': virtualIp});
   }
+
+  @override
+  Future<PeerStatus> resetPeer() =>
+      _parsePeer(transport.post('/api/v1/peer/reset'));
 
   @override
   Future<PeerStatus> setPeerConfig({

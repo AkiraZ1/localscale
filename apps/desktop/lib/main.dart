@@ -401,6 +401,44 @@ class _ControlPageState extends State<ControlPage> {
     }
   }
 
+  Future<void> _resetPeer() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Remover dispositivo?'),
+        content: const Text(
+            'Isso apagará a configuração de pareamento. Você precisará gerar um novo convite para conectar novamente.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancelar')),
+          FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              style:
+                  FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+              child: const Text('Remover')),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _pairingBusy = true);
+    try {
+      await widget.api.resetPeer();
+      setState(() {
+        _generatedInvitation = null;
+        _invitationController.clear();
+        _nodeIdController.clear();
+        _vipController.clear();
+        _onionController.clear();
+      });
+      _pairingMessage('Dispositivo removido. Pronto para novo pareamento.');
+    } catch (error) {
+      _pairingMessage('Falha ao remover dispositivo: $error');
+    } finally {
+      if (mounted) setState(() => _pairingBusy = false);
+    }
+  }
+
   Future<bool?> _confirmInvitation(InvitationPreview preview,
       {required String title, required String explanation}) {
     return showDialog<bool>(
@@ -736,6 +774,14 @@ class _ControlPageState extends State<ControlPage> {
                   onPressed: _pairingBusy ? null : _activateGeneratedInvitation,
                   icon: const Icon(Icons.verified_user),
                   label: const Text('Ativar Host')),
+            if (status?.configured == true)
+              OutlinedButton.icon(
+                  key: const Key('reset-peer'),
+                  onPressed: _pairingBusy ? null : _resetPeer,
+                  icon: const Icon(Icons.link_off),
+                  style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.redAccent),
+                  label: const Text('Remover dispositivo')),
           ]),
           if (_generatedInvitation != null && isHost) ...[
             const SizedBox(height: 8),
