@@ -33,9 +33,23 @@ Future<bool> ensureLocalAgentRunning({
       '${File(desktopExecutable).parent.path}${Platform.pathSeparator}localscaled');
   
   if (!await agentExecutable.exists() && Platform.isLinux) {
-    final home = Platform.environment['HOME'];
-    if (home != null) {
-      agentExecutable = File('$home/.local/opt/localscale-agent/localscaled');
+    const standardPaths = [
+      '/usr/local/bin/localscaled',
+      '/usr/bin/localscaled',
+      '/opt/localscale/bin/localscaled',
+    ];
+    for (final path in standardPaths) {
+      final file = File(path);
+      if (await file.exists()) {
+        agentExecutable = file;
+        break;
+      }
+    }
+    if (!await agentExecutable.exists()) {
+      final home = Platform.environment['HOME'];
+      if (home != null) {
+        agentExecutable = File('$home/.local/opt/localscale-agent/localscaled');
+      }
     }
   }
 
