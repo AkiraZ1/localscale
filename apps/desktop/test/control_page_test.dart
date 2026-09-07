@@ -69,11 +69,17 @@ void main() {
   });
 
   testWidgets('displays Onion network card, virtual IP, and devices', (tester) async {
+    tester.view.physicalSize = const Size(1200, 1600);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
     final api = ControlledApi();
     await tester.pumpWidget(MaterialApp(home: ControlPage(api: api)));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 100));
-    await tester.scrollUntilVisible(find.text('Rede Onion & Dispositivos'), 200);
     expect(find.text('Rede Onion & Dispositivos'), findsOneWidget);
     expect(find.text('Isolamento LAN Ativo (Tor 100%)'), findsOneWidget);
     expect(find.text('local-test'), findsOneWidget);
