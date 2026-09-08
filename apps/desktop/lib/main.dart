@@ -219,6 +219,12 @@ class _ControlPageState extends State<ControlPage> {
     'Convite',
   ];
   int _wizardStep = _stepRole;
+  // Set synchronously the moment the user picks a role; `status?.mode` only
+  // updates once the setMode() call round-trips and the next poll lands, so
+  // relying on it to decide "generate" vs "import" on the invitation page
+  // could still show the previous mode's flow for a beat (or indefinitely
+  // in a fast run-through) right after the role choice.
+  LocalScaleMode? _selectedRole;
   bool get _needsPermissionStep => defaultTargetPlatform == TargetPlatform.macOS;
   bool _permissionGranted = false;
   bool _permissionSkipped = false;
@@ -619,6 +625,7 @@ class _ControlPageState extends State<ControlPage> {
     _invitationController.clear();
     setState(() {
       _generatedInvitation = null;
+      _selectedRole = LocalScaleMode.host;
       _forceWizard = true;
       _wizardStep = _stepInvitation;
     });
@@ -980,6 +987,7 @@ class _ControlPageState extends State<ControlPage> {
     _invitationController.clear();
     setState(() {
       _generatedInvitation = null;
+      _selectedRole = mode;
       _wizardStep = _stepName;
     });
     _run(() => widget.api.setMode(mode), 'Mode update');
@@ -1070,8 +1078,7 @@ class _ControlPageState extends State<ControlPage> {
   }
 
   Widget _pageInvitation() {
-    final current = status;
-    final isHost = current?.mode == LocalScaleMode.host;
+    final isHost = (_selectedRole ?? status?.mode) == LocalScaleMode.host;
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       Text(isHost
           ? 'Crie um convite de uso único e envie-o ao outro computador por um canal de sua confiança (mensagem, e-mail, etc).'
