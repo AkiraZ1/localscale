@@ -165,6 +165,13 @@ pub fn prepare_data_directory(path: &Path) -> Result<(), TorRuntimeError> {
         set_private_mode(path)?;
         enforce_private_mode(path)?;
     }
+    // If this directory was created (or last touched) while running with
+    // elevated effective privilege, make sure it's still owned by the real
+    // user — see `restore_real_owner`'s doc comment. A root-owned 0700
+    // directory is completely inaccessible to this same install once it
+    // runs unprivileged again (e.g. after a reinstall resets the macOS
+    // setuid grant), breaking Tor's own ability to write into it at all.
+    crate::restore_real_owner(path);
     Ok(())
 }
 

@@ -177,7 +177,9 @@ impl HostPeerRegistry {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         }
-        std::fs::rename(&tmp, &self.path)
+        std::fs::rename(&tmp, &self.path)?;
+        crate::restore_real_owner(&self.path);
+        Ok(())
     }
 }
 
@@ -216,6 +218,7 @@ impl LocalVirtualIpStore {
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
         }
         std::fs::rename(&tmp, &self.path)?;
+        crate::restore_real_owner(&self.path);
         self.value = Some(value.to_string());
         Ok(())
     }

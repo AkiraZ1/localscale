@@ -921,6 +921,7 @@ impl RoleStore {
         file.write_all(b"\n")?;
         file.sync_all()?;
         std::fs::rename(&tmp, &self.path)?;
+        restore_real_owner(&self.path);
         self.role = Some(role.to_owned());
         Ok(true)
     }
@@ -935,6 +936,44 @@ impl std::fmt::Debug for PeerStore {
             .finish()
     }
 }
+
+/// Restores the real invoking user as owner of one of our own state files
+/// right after writing it. Needed only when running with elevated effective
+/// privilege — the macOS setuid grant for the opt-in virtual-network
+/// feature (`requestVirtualNetworkPrivilege` in the Flutter app) makes
+/// *every* file this process creates come out owned by root, including
+/// ordinary state like the peer store or the Host registry. That silently
+/// locks the real user out of their own state the next time this exact
+/// installed binary runs unprivileged (e.g. after a reinstall resets the
+/// setuid bit): `validate_file` below correctly rejects a file it doesn't
+/// own, surfacing as "peer store has the wrong owner" /
+/// `peer_store_unavailable` with no way to recover short of a shell and
+/// `sudo chown`. A no-op when not elevated (chowning to the uid/gid a file
+/// already has) and when genuinely running as root rather than via setuid
+/// (real uid 0 too — nothing to restore to).
+#[cfg(unix)]
+pub(crate) fn restore_real_owner(path: &Path) {
+    if effective_uid() != 0 {
+        return;
+    }
+    unsafe extern "C" {
+        fn getuid() -> u32;
+        fn getgid() -> u32;
+        fn chown(path: *const std::os::raw::c_char, owner: u32, group: u32) -> i32;
+    }
+    let (uid, gid) = unsafe { (getuid(), getgid()) };
+    if uid == 0 {
+        return;
+    }
+    use std::os::unix::ffi::OsStrExt;
+    if let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        unsafe {
+            let _ = chown(cpath.as_ptr(), uid, gid);
+        }
+    }
+}
+#[cfg(not(unix))]
+pub(crate) fn restore_real_owner(_path: &Path) {}
 
 #[cfg(unix)]
 fn effective_uid() -> u32 {
@@ -1170,6 +1209,7 @@ impl PeerStore {
             Self::validate_file(&tmp, &metadata)?;
         }
         std::fs::rename(&tmp, &self.path)?;
+        restore_real_owner(&self.path);
         if let Ok(dir) = std::fs::File::open(parent) {
             let _ = dir.sync_all();
         }
@@ -1725,6 +1765,7 @@ fn load_or_create_local_device_id() -> String {
             let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
         }
         let _ = std::fs::rename(&tmp, &path);
+        restore_real_owner(&path);
     }
     node_id
 }
