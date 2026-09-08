@@ -769,6 +769,17 @@ fn start_peer_transport(
                         // immediately instead of blocking on this
                         // connection's heartbeat loop first.
                         let peer_status = PeerTransportStatus::default();
+                        // spawn_tun_bridge below reads *this* status's own
+                        // local_virtual_ip to decide whether to create the
+                        // TUN interface at all — a fresh PeerTransportStatus
+                        // never has one, so without this the Host always
+                        // logged "no local virtual IP configured, skipping
+                        // TUN bridge" and never bridged any traffic, no
+                        // matter what IP was actually configured (the Host's
+                        // own IP lives on the shared `status`, seeded by
+                        // `generate_invitation`/`set_virtual_ip_handler` —
+                        // never on a per-connection status).
+                        peer_status.set_local_virtual_ip(status.local_virtual_ip());
                         {
                             let mut live = match host_peer_live.lock() {
                                 Ok(guard) => guard,
