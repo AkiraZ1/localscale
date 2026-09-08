@@ -102,6 +102,13 @@ void main() {
     final api = ControlledApi();
     await tester.pumpWidget(MaterialApp(home: ControlPage(api: api)));
     await tester.pump();
+    // Step 1 of the pairing wizard (name this computer) is prefilled from
+    // getDevices(), so it's already valid — advance straight to step 2.
+    await tester.ensureVisible(
+        find.byKey(const Key('wizard-step-name-continue')).first);
+    await tester
+        .tap(find.byKey(const Key('wizard-step-name-continue')).first);
+    await tester.pump();
     await tester
         .ensureVisible(find.byKey(const Key('pairing-invitation')).first);
     final payload = base64Url
@@ -154,6 +161,12 @@ void main() {
           onionEndpoint:
               'abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion');
     await tester.pumpWidget(MaterialApp(home: ControlPage(api: api)));
+    await tester.pump();
+    // Step 1 of the pairing wizard (name this computer) is prefilled from
+    // getDevices(), so it's already valid — advance straight to step 2.
+    await tester
+        .ensureVisible(find.byKey(const Key('wizard-step-name-continue')));
+    await tester.tap(find.byKey(const Key('wizard-step-name-continue')));
     await tester.pump();
     await tester.ensureVisible(find.byKey(const Key('generate-invitation')));
     await tester.tap(find.byKey(const Key('generate-invitation')));

@@ -56,6 +56,15 @@ Future<bool> ensureLocalAgentRunning({
 
   if (!await agentExecutable.exists()) return false;
 
+  // The health probe above failed, meaning either nothing is listening on
+  // this port, or something is listening but not answering as our own
+  // agent (a stuck/orphaned previous run — e.g. its shell was closed
+  // without a clean shutdown, or a crash left it and its bundled Tor
+  // process behind holding the port). Clear any such leftovers from this
+  // exact bundled binary before starting a fresh one, so a fresh launch
+  // never silently fails to bind or ends up talking to a dead process.
+  await _killStaleAgentProcesses(agentExecutable);
+
   if (Platform.isMacOS) {
     // Fire-and-forget: this shows a native admin-password dialog the first
     // time (or after a binary update), which must never block the app's
@@ -132,6 +141,33 @@ Future<bool> ensureLocalAgentRestarted({
     await Future<void>.delayed(retryDelay);
   }
   return false;
+}
+
+/// Terminates any process still running from this exact bundled agent
+/// binary (matched by its own full path, never a generic process name) —
+/// covers a previous run left behind by a closed terminal, a crashed
+/// desktop app, or any other path that skipped a clean shutdown. Safe by
+/// construction: it can only ever match this app's own bundled
+/// `localscaled` and its bundled Tor child, never an unrelated process.
+Future<void> _killStaleAgentProcesses(File agentExecutable) async {
+  if (!Platform.isMacOS && !Platform.isLinux) return;
+  try {
+    await Process.run('pkill', ['-9', '-f', agentExecutable.path]);
+    // The bundled Tor child is a grandchild process spawned by localscaled,
+    // not something `pkill -f <agent path>` matches — its own command line
+    // instead references the Tor binary bundled next to the agent (see
+    // resolve_bundled_tor). Clear it too, or the fresh agent about to start
+    // can fail to bind Tor's SOCKS/control ports.
+    final bundleDir = agentExecutable.parent.path;
+    await Process.run('pkill', ['-9', '-f', '$bundleDir/../Resources/tor/tor']);
+    await Process.run('pkill', ['-9', '-f', '$bundleDir/tor/tor']);
+    // Give the OS a moment to actually release the port before the fresh
+    // agent tries to bind it.
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+  } on Object {
+    // Best-effort cleanup only — never block startup on this failing (e.g.
+    // pkill not installed, or nothing to kill in the first place).
+  }
 }
 
 /// macOS has no per-binary capability grant like Linux's `setcap` — opening

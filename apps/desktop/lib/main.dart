@@ -202,6 +202,14 @@ class _ControlPageState extends State<ControlPage> {
   GeneratedInvitation? _generatedInvitation;
   bool _pairingBusy = false;
 
+  // First-time setup walks through one decision at a time instead of a
+  // single form with every field visible at once — chosen role isn't
+  // committed to the agent (setMode) until the user actually advances past
+  // step 0, so backing out costs nothing.
+  int _wizardStep = 0;
+  LocalScaleMode? _wizardRole;
+  bool get _isPaired => networkDevices?.remotePeers.isNotEmpty ?? false;
+
   // Rolling event log so status/port/restart/transport transitions and
   // unexpected agent behavior can be reported back here, instead of only
   // flashing as a snackbar and disappearing.
@@ -550,6 +558,7 @@ class _ControlPageState extends State<ControlPage> {
       await widget.api.resetPeer();
       setState(() {
         _generatedInvitation = null;
+        _wizardStep = 0;
         _invitationController.clear();
         _nodeIdController.clear();
         _vipController.clear();
@@ -662,6 +671,7 @@ class _ControlPageState extends State<ControlPage> {
                                     _invitationController.clear();
                                     setState(() {
                                       _generatedInvitation = null;
+                                      _wizardStep = 0;
                                     });
                                     _run(() => widget.api.setMode(s.first),
                                         'Mode update');
@@ -928,55 +938,140 @@ class _ControlPageState extends State<ControlPage> {
         ]),
       );
 
+  // Two visible steps: name this computer, then handle the invitation.
+  // Kept as an int (not an enum) so it stays trivial to reset alongside the
+  // other pairing fields whenever mode changes or the peer is removed.
+  static const int _wizardStepCount = 2;
+
+  Widget _wizardProgressDots() => Row(
+        mainAxisSize: MainAxisSize.min,
+        children: List.generate(_wizardStepCount, (i) {
+          final active = i == _wizardStep;
+          final done = i < _wizardStep;
+          return Padding(
+            padding: const EdgeInsets.only(right: 6),
+            child: Container(
+              width: active ? 22 : 8,
+              height: 8,
+              decoration: BoxDecoration(
+                color: done || active
+                    ? Theme.of(context).colorScheme.primary
+                    : Colors.grey.withValues(alpha: 0.35),
+                borderRadius: BorderRadius.circular(4),
+              ),
+            ),
+          );
+        }),
+      );
+
   Widget _buildInvitationCard(ServiceStatus? current) {
     final isHost = current?.mode == LocalScaleMode.host;
+    final hasRemovableDevice = networkDevices?.remotePeers.isNotEmpty == true;
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(20),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('Conectar dispositivos',
-              style: Theme.of(context).textTheme.titleLarge),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text('Conectar dispositivos',
+                  style: Theme.of(context).textTheme.titleLarge),
+              _wizardProgressDots(),
+            ],
+          ),
           const SizedBox(height: 8),
           Text(isHost
               ? 'Crie um convite de uso único e envie-o ao outro computador por um canal de sua confiança (mensagem, e-mail, etc).'
               : 'Cole abaixo o convite recebido do outro computador para se conectar a ele.'),
           const SizedBox(height: 16),
-          _stepLabel('1', 'Dê um nome a este computador'),
-          TextField(
-            key: const Key('pairing-node-id'),
-            controller: _nodeIdController,
-            decoration: const InputDecoration(
-                labelText: 'Nome deste computador',
-                hintText: 'Ex: notebook-trabalho',
-                border: OutlineInputBorder()),
+          if (_wizardStep == 0)
+            _buildWizardStepName()
+          else
+            _buildWizardStepInvitation(isHost),
+          if (hasRemovableDevice) ...[
+            const SizedBox(height: 16),
+            const Divider(),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+                key: const Key('reset-peer'),
+                onPressed: _pairingBusy ? null : _resetPeer,
+                icon: const Icon(Icons.link_off),
+                style:
+                    OutlinedButton.styleFrom(foregroundColor: Colors.redAccent),
+                label: const Text('Remover dispositivo')),
+          ],
+          const SizedBox(height: 8),
+          const Text(
+            'A conta Google autoriza somente o painel local. O convite é a credencial de pareamento; não é sincronizado pelo Google e deve permanecer privado.',
+            style: TextStyle(fontSize: 12, color: Colors.grey),
           ),
-          const SizedBox(height: 16),
-          _stepLabel(
-              '2', isHost ? 'Gere o convite' : 'Cole o convite recebido'),
-          TextField(
-            key: const Key('pairing-invitation'),
-            controller: _invitationController,
-            minLines: 2,
-            maxLines: 4,
-            readOnly: isHost && _generatedInvitation != null,
-            decoration: InputDecoration(
-                labelText: isHost ? 'Convite gerado' : 'Convite recebido',
-                hintText: isHost ? 'Clique em "Gerar convite" abaixo' : 'Cole aqui…',
-                border: const OutlineInputBorder(),
-                suffixIcon: IconButton(
-                  tooltip: 'Copiar convite',
-                  onPressed: _invitationController.text.trim().isEmpty
-                      ? null
-                      : () {
-                          Clipboard.setData(ClipboardData(
-                              text: _invitationController.text.trim()));
-                          _pairingMessage('Convite copiado.');
-                        },
-                  icon: const Icon(Icons.copy),
-                )),
-          ),
-          const SizedBox(height: 16),
-          _stepLabel('3', isHost ? 'Ative e compartilhe' : 'Confirme e conecte'),
+        ]),
+      ),
+    );
+  }
+
+  Widget _buildWizardStepName() {
+    final canContinue = _nodeIdController.text.trim().isNotEmpty;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      _stepLabel('1', 'Dê um nome a este computador'),
+      TextField(
+        key: const Key('pairing-node-id'),
+        controller: _nodeIdController,
+        onChanged: (_) => setState(() {}),
+        decoration: const InputDecoration(
+            labelText: 'Nome deste computador',
+            hintText: 'Ex: notebook-trabalho',
+            border: OutlineInputBorder()),
+      ),
+      const SizedBox(height: 16),
+      Align(
+        alignment: Alignment.centerRight,
+        child: FilledButton.icon(
+          key: const Key('wizard-step-name-continue'),
+          onPressed: canContinue ? () => setState(() => _wizardStep = 1) : null,
+          icon: const Icon(Icons.arrow_forward),
+          label: const Text('Continuar'),
+        ),
+      ),
+    ]);
+  }
+
+  Widget _buildWizardStepInvitation(bool isHost) {
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      _stepLabel(
+          '2', isHost ? 'Gere o convite' : 'Cole o convite recebido'),
+      TextField(
+        key: const Key('pairing-invitation'),
+        controller: _invitationController,
+        minLines: 2,
+        maxLines: 4,
+        readOnly: isHost && _generatedInvitation != null,
+        decoration: InputDecoration(
+            labelText: isHost ? 'Convite gerado' : 'Convite recebido',
+            hintText: isHost ? 'Clique em "Gerar convite" abaixo' : 'Cole aqui…',
+            border: const OutlineInputBorder(),
+            suffixIcon: IconButton(
+              tooltip: 'Copiar convite',
+              onPressed: _invitationController.text.trim().isEmpty
+                  ? null
+                  : () {
+                      Clipboard.setData(ClipboardData(
+                          text: _invitationController.text.trim()));
+                      _pairingMessage('Convite copiado.');
+                    },
+              icon: const Icon(Icons.copy),
+            )),
+      ),
+      const SizedBox(height: 16),
+      Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          OutlinedButton.icon(
+              onPressed: _pairingBusy
+                  ? null
+                  : () => setState(() => _wizardStep = 0),
+              icon: const Icon(Icons.arrow_back),
+              label: const Text('Voltar')),
           Wrap(spacing: 8, runSpacing: 8, children: [
             if (isHost)
               FilledButton.icon(
@@ -996,28 +1091,15 @@ class _ControlPageState extends State<ControlPage> {
                   onPressed: _pairingBusy ? null : _activateGeneratedInvitation,
                   icon: const Icon(Icons.verified_user),
                   label: const Text('Ativar Host')),
-            if (networkDevices?.remotePeers.isNotEmpty == true)
-              OutlinedButton.icon(
-                  key: const Key('reset-peer'),
-                  onPressed: _pairingBusy ? null : _resetPeer,
-                  icon: const Icon(Icons.link_off),
-                  style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.redAccent),
-                  label: const Text('Remover dispositivo')),
           ]),
-          if (_generatedInvitation != null && isHost) ...[
-            const SizedBox(height: 8),
-            Text(
-                'Expira em ${_generatedInvitation!.expiresAt.toLocal()}. Gerar outro convite invalida a configuração pendente anterior.'),
-          ],
-          const SizedBox(height: 8),
-          const Text(
-            'A conta Google autoriza somente o painel local. O convite é a credencial de pareamento; não é sincronizado pelo Google e deve permanecer privado.',
-            style: TextStyle(fontSize: 12, color: Colors.grey),
-          ),
-        ]),
+        ],
       ),
-    );
+      if (_generatedInvitation != null && isHost) ...[
+        const SizedBox(height: 8),
+        Text(
+            'Expira em ${_generatedInvitation!.expiresAt.toLocal()}. Gerar outro convite invalida a configuração pendente anterior.'),
+      ],
+    ]);
   }
 
   /// A Cliente never runs a hidden service — only a Host publishes one — so
