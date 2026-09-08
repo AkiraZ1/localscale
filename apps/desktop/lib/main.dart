@@ -400,20 +400,6 @@ class _ControlPageState extends State<ControlPage> {
     }
   }
 
-  Future<void> _activateGeneratedInvitation() async {
-    final generated = _generatedInvitation;
-    if (generated == null) return;
-    final preview = InvitationPreview.parse(generated.invitation);
-    final confirmed = await _confirmInvitation(
-      preview,
-      title: 'Ativar este Host?',
-      explanation:
-          'O código abaixo identifica este convite específico; compare-o por um canal confiável com o Cliente.',
-    );
-    if (confirmed != true || !mounted) return;
-    await _approveAndRestart('Host ativado. O agente será reiniciado.');
-  }
-
   Future<void> _importInvitation() async {
     final nodeId = _nodeIdController.text.trim();
     final invitation = _invitationController.text.trim();
@@ -1042,19 +1028,12 @@ class _ControlPageState extends State<ControlPage> {
                   onPressed: _pairingBusy ? null : _importInvitation,
                   icon: const Icon(Icons.link),
                   label: const Text('Revisar e conectar')),
-            if (isHost && _generatedInvitation != null)
-              OutlinedButton.icon(
-                  key: const Key('activate-invitation'),
-                  onPressed: _pairingBusy ? null : _activateGeneratedInvitation,
-                  icon: const Icon(Icons.verified_user),
-                  label: const Text('Ativar')),
           ]),
         ],
       ),
       if (_generatedInvitation != null && isHost) ...[
         const SizedBox(height: 12),
-        Text(
-            'Expira em ${_generatedInvitation!.expiresAt.toLocal()}. Gerar outro convite invalida a configuração pendente anterior.'),
+        Text('Expira em ${_generatedInvitation!.expiresAt.toLocal()}.'),
       ],
       if (_pairingBusy) ...[
         const SizedBox(height: 20),
