@@ -5,6 +5,13 @@ import 'local_agent_api.dart';
 
 int nativeLocalAgentPort({required bool macOS}) => macOS ? 18765 : 8765;
 
+/// The most recent reason `ensureLocalAgentRunning` failed to actually
+/// launch the agent process (as opposed to it launching but never becoming
+/// healthy) — `null` while nothing has failed yet this run. The UI reads
+/// this to show something more actionable than a generic "can't reach the
+/// agent" when the underlying cause is known.
+String? lastAgentStartupError;
+
 typedef AgentHealthProbe = Future<bool> Function(Uri base);
 typedef AgentProcessStarter = Future<void> Function(
     String executable, List<String> arguments);
@@ -56,6 +63,34 @@ Future<bool> ensureLocalAgentRunning({
 
   if (!await agentExecutable.exists()) return false;
 
+  // This app isn't notarized (ad-hoc signed only), so a real user who
+  // downloaded it — as opposed to one built and run locally like this
+  // during development — gets it under Gatekeeper quarantine. Approving
+  // the *main* app to open (the one-time "cannot verify the developer,
+  // open anyway" flow) does not necessarily clear quarantine on bundled
+  // child executables it spawns itself, like this agent binary: Gatekeeper
+  // can still refuse to exec it, and Process.start then fails with no
+  // dialog or visible explanation at all — just a silent, permanent
+  // "can't reach the agent" from the app's point of view. Since the
+  // already-running, already-approved app is the one about to spawn it,
+  // clearing quarantine on its own bundled binary here is reasonable
+  // self-healing, not a security bypass of anything the user hasn't
+  // already approved by opening this app in the first place.
+  if (Platform.isMacOS) {
+    try {
+      await Process.run(
+          'xattr', ['-d', '-r', 'com.apple.quarantine', agentExecutable.path]);
+      final torDir = Directory('${agentExecutable.parent.path}/tor');
+      if (await torDir.exists()) {
+        await Process.run(
+            'xattr', ['-d', '-r', 'com.apple.quarantine', torDir.path]);
+      }
+    } on Object {
+      // Best-effort only — xattr missing, nothing to clear, or already
+      // clear are all fine; never block startup on this.
+    }
+  }
+
   // The health probe above failed, meaning either nothing is listening on
   // this port, or something is listening but not answering as our own
   // agent (a stuck/orphaned previous run — e.g. its shell was closed
@@ -82,7 +117,12 @@ Future<bool> ensureLocalAgentRunning({
         <String>['--port', '${agentBase.port}', '--no-open']);
   } catch (error, stackTrace) {
     // Keep the desktop UI available so it can report/retry an unavailable
-    // agent instead of crashing during application bootstrap.
+    // agent instead of crashing during application bootstrap. `print` alone
+    // is invisible to a real user (no attached console) — record it
+    // somewhere the UI can actually surface, since "process failed to
+    // start" and "process started but never became healthy" need
+    // different troubleshooting.
+    lastAgentStartupError = '$error';
     print('Failed to start agent: $error\n$stackTrace');
     return false;
   }

@@ -81,19 +81,30 @@ TARGET="$INSTALL_DIR/$APP_NAME"
 log "stopping any running instance"
 pkill -f "$APP_NAME/Contents/MacOS/" 2>/dev/null || true
 pkill -f localscale_desktop 2>/dev/null || true
-# A plain SIGTERM to localscaled does not run its normal shutdown path (no
-# signal handler is installed), so its bundled Tor child is left running
-# instead of being terminated. That orphaned Tor process keeps holding the
-# SOCKS/control ports and the onion service's data directory, so the next
-# localscaled this script installs can time out waiting for its own Tor to
-# become ready and get stuck retrying a peer connection forever. Clean up
-# any bundled Tor process left over from a prior install/run explicitly.
+# localscaled installs a SIGTERM/SIGINT handler that kills its own bundled
+# Tor child before exiting, but that handler lives in the binary this
+# script is about to replace — a plain pkill here still bypasses it (no
+# graceful signal delivery through pkill's default TERM is guaranteed to be
+# handled before the process is replaced on disk), so explicitly clean up
+# any bundled Tor process left over from a prior install/run too.
 pkill -f "$APP_NAME/Contents/Resources/tor/tor" 2>/dev/null || true
 sleep 1
 
 log "installing to $TARGET"
 rm -rf "$TARGET"
 cp -R "$BUILT_APP" "$TARGET"
+
+# De-registering the raw build-output app (above) only stops Spotlight/
+# Launchpad from *listing* it — it can still be opened directly (e.g. by
+# navigating to apps/desktop/build/ in Finder, or a stale Dock/recent-items
+# entry), and since it was never repackaged with the embedded agent/Tor
+# runtime, opening it produces a confusing "nothing connects" dead end that
+# looks identical to the real app. Now that its content is safely copied
+# into $TARGET, delete it outright so there is only ever one openable
+# LocalScale.app on this machine.
+rm -rf "$BUILT_APP"
+DEBUG_APP="$ROOT/apps/desktop/build/macos/Build/Products/Debug/localscale_desktop.app"
+rm -rf "$DEBUG_APP"
 
 # The virtual-network bridge (see spawn_tun_bridge in src/main.rs) opens a
 # `utun` control socket, which macOS only allows root to do — there is no

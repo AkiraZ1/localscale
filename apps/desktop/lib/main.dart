@@ -292,11 +292,16 @@ class _ControlPageState extends State<ControlPage> {
       if (!_lastRefreshFailed) {
         _lastRefreshFailed = true;
         _log('Falha ao ler o agente local: $error');
+        if (lastAgentStartupError != null) {
+          _log('Motivo provável: $lastAgentStartupError');
+        }
       }
       if (mounted) {
         setState(() {
           status = null;
-          message = 'Unable to read LocalScale agent: $error';
+          message = lastAgentStartupError != null
+              ? 'Não foi possível iniciar o serviço local: $lastAgentStartupError'
+              : 'Não foi possível conectar ao serviço local. Tentando novamente…';
         });
       }
     }
