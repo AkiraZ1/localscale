@@ -225,7 +225,7 @@ class _ControlPageState extends State<ControlPage> {
         setState(() {
           status = null;
           message = lastAgentStartupError != null
-              ? 'Não foi possível iniciar o serviço local: $lastAgentStartupError'
+              ? 'Não foi possível iniciar o serviço local. Tente reabrir o LocalScale.'
               : 'Não foi possível conectar ao serviço local. Tentando novamente…';
         });
       }
@@ -314,20 +314,23 @@ class _ControlPageState extends State<ControlPage> {
     _backendLogLinesSeen = lines.length;
   }
 
-  Future<void> _run(
-      Future<ServiceStatus> Function() action, String label) async {
+  Future<void> _run(Future<ServiceStatus> Function() action,
+      {required String inProgress,
+      required String done,
+      required String failed}) async {
     if (!mounted) return;
-    setState(() => message = '$label LocalScale…');
+    setState(() => message = inProgress);
     try {
       final value = await action();
       if (mounted) {
         setState(() {
           status = value;
-          message = '$label complete';
+          message = done;
         });
       }
     } catch (error) {
-      if (mounted) setState(() => message = '$label failed: $error');
+      _log('$failed: $error');
+      if (mounted) setState(() => message = failed);
     }
   }
 
@@ -344,9 +347,10 @@ class _ControlPageState extends State<ControlPage> {
         _refresh();
       }
     } catch (e) {
+      _log('Falha ao atualizar IP: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Falha ao atualizar IP: $e')),
+          const SnackBar(content: Text('Não foi possível atualizar o IP.')),
         );
       }
     }
@@ -390,7 +394,7 @@ class _ControlPageState extends State<ControlPage> {
         _pairingMessage('Convite criado. Copie e envie ao novo dispositivo.');
       }
     } catch (error) {
-      _pairingMessage('Não foi possível gerar o convite: $error');
+      _pairingError('Não foi possível gerar o convite', error);
     } finally {
       if (mounted) setState(() => _pairingBusy = false);
     }
@@ -447,7 +451,7 @@ class _ControlPageState extends State<ControlPage> {
       await ensureLocalAgentRestarted();
       if (mounted) _pairingMessage('Agente reiniciado com sucesso.');
     } catch (error) {
-      _pairingMessage('Falha ao importar convite: $error');
+      _pairingError('Não foi possível importar o convite', error);
     } finally {
       if (mounted) setState(() => _pairingBusy = false);
     }
@@ -462,7 +466,7 @@ class _ControlPageState extends State<ControlPage> {
       await ensureLocalAgentRestarted();
       if (mounted) _pairingMessage(success);
     } catch (error) {
-      _pairingMessage('Falha ao ativar convite: $error');
+      _pairingError('Não foi possível ativar o convite', error);
     } finally {
       if (mounted) setState(() => _pairingBusy = false);
     }
@@ -506,7 +510,7 @@ class _ControlPageState extends State<ControlPage> {
       await _refresh();
       _pairingMessage('Dispositivo removido. Pronto para novo pareamento.');
     } catch (error) {
-      _pairingMessage('Falha ao remover dispositivo: $error');
+      _pairingError('Não foi possível remover o dispositivo', error);
     } finally {
       if (mounted) setState(() => _pairingBusy = false);
     }
@@ -570,6 +574,20 @@ class _ControlPageState extends State<ControlPage> {
     _log(text);
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  /// Shows the user a plain-language message for a failed pairing action
+  /// while keeping the real exception (SocketException/OS errno/port
+  /// numbers and the like) only in the technical event log — the same
+  /// separation the rest of the app keeps between "how it works" and
+  /// implementation detail. `_pairingMessage` alone would put both in the
+  /// same snackbar the user sees.
+  void _pairingError(String action, Object error) {
+    _log('$action: $error');
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('$action. Verifique se o LocalScale está aberto e '
+            'tente novamente em alguns segundos.')));
   }
 
   @override
@@ -700,7 +718,10 @@ class _ControlPageState extends State<ControlPage> {
                         const SizedBox(height: 12),
                         Wrap(spacing: 12, runSpacing: 8, children: [
                           OutlinedButton.icon(
-                              onPressed: () => _run(widget.api.sync, 'Sync'),
+                              onPressed: () => _run(widget.api.sync,
+                                  inProgress: 'Sincronizando…',
+                                  done: 'Sincronização concluída.',
+                                  failed: 'Não foi possível sincronizar agora.'),
                               icon: const Icon(Icons.sync),
                               label: const Text('Sincronizar')),
                           if (current?.mode == LocalScaleMode.host)
@@ -879,7 +900,10 @@ class _ControlPageState extends State<ControlPage> {
       _selectedRole = mode;
       _wizardStep = _stepName;
     });
-    _run(() => widget.api.setMode(mode), 'Mode update');
+    _run(() => widget.api.setMode(mode),
+        inProgress: 'Atualizando modo…',
+        done: 'Modo atualizado.',
+        failed: 'Não foi possível atualizar o modo agora.');
   }
 
   Widget _pageName() {
@@ -1160,7 +1184,7 @@ class _ControlPageState extends State<ControlPage> {
       await _refresh();
       _pairingMessage('Dispositivo "$nodeId" removido.');
     } catch (error) {
-      _pairingMessage('Falha ao remover dispositivo: $error');
+      _pairingError('Não foi possível remover o dispositivo', error);
     } finally {
       if (mounted) setState(() => _pairingBusy = false);
     }
