@@ -2333,7 +2333,17 @@ fn generate_invitation(body: &str, state: &AgentState) -> String {
     let envelope = InvitationEnvelopeV1 {
         version: 1,
         invitation_id,
-        host_node_id: request.node_id,
+        // The Cliente authenticates the Host's handshake response against
+        // this exact node id (see `ClienteTransport::connect`'s
+        // `response_env.open(&self.key, Role::Host, &self.host_node_id)`),
+        // and `HostTransport` (main.rs) always seals that response using
+        // `local_device_id()` as its own transport identity — never the
+        // cosmetic display name the user typed in the wizard. Embedding
+        // that display name here instead used to make every handshake
+        // response fail AEAD verification (surfacing as
+        // `Crypto(AuthenticationFailed)`, retried forever) unless it
+        // happened to be identical to the stable device id by coincidence.
+        host_node_id: local_device_id().to_string(),
         onion_endpoint,
         invitation_secret: invitation_secret_raw,
         issued_at: now,
