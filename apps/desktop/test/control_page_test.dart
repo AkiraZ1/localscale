@@ -6,26 +6,28 @@ import 'package:localscale_desktop/local_agent_api.dart';
 import 'package:localscale_desktop/main.dart';
 
 void main() {
-  testWidgets('application starts directly on the control page',
+  testWidgets(
+      'application starts directly on the setup wizard, no login screen',
       (tester) async {
-    await tester.pumpWidget(
-        LocalScaleApp(api: LocalAgentApiClient(FakeLocalAgentTransport())));
+    await tester.pumpWidget(LocalScaleApp(
+        api: LocalAgentApiClient(
+            FakeLocalAgentTransport(includeRemotePeer: false))));
     await tester.pump();
-    expect(find.text('Control center'), findsOneWidget);
     expect(find.byKey(const Key('login-button')), findsNothing);
+    expect(find.text('Criar uma rede nova'), findsOneWidget);
   });
 
-  testWidgets('mode selection switches between Cliente and Host',
+  testWidgets('choosing a role sets the agent mode and advances the wizard',
       (tester) async {
-    final transport = FakeLocalAgentTransport();
+    final transport = FakeLocalAgentTransport(includeRemotePeer: false);
     await tester.pumpWidget(
         MaterialApp(home: ControlPage(api: LocalAgentApiClient(transport))));
     await tester.pump();
-    expect(find.text('Cliente'), findsOneWidget);
-    await tester.tap(find.text('Host'));
+    expect(find.text('Criar uma rede nova'), findsOneWidget);
+    await tester.tap(find.text('Criar uma rede nova'));
     await tester.pump();
     expect(transport.current.mode, LocalScaleMode.host);
-    expect(find.text('Host'), findsOneWidget);
+    expect(find.byKey(const Key('pairing-node-id')), findsOneWidget);
   });
 
   testWidgets('polling refreshes status while the page is mounted',
@@ -62,7 +64,7 @@ void main() {
     expect(find.text('Stopped'), findsOneWidget);
 
     api.failStatus = true;
-    await tester.tap(find.byTooltip('Refresh'));
+    await tester.tap(find.byTooltip('Atualizar'));
     await tester.pumpAndSettle();
 
     expect(
@@ -100,11 +102,17 @@ void main() {
       tester.view.resetPhysicalSize();
       tester.view.resetDevicePixelRatio();
     });
-    final api = ControlledApi();
+    final api = ControlledApi()..includeRemotePeer = false;
     await tester.pumpWidget(MaterialApp(home: ControlPage(api: api)));
     await tester.pump();
-    // Step 1 of the pairing wizard (name this computer) is prefilled from
-    // getDevices(), so it's already valid — advance straight to step 2.
+    // Role page first: this device is joining an existing network.
+    await tester.tap(find.text('Entrar em uma rede existente'));
+    await tester.pump();
+    // Name page: choosing a role clears the name field (it's a fresh setup
+    // decision each time), so it must be filled in before continuing.
+    await tester.enterText(
+        find.byKey(const Key('pairing-node-id')), 'cliente-test-node');
+    await tester.pump();
     await tester.ensureVisible(
         find.byKey(const Key('wizard-step-name-continue')).first);
     await tester
@@ -156,6 +164,7 @@ void main() {
       tester.view.resetDevicePixelRatio();
     });
     final api = ControlledApi()
+      ..includeRemotePeer = false
       ..nextStatus = const ServiceStatus(
           mode: LocalScaleMode.host,
           state: ServiceState.running,
@@ -163,8 +172,14 @@ void main() {
               'abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion');
     await tester.pumpWidget(MaterialApp(home: ControlPage(api: api)));
     await tester.pump();
-    // Step 1 of the pairing wizard (name this computer) is prefilled from
-    // getDevices(), so it's already valid — advance straight to step 2.
+    // Role page first: this device is creating the network.
+    await tester.tap(find.text('Criar uma rede nova'));
+    await tester.pump();
+    // Name page: choosing a role clears the name field (it's a fresh setup
+    // decision each time), so it must be filled in before continuing.
+    await tester.enterText(
+        find.byKey(const Key('pairing-node-id')), 'host-test-node');
+    await tester.pump();
     await tester
         .ensureVisible(find.byKey(const Key('wizard-step-name-continue')));
     await tester.tap(find.byKey(const Key('wizard-step-name-continue')));
@@ -196,6 +211,7 @@ class ControlledApi implements LocalAgentApi {
   int approveCalls = 0;
   int restartCalls = 0;
   int generateCalls = 0;
+  bool includeRemotePeer = true;
   ServiceStatus nextStatus = const ServiceStatus(
       mode: LocalScaleMode.cliente, state: ServiceState.stopped);
 
@@ -283,10 +299,10 @@ class ControlledApi implements LocalAgentApi {
 
   @override
   Future<NetworkDevicesResponse> getDevices() async =>
-      const NetworkDevicesResponse(
+      NetworkDevicesResponse(
         transport: 'Tor v3 Onion (Strict Isolation)',
         isolation: 'tor_only_no_lan',
-        localDevice: NetworkDevice(
+        localDevice: const NetworkDevice(
           nodeId: 'local-test',
           role: 'cliente',
           onionEndpoint: null,
@@ -294,16 +310,18 @@ class ControlledApi implements LocalAgentApi {
           status: 'active',
           isLocal: true,
         ),
-        remotePeers: [
-          NetworkDevice(
-            nodeId: 'remote-test',
-            role: 'host',
-            onionEndpoint: 'remote.onion',
-            virtualIp: '10.42.0.2',
-            status: 'connected',
-            isLocal: false,
-          ),
-        ],
+        remotePeers: includeRemotePeer
+            ? const [
+                NetworkDevice(
+                  nodeId: 'remote-test',
+                  role: 'host',
+                  onionEndpoint: 'remote.onion',
+                  virtualIp: '10.42.0.2',
+                  status: 'connected',
+                  isLocal: false,
+                ),
+              ]
+            : const [],
       );
 
   @override

@@ -8,5 +8,23 @@
 	<true/>
 	<key>com.apple.security.network.client</key>
 	<true/>
+	<!--
+	  This app is ad-hoc signed (no paid Apple Developer account / no
+	  notarization), and it spawns its own bundled localscaled binary — also
+	  ad-hoc signed, as a separate executable — as a child process. macOS's
+	  hardened runtime enforces "Library Validation" on any signed app by
+	  default: a signed process may only load/exec code signed by the same
+	  team identity (or Apple's). Every ad-hoc signature is its own unique,
+	  unrelated identity, so without this entitlement the kernel silently
+	  refuses to let this app exec its own bundled agent at all — no error
+	  surfaced to the app, just a permanent, otherwise-inexplicable
+	  "connection refused" (confirmed via the unified log: "amfid: ...not
+	  valid: The file is adhoc signed or signed by an unknown certificate
+	  chain"). Running the exact same binary directly from a shell works
+	  fine, because Terminal itself doesn't enforce Library Validation on
+	  its own children — which is what made this take a while to track down.
+	-->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
 </dict>
 </plist>
