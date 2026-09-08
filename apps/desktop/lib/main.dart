@@ -3,9 +3,6 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'core/browser_auth/browser_auth.dart';
-import 'core/browser_auth/browser_platform.dart';
-import 'features/auth/login_controller.dart';
 import 'local_agent_api.dart';
 import 'local_agent_transport.dart';
 import 'pairing_invitation.dart';
@@ -14,10 +11,6 @@ import 'test_pairing_bootstrap.dart';
 // Native agents keep their installed ports: macOS 18765, other platforms 8765.
 final int localAgentPort =
     defaultTargetPlatform == TargetPlatform.macOS ? 18765 : 8765;
-const String googleClientId = String.fromEnvironment(
-  'LOCALSCALE_GOOGLE_CLIENT_ID',
-  defaultValue: 'local-agent',
-);
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -48,67 +41,17 @@ Future<void> main() async {
       debugPrint('LocalScale test pairing bootstrap failed: $error');
     }
   }
-  final auth = LoginController(
-    oauth: BrowserOAuthClient(
-      request: OAuthAuthorizationRequest(
-        authorizationEndpoint: Uri(
-            scheme: 'http',
-            host: '127.0.0.1',
-            port: localAgentPort,
-            path: '/oauth/google/start'),
-        clientId: googleClientId,
-        redirectUri: Uri(
-            scheme: 'http',
-            host: '127.0.0.1',
-            port: localAgentPort,
-            path: '/oauth/google/callback'),
-        scopes: <String>['openid', 'email', 'profile'],
-      ),
-      browserLauncher: systemBrowserLauncher(),
-      callbackReceiver: loopbackCallbackReceiver(),
-      exchanger: localSessionBridge(
-          Uri(scheme: 'http', host: '127.0.0.1', port: localAgentPort)),
-    ),
-    storage: MemorySessionStorage(),
-  );
-  runApp(LocalScaleApp(api: api, auth: auth));
-}
-
-class MemorySessionStorage implements SecureSessionStorage {
-  SecureSession? _session;
-  @override
-  Future<SecureSession?> read() async => _session;
-  @override
-  Future<void> write(SecureSession session) async => _session = session;
-  @override
-  Future<void> clear() async => _session = null;
+  runApp(LocalScaleApp(api: api));
 }
 
 class LocalScaleApp extends StatefulWidget {
-  const LocalScaleApp({super.key, required this.api, this.auth});
+  const LocalScaleApp({super.key, required this.api});
   final LocalAgentApi api;
-  final LoginController? auth;
   @override
   State<LocalScaleApp> createState() => _LocalScaleAppState();
 }
 
 class _LocalScaleAppState extends State<LocalScaleApp> {
-  late final LoginController auth;
-  @override
-  void initState() {
-    super.initState();
-    auth = widget.auth ?? _unconfiguredAuth();
-    auth.restoreSession();
-  }
-
-  LoginController _unconfiguredAuth() => LoginController(
-      oauth: _UnavailableOAuth(), storage: MemorySessionStorage());
-  @override
-  void dispose() {
-    auth.dispose();
-    super.dispose();
-  }
-
   @override
   Widget build(BuildContext context) => MaterialApp(
         title: 'LocalScale',
@@ -128,62 +71,13 @@ class _LocalScaleAppState extends State<LocalScaleApp> {
           useMaterial3: true,
           scaffoldBackgroundColor: const Color(0xff0b0f19),
         ),
-        home: ControlPage(api: widget.api, onLogout: () async {}),
-      );
-}
-
-class _UnavailableOAuth implements BrowserOAuthClient {
-  @override
-  noSuchMethod(Invocation invocation) => throw const AuthException(
-      AuthErrorCode.exchangeFailed, 'Authentication is unavailable');
-}
-
-class LoginPage extends StatelessWidget {
-  const LoginPage({super.key, required this.controller});
-  final LoginController controller;
-  @override
-  Widget build(BuildContext context) => Scaffold(
-        body: Center(
-            child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 420),
-                child: Card(
-                  child: Padding(
-                      padding: const EdgeInsets.all(28),
-                      child: Column(mainAxisSize: MainAxisSize.min, children: [
-                        Text('LocalScale',
-                            style: Theme.of(context).textTheme.headlineMedium),
-                        const SizedBox(height: 12),
-                        const Text('Sign in to manage this local agent.'),
-                        const SizedBox(height: 24),
-                        FilledButton.icon(
-                            key: const Key('login-button'),
-                            onPressed: controller.model.canLogin
-                                ? controller.login
-                                : null,
-                            icon: const Icon(Icons.login),
-                            label: Text(
-                                controller.model.state == AuthState.authorizing
-                                    ? 'Opening browser…'
-                                    : 'Sign in with Google')),
-                        if (controller.model.error != null) ...[
-                          const SizedBox(height: 16),
-                          Text(controller.model.error!.message,
-                              key: const Key('auth-error'))
-                        ],
-                        if (kIsWeb) ...[
-                          const SizedBox(height: 16),
-                          const Text(
-                              'Desktop sign-in is required; Web authentication is disabled.')
-                        ],
-                      ])),
-                ))),
+        home: ControlPage(api: widget.api),
       );
 }
 
 class ControlPage extends StatefulWidget {
-  const ControlPage({super.key, required this.api, this.onLogout});
+  const ControlPage({super.key, required this.api});
   final LocalAgentApi api;
-  final Future<void> Function()? onLogout;
   @override
   State<ControlPage> createState() => _ControlPageState();
 }
@@ -698,11 +592,6 @@ class _ControlPageState extends State<ControlPage> {
             onPressed: _refresh,
             icon: const Icon(Icons.refresh),
             tooltip: 'Atualizar'),
-        if (widget.onLogout != null)
-          IconButton(
-              onPressed: widget.onLogout,
-              icon: const Icon(Icons.logout),
-              tooltip: 'Sair'),
       ]),
       body: Center(
           child: ConstrainedBox(
@@ -1156,7 +1045,7 @@ class _ControlPageState extends State<ControlPage> {
       ],
       const SizedBox(height: 16),
       const Text(
-        'A conta Google autoriza somente o painel local. O convite é a credencial de pareamento; não é sincronizado pelo Google e deve permanecer privado.',
+        'O convite é a credencial de pareamento — mantenha-o privado e envie apenas pelo canal que você confia.',
         style: TextStyle(fontSize: 12, color: Colors.grey),
       ),
     ]);
