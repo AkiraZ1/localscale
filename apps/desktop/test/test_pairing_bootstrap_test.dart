@@ -209,5 +209,7 @@ class _RecordingApi implements LocalAgentApi {
   @override
   Future<PeerStatus> resetPeer() => throw UnimplementedError();
   @override
+  Future<void> removeHostPeer(String nodeId) => throw UnimplementedError();
+  @override
   Future<String> backendLogTail() => throw UnimplementedError();
 }

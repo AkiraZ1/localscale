@@ -94,6 +94,99 @@ void main() {
     expect(find.text('ESTE COMPUTADOR'), findsOneWidget);
   });
 
+  testWidgets(
+      'dashboard lets a Host add another device without restarting existing peers',
+      (tester) async {
+    tester.view.physicalSize = const Size(1200, 1800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final api = ControlledApi()
+      ..nextStatus = const ServiceStatus(
+          mode: LocalScaleMode.host, state: ServiceState.running);
+    await tester.pumpWidget(MaterialApp(home: ControlPage(api: api)));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+
+    expect(find.text('Sua Rede & Dispositivos'), findsOneWidget);
+    expect(find.byKey(const Key('add-device')), findsOneWidget);
+
+    await tester.ensureVisible(find.byKey(const Key('add-device')));
+    await tester.tap(find.byKey(const Key('add-device')));
+    await tester.pump();
+
+    // Back in the wizard at the invitation step, not the dashboard, and a
+    // "Cancelar" escape hatch back to the dashboard is visible.
+    expect(find.byKey(const Key('generate-invitation')), findsOneWidget);
+    expect(find.byKey(const Key('wizard-cancel-to-dashboard')), findsOneWidget);
+
+    await tester.ensureVisible(find.byKey(const Key('generate-invitation')));
+    await tester.tap(find.byKey(const Key('generate-invitation')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+
+    // Adding a device while already paired must NOT trigger the
+    // first-time-setup restart, or every other connected Cliente would be
+    // disconnected for no reason.
+    expect(api.generateCalls, 1);
+    expect(api.restartCalls, 0);
+
+    await tester.tap(find.byKey(const Key('wizard-cancel-to-dashboard')));
+    await tester.pump();
+    expect(find.text('Sua Rede & Dispositivos'), findsOneWidget);
+  });
+
+  testWidgets('dashboard "Mudar modo" re-enters the wizard at the role step',
+      (tester) async {
+    tester.view.physicalSize = const Size(1200, 1800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final api = ControlledApi();
+    await tester.pumpWidget(MaterialApp(home: ControlPage(api: api)));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+
+    await tester.ensureVisible(find.byKey(const Key('change-mode')));
+    await tester.tap(find.byKey(const Key('change-mode')));
+    await tester.pump();
+
+    expect(find.text('Criar uma rede nova'), findsOneWidget);
+    expect(find.byKey(const Key('wizard-cancel-to-dashboard')), findsOneWidget);
+  });
+
+  testWidgets('Host can remove one specific connected device',
+      (tester) async {
+    tester.view.physicalSize = const Size(1200, 1800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    final api = ControlledApi()
+      ..nextStatus = const ServiceStatus(
+          mode: LocalScaleMode.host, state: ServiceState.running);
+    await tester.pumpWidget(MaterialApp(home: ControlPage(api: api)));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+
+    await tester.ensureVisible(find.byKey(const Key('remove-device-tile')));
+    await tester.tap(find.byKey(const Key('remove-device-tile')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Remover'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 50));
+
+    expect(api.removedHostPeerNodeIds, ['remote-test']);
+    // A Host removing one device must use the multi-peer endpoint, never
+    // the Cliente-only single-pairing reset.
+    expect(api.resetCalls, 0);
+  });
+
   testWidgets('client reviews invitation before agent import and restart',
       (tester) async {
     tester.view.physicalSize = const Size(1200, 1800);
@@ -337,6 +430,13 @@ class ControlledApi implements LocalAgentApi {
         transport: 'unavailable',
         connected: false,
         approved: false));
+  }
+
+  final List<String> removedHostPeerNodeIds = [];
+
+  @override
+  Future<void> removeHostPeer(String nodeId) async {
+    removedHostPeerNodeIds.add(nodeId);
   }
 
   @override

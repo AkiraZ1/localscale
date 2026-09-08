@@ -222,10 +222,27 @@ impl From<ValidationError> for TransportError {
 pub struct AuthenticatedStream {
     stream: TcpStream,
     peer_node_id: String,
+    // Which pending-invitation candidate (see `HostKeyResolver`) actually
+    // matched this handshake, if the resolver offered more than one and
+    // tagged them — `None` for a plain single-key transport, or a
+    // multi-peer host whose connecting client had already been bound to a
+    // specific key on some earlier handshake (so there was only the one
+    // exact-match candidate to try, carrying no separate tag).
+    matched_key_tag: Option<String>,
 }
 impl AuthenticatedStream {
     pub fn peer_node_id(&self) -> &str {
         &self.peer_node_id
+    }
+
+    /// The identifier of the pending invitation this handshake's key
+    /// belonged to, if the caller's `HostKeyResolver` tagged it as such —
+    /// the caller uses this once, right after a successful `accept()`, to
+    /// permanently bind that invitation's registry entry to
+    /// `peer_node_id()` so future reconnects from the same device look it
+    /// up directly instead of trying every still-pending candidate again.
+    pub fn matched_key_tag(&self) -> Option<&str> {
+        self.matched_key_tag.as_deref()
     }
     /// Checks whether the authenticated TCP session is still open without consuming
     /// protocol bytes. A pending frame also counts as a live connection.
@@ -456,6 +473,7 @@ impl AuthenticatedStream {
         let AuthenticatedStream {
             stream,
             peer_node_id,
+            matched_key_tag: _,
         } = self;
         let writer_handle = stream
             .try_clone()
@@ -535,9 +553,37 @@ fn parse_heartbeat(
 }
 
 /// Host-side transport with an explicit caller-owned nonce allocator.
+/// Supplies candidate decryption keys for an incoming handshake, given the
+/// (not-yet-authenticated) client node id peeked from the envelope header.
+/// Exists so a single `HostTransport` can accept connections from more than
+/// one paired Cliente, each with its own one-time invitation secret, without
+/// weakening that per-device secret into one shared "network password":
+/// every candidate is tried in turn against the *same* envelope via
+/// [`HandshakeEnvelope::open`] (a pure, side-effect-free check — wrong keys
+/// just fail the AEAD tag, exactly like a wrong password), and only one
+/// (the one that was actually issued to whoever is really connecting) can
+/// ever succeed.
+///
+/// A single-key `HostTransport` (the original, still-supported shape) is
+/// just the degenerate case of one candidate that never changes, which is
+/// why `CryptoKey` itself implements this trait below.
+pub trait HostKeyResolver: Send {
+    /// Returns candidate keys to try, each tagged with an identifier the
+    /// caller can use to learn afterward *which* candidate matched (e.g. a
+    /// pending invitation's id) — `AuthenticatedStream::matched_key_tag()`
+    /// surfaces whichever tag's key actually opened the envelope.
+    fn candidates(&self, claimed_node_id: &str) -> Vec<(String, CryptoKey)>;
+}
+
+impl HostKeyResolver for CryptoKey {
+    fn candidates(&self, _claimed_node_id: &str) -> Vec<(String, CryptoKey)> {
+        vec![(String::new(), self.clone_for_resolver())]
+    }
+}
+
 pub struct HostTransport {
     listener: TcpListener,
-    key: CryptoKey,
+    resolver: Box<dyn HostKeyResolver>,
     node_id: String,
     timeout: Duration,
     replay: ReplayGuard,
@@ -547,16 +593,16 @@ pub struct HostTransport {
 impl HostTransport {
     pub fn bind(
         addr: SocketAddr,
-        key: CryptoKey,
+        resolver: impl HostKeyResolver + 'static,
         node_id: impl Into<String>,
         allocator: Box<dyn NonceAllocator + Send>,
     ) -> Result<Self, TransportError> {
-        Self::bind_with_timeout(addr, key, node_id, DEFAULT_TIMEOUT, allocator)
+        Self::bind_with_timeout(addr, resolver, node_id, DEFAULT_TIMEOUT, allocator)
     }
 
     pub fn bind_with_timeout(
         addr: SocketAddr,
-        key: CryptoKey,
+        resolver: impl HostKeyResolver + 'static,
         node_id: impl Into<String>,
         timeout: Duration,
         allocator: Box<dyn NonceAllocator + Send>,
@@ -567,7 +613,7 @@ impl HostTransport {
         }
         Ok(Self {
             listener: TcpListener::bind(addr)?,
-            key,
+            resolver: Box::new(resolver),
             node_id,
             timeout,
             replay: ReplayGuard::default(),
@@ -596,9 +642,9 @@ impl HostTransport {
         set_deadline(&stream, self.timeout)?;
         let envelope_bytes = read_frame(&mut stream)?;
         let envelope = HandshakeEnvelope::from_bytes(&envelope_bytes)?;
-        let parsed = envelope
-            .open(&self.key, Role::Cliente, "cliente")
-            .or_else(|_| find_and_open_client(&envelope, &self.key, &envelope_bytes))?;
+        let claimed_id = peek_client_id(&envelope_bytes)?;
+        let (parsed, matched_key, matched_tag) =
+            open_with_candidates(&envelope, self.resolver.candidates(claimed_id), claimed_id)?;
         let init = localscale_agent_protocol::parse_message(&parsed)?;
         let (client_id, _timestamp, nonce_text) = match &init {
             Message::HandshakeInit {
@@ -622,7 +668,7 @@ impl HostTransport {
             nonce: nonce_text.clone(),
         };
         let sealed = HandshakeEnvelope::seal_with_allocator(
-            &self.key,
+            &matched_key,
             Role::Host,
             &self.node_id,
             self.allocator.as_mut(),
@@ -632,16 +678,16 @@ impl HostTransport {
         Ok(AuthenticatedStream {
             stream,
             peer_node_id: client_id.clone(),
+            matched_key_tag: matched_tag,
         })
     }
 }
 
-// The envelope authenticates the node id, so inspect its stable header only to obtain it.
-fn find_and_open_client(
-    envelope: &HandshakeEnvelope,
-    key: &CryptoKey,
-    bytes: &[u8],
-) -> Result<Vec<u8>, TransportError> {
+/// The envelope authenticates the node id, so peeking its stable header
+/// (before any decryption) only reveals what the connecting client is
+/// *claiming* — resolving which key (if any) actually vouches for that
+/// claim happens afterward in `open_with_candidates`.
+fn peek_client_id(bytes: &[u8]) -> Result<&str, TransportError> {
     if bytes.len() < 7 {
         return Err(TransportError::Protocol("malformed client envelope"));
     }
@@ -649,9 +695,25 @@ fn find_and_open_client(
     if 7 + n > bytes.len() {
         return Err(TransportError::Protocol("malformed client envelope"));
     }
-    let id = std::str::from_utf8(&bytes[7..7 + n])
-        .map_err(|_| TransportError::Protocol("invalid client node id"))?;
-    Ok(envelope.open(key, Role::Cliente, id)?)
+    std::str::from_utf8(&bytes[7..7 + n])
+        .map_err(|_| TransportError::Protocol("invalid client node id"))
+}
+
+/// Tries every candidate key in order, returning the first one whose AEAD
+/// tag actually verifies (never any partial/oracle information for the
+/// ones that don't — `open` either fully succeeds or fails uniformly).
+fn open_with_candidates(
+    envelope: &HandshakeEnvelope,
+    candidates: Vec<(String, CryptoKey)>,
+    claimed_id: &str,
+) -> Result<(Vec<u8>, CryptoKey, Option<String>), TransportError> {
+    for (tag, key) in candidates {
+        if let Ok(plaintext) = envelope.open(&key, Role::Cliente, claimed_id) {
+            let tag = if tag.is_empty() { None } else { Some(tag) };
+            return Ok((plaintext, key, tag));
+        }
+    }
+    Err(TransportError::Crypto(CryptoError::AuthenticationFailed))
 }
 
 /// Cliente-side transport with an explicit caller-owned nonce allocator.
@@ -732,6 +794,7 @@ impl ClienteTransport {
             } if node_id == self.host_node_id && echoed == hex(&nonce) => Ok(AuthenticatedStream {
                 stream,
                 peer_node_id: node_id,
+                matched_key_tag: None,
             }),
             _ => Err(TransportError::Protocol("invalid handshake response")),
         }

@@ -184,6 +184,11 @@ abstract interface class LocalAgentApi {
   /// Clears the persisted peer record so a fresh pairing can be performed.
   Future<PeerStatus> resetPeer();
 
+  /// Host-only: removes one specific Cliente from the multi-peer registry
+  /// (by `node_id`), freeing its virtual IP for reuse — unlike [resetPeer],
+  /// which clears the Cliente's own single Host pairing.
+  Future<void> removeHostPeer(String nodeId);
+
   /// Persists an invitation-derived peer configuration without approving it.
   ///
   /// Approval is deliberately a separate local-agent action: callers must not
@@ -315,6 +320,12 @@ class LocalAgentApiClient implements LocalAgentApi {
   @override
   Future<PeerStatus> resetPeer() =>
       _parsePeer(transport.post('/api/v1/peer/reset'));
+
+  @override
+  Future<void> removeHostPeer(String nodeId) async {
+    await transport
+        .post('/api/v1/peer/remove', body: {'node_id': nodeId});
+  }
 
   @override
   Future<PeerStatus> setPeerConfig({

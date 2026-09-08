@@ -12,7 +12,10 @@ use std::sync::{
     Arc, Mutex,
 };
 
+pub mod host_registry;
 pub mod tor_runtime;
+
+pub use host_registry::{HostPeerEntry, HostPeerRegistry, LocalVirtualIpStore};
 
 pub trait AuthHandler: Send {
     fn handle(&mut self, request: AuthRequest) -> AuthResponse;
@@ -646,6 +649,17 @@ struct AgentState {
     peer_transport_status: PeerTransportStatus,
     peer_transport_restart_required: Arc<AtomicBool>,
     runtime_restart: RuntimeRestart,
+    // Host role only — an arbitrary number of invited/paired Clientes (see
+    // `host_registry` module docs). `None` when this device has never run
+    // as Host (or in tests that don't exercise multi-peer pairing).
+    host_registry: Option<Arc<Mutex<HostPeerRegistry>>>,
+    host_local_virtual_ip: Option<Arc<Mutex<LocalVirtualIpStore>>>,
+    // Live (never persisted) per-Cliente connection status, keyed by node
+    // id — one `PeerTransportStatus` per currently-or-previously-connected
+    // device this process has seen since it started, so `devices_status()`
+    // can report "offline" (last seen, but not currently connected)
+    // instead of a device silently vanishing from the list.
+    host_peer_live: Arc<Mutex<std::collections::HashMap<String, PeerTransportStatus>>>,
 }
 
 /// Coordinates a process restart without letting an HTTP request handler call
@@ -1215,6 +1229,27 @@ impl Default for AgentState {
             peer_transport_status: PeerTransportStatus::default(),
             peer_transport_restart_required: Arc::new(AtomicBool::new(false)),
             runtime_restart: RuntimeRestart::default(),
+            host_registry: HostPeerRegistry::open(std::env::temp_dir().join(format!(
+                    "localscale-host-registry-{}-{}.json",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                )))
+            .ok()
+            .map(|r| Arc::new(Mutex::new(r))),
+            host_local_virtual_ip: LocalVirtualIpStore::open(std::env::temp_dir().join(format!(
+                    "localscale-host-local-ip-{}-{}.txt",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                )))
+            .ok()
+            .map(|s| Arc::new(Mutex::new(s))),
+            host_peer_live: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -1239,7 +1274,27 @@ pub fn serve_with_peer_transport(
     gate: Arc<AtomicBool>,
     status: PeerTransportStatus,
 ) -> std::io::Result<()> {
-    serve_with_auth_handler_and_status(listener, None, Some(gate), Some(status))
+    serve_with_auth_handler_and_status(listener, None, Some(gate), Some(status), None)
+}
+
+/// Same as `serve_with_peer_transport` (no auth handler configured), plus
+/// the Host-role multi-peer state — see
+/// `serve_with_auth_and_peer_transport_and_host_registry`.
+pub fn serve_with_peer_transport_and_host_registry(
+    listener: TcpListener,
+    gate: Arc<AtomicBool>,
+    status: PeerTransportStatus,
+    host_registry: Arc<Mutex<HostPeerRegistry>>,
+    host_local_virtual_ip: Arc<Mutex<LocalVirtualIpStore>>,
+    host_peer_live: Arc<Mutex<std::collections::HashMap<String, PeerTransportStatus>>>,
+) -> std::io::Result<()> {
+    serve_with_auth_handler_and_status(
+        listener,
+        None,
+        Some(gate),
+        Some(status),
+        Some((host_registry, host_local_virtual_ip, host_peer_live)),
+    )
 }
 
 pub fn serve_with_auth_and_peer_transport_gate(
@@ -1261,6 +1316,33 @@ pub fn serve_with_auth_and_peer_transport(
         Some(Arc::new(Mutex::new(auth))),
         Some(gate),
         Some(status),
+        None,
+    )
+}
+
+/// Same as `serve_with_auth_and_peer_transport`, plus the Host-role
+/// multi-peer state — shared with `start_peer_transport`'s accept loop
+/// (spawned earlier in the *same* process/`main()`, not a separate one)
+/// so a device this HTTP API just invited or removed is immediately
+/// visible to the next handshake attempt, and a connection that loop just
+/// accepted is immediately visible to `devices_status()` — no restart
+/// needed for either direction, unlike the legacy single-peer Cliente
+/// role's file-based `PeerStore` handoff (see `mark_peer_changed`).
+pub fn serve_with_auth_and_peer_transport_and_host_registry(
+    listener: TcpListener,
+    auth: Box<dyn AuthHandler>,
+    gate: Arc<AtomicBool>,
+    status: PeerTransportStatus,
+    host_registry: Arc<Mutex<HostPeerRegistry>>,
+    host_local_virtual_ip: Arc<Mutex<LocalVirtualIpStore>>,
+    host_peer_live: Arc<Mutex<std::collections::HashMap<String, PeerTransportStatus>>>,
+) -> std::io::Result<()> {
+    serve_with_auth_handler_and_status(
+        listener,
+        Some(Arc::new(Mutex::new(auth))),
+        Some(gate),
+        Some(status),
+        Some((host_registry, host_local_virtual_ip, host_peer_live)),
     )
 }
 
@@ -1269,14 +1351,20 @@ fn serve_with_auth_handler(
     auth: Option<SharedAuth>,
     gate: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<()> {
-    serve_with_auth_handler_and_status(listener, auth, gate, None)
+    serve_with_auth_handler_and_status(listener, auth, gate, None, None)
 }
 
+#[allow(clippy::type_complexity)]
 fn serve_with_auth_handler_and_status(
     listener: TcpListener,
     auth: Option<SharedAuth>,
     gate: Option<Arc<AtomicBool>>,
     status: Option<PeerTransportStatus>,
+    host_shared: Option<(
+        Arc<Mutex<HostPeerRegistry>>,
+        Arc<Mutex<LocalVirtualIpStore>>,
+        Arc<Mutex<std::collections::HashMap<String, PeerTransportStatus>>>,
+    )>,
 ) -> std::io::Result<()> {
     let peer_store = match std::env::var_os("LOCALSCALE_PEER_STORE") {
         Some(path) => {
@@ -1297,12 +1385,41 @@ fn serve_with_auth_handler_and_status(
                 .map(|path| PathBuf::from(path).with_file_name("selected-role"))
         });
     let role_store = role_path.and_then(|path| RoleStore::open(path).ok());
+    // Sibling files next to the peer store's own path, same pattern as
+    // `role_path` above — so a real (non-ephemeral) `LOCALSCALE_PEER_STORE`
+    // gives the Host registry and its own virtual IP a real, persistent
+    // home too, instead of falling back to `AgentState::default()`'s
+    // per-process temp files (fine for tests, wrong for a real daemon).
+    let host_registry_path = std::env::var_os("LOCALSCALE_PEER_STORE")
+        .map(|path| PathBuf::from(path).with_file_name("host-peers.json"));
+    let host_local_virtual_ip_path = std::env::var_os("LOCALSCALE_PEER_STORE")
+        .map(|path| PathBuf::from(path).with_file_name("host-local-virtual-ip"));
     let state = AgentState {
         auth,
         peer_store: peer_store.map(|s| Arc::new(Mutex::new(s))),
         role_store: role_store.map(|s| Arc::new(Mutex::new(s))),
         peer_transport_enabled: gate.unwrap_or_else(|| Arc::new(AtomicBool::new(true))),
         peer_transport_status: status.unwrap_or_default(),
+        host_registry: host_shared
+            .as_ref()
+            .map(|(registry, _, _)| registry.clone())
+            .or_else(|| {
+                host_registry_path
+                    .and_then(|path| HostPeerRegistry::open(path).ok())
+                    .map(|r| Arc::new(Mutex::new(r)))
+            }),
+        host_local_virtual_ip: host_shared
+            .as_ref()
+            .map(|(_, local_ip, _)| local_ip.clone())
+            .or_else(|| {
+                host_local_virtual_ip_path
+                    .and_then(|path| LocalVirtualIpStore::open(path).ok())
+                    .map(|s| Arc::new(Mutex::new(s)))
+            }),
+        host_peer_live: host_shared
+            .as_ref()
+            .map(|(_, _, live)| live.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(std::collections::HashMap::new()))),
         ..AgentState::default()
     };
     if let Some(store) = &state.role_store {
@@ -1623,6 +1740,7 @@ fn response_for_request_with_state(request: &str, state: &AgentState) -> String 
         ("POST", "/api/v1/peer/approve") => set_peer_approval(true, state),
         ("POST", "/api/v1/peer/revoke") => set_peer_approval(false, state),
         ("POST", "/api/v1/peer/reset") => reset_peer(state),
+        ("POST", "/api/v1/peer/remove") => remove_host_peer(body, state),
         ("POST", "/api/v1/peer/virtual-ip") => set_virtual_ip_handler(body, state),
         ("POST", "/api/v1/runtime/restart") => request_runtime_restart(state),
         ("GET", "/api/v1/devices") => devices_status(state),
@@ -1846,7 +1964,7 @@ fn load_or_create_local_device_id() -> String {
     node_id
 }
 
-fn local_device_id() -> &'static str {
+pub fn local_device_id() -> &'static str {
     LOCAL_DEVICE_ID.get_or_init(load_or_create_local_device_id)
 }
 
@@ -2040,24 +2158,65 @@ fn devices_status(state: &AgentState) -> String {
         json_string(local_node_id), json_string(&mode), json_string(local_onion), json_string(local_ip)
     );
 
-    let mut peers_json = String::new();
-    if peer.configured {
-        let peer_role = if mode == "host" { "cliente" } else { "host" };
+    // Host: every invited/paired Cliente from the registry, each merged
+    // with its own live connection state — a device that connected before
+    // but isn't right now reports "offline" instead of disappearing from
+    // the list (the bug this replaced), and one nobody has connected with
+    // yet reports "pending".
+    //
+    // Cliente: unchanged single-peer behavior (a Cliente only ever has one
+    // Host to report).
+    let remote_peers = if mode == "host" {
+        let entries: Vec<HostPeerEntry> = state
+            .host_registry
+            .as_ref()
+            .map(|registry| lock_recover(registry).entries().to_vec())
+            .unwrap_or_default();
+        let live = state.host_peer_live.clone();
+        let peer_jsons: Vec<String> = entries
+            .iter()
+            .filter(|entry| !entry.revoked)
+            .map(|entry| {
+                let live_status = entry
+                    .node_id
+                    .as_deref()
+                    .and_then(|node_id| lock_recover(&live).get(node_id).cloned());
+                let connected = live_status
+                    .as_ref()
+                    .map(PeerTransportStatus::is_connected)
+                    .unwrap_or(false);
+                let remote_id = entry.node_id.clone().unwrap_or_else(|| {
+                    format!(
+                        "convite-pendente-{}",
+                        &entry.invitation_id[..8.min(entry.invitation_id.len())]
+                    )
+                });
+                let status = if connected {
+                    "connected"
+                } else if entry.node_id.is_none() {
+                    "pending"
+                } else {
+                    "offline"
+                };
+                format!(
+                    r#"{{"node_id":{},"role":"cliente","onion_endpoint":"","virtual_ip":{},"status":{},"approved":true,"revoked":false}}"#,
+                    json_string(&remote_id),
+                    json_string(&entry.virtual_ip),
+                    json_string(status),
+                )
+            })
+            .collect();
+        format!("[{}]", peer_jsons.join(","))
+    } else if peer.configured {
         // Prefer the node id actually learned from a completed, authenticated
-        // handshake (Host side only: `peer.host_node_id` is never populated
-        // for the Host role, see `validate_approved_peer_record`). Falling
-        // back to `peer.host_node_id` keeps Cliente-side behavior unchanged.
+        // handshake. Falling back to `peer.host_node_id` (always populated
+        // for the Cliente role) keeps this working before the first
+        // handshake ever completes.
         let handshake_remote_id = state.peer_transport_status.remote_node_id();
         let remote_id = handshake_remote_id
             .as_deref()
             .or(peer.host_node_id.as_deref())
-            .unwrap_or_else(|| {
-                if mode == "host" {
-                    "remote-client"
-                } else {
-                    "remote-host"
-                }
-            });
+            .unwrap_or("remote-host");
         // The peer's real virtual IP, learned from its own heartbeat (see
         // `PeerTransportStatus::remote_virtual_ip`) — this used to guess by
         // swapping the last octet between .1 and .2 (or hardcoding
@@ -2083,22 +2242,17 @@ fn devices_status(state: &AgentState) -> String {
         } else {
             state.peer_transport_status.label()
         };
-        peers_json = format!(
-            r#"{{"node_id":{},"role":{},"onion_endpoint":{},"virtual_ip":{},"status":{},"approved":{},"revoked":{}}}"#,
+        format!(
+            r#"[{{"node_id":{},"role":"host","onion_endpoint":{},"virtual_ip":{},"status":{},"approved":{},"revoked":{}}}]"#,
             json_string(remote_id),
-            json_string(peer_role),
             json_string(remote_onion),
             json_string(&remote_ip),
             json_string(status),
             peer.approved,
             peer.revoked
-        );
-    }
-
-    let remote_peers = if peers_json.is_empty() {
-        "[]".to_string()
+        )
     } else {
-        format!("[{}]", peers_json)
+        "[]".to_string()
     };
 
     http_response(
@@ -2277,6 +2431,66 @@ fn reset_peer(state: &AgentState) -> String {
     peer_status(state)
 }
 
+/// Network prefix ("a.b.c" of "a.b.c.d") every virtual IP on this Host's
+/// side of the mesh is drawn from — the Host itself always gets `.1`;
+/// `HostPeerRegistry::next_free_virtual_ip` hands out `.2..254` to each
+/// Cliente in the order it's invited. Derived from whatever the Host's own
+/// address already is if one was configured (so an existing deployment
+/// isn't silently renumbered), defaulting to `10.0.0` otherwise.
+fn host_network_prefix(state: &AgentState) -> String {
+    let existing = state
+        .host_local_virtual_ip
+        .as_ref()
+        .and_then(|store| lock_recover(store).get().map(str::to_string));
+    if let Some(existing) = existing {
+        if let Some((prefix, _)) = existing.rsplit_once('.') {
+            return prefix.to_string();
+        }
+    }
+    "10.0.0".to_string()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoveHostPeerRequest {
+    node_id: String,
+}
+
+/// Removes one specific device from a Host's registry — the multi-peer
+/// counterpart to `reset_peer` (which clears the Cliente role's single
+/// Host pairing entirely). Frees that device's virtual IP for reuse by
+/// the next invitation and, if it's currently connected, its live status
+/// entry so it stops being reported at all rather than lingering as
+/// "offline" for a device the user explicitly removed.
+fn remove_host_peer(body: &str, state: &AgentState) -> String {
+    let request: RemoveHostPeerRequest = match serde_json::from_str(body) {
+        Ok(request) => request,
+        Err(_) => {
+            return http_response(
+                "400 Bad Request",
+                "application/json",
+                r#"{"error":"invalid_request"}"#,
+            )
+        }
+    };
+    let Some(registry) = &state.host_registry else {
+        return http_response(
+            "503 Service Unavailable",
+            "application/json",
+            r#"{"error":"peer_store_unavailable"}"#,
+        );
+    };
+    if lock_recover(registry).remove(&request.node_id).is_err() {
+        return http_response(
+            "500 Internal Server Error",
+            "application/json",
+            r#"{"error":"peer_store_remove_failed"}"#,
+        );
+    }
+    lock_recover(&state.host_peer_live).remove(&request.node_id);
+    http_response("200 OK", "application/json", r#"{"removed":true}"#)
+}
+
 fn generate_invitation(body: &str, state: &AgentState) -> String {
     let request: GenerateInvitationRequest = match serde_json::from_str(body) {
         Ok(request) => request,
@@ -2288,6 +2502,9 @@ fn generate_invitation(body: &str, state: &AgentState) -> String {
     let Some(onion_endpoint) = detect_local_onion_endpoint() else {
         return invitation_error("409 Conflict", "onion_endpoint_not_ready");
     };
+    let Some(registry) = &state.host_registry else {
+        return invitation_error("503 Service Unavailable", "peer_store_unavailable");
+    };
     let now = match unix_time_secs() {
         Ok(now) => now,
         Err(_) => return invitation_error("500 Internal Server Error", "clock_unavailable"),
@@ -2296,23 +2513,64 @@ fn generate_invitation(body: &str, state: &AgentState) -> String {
         Ok(value) => value,
         Err(_) => return invitation_error("500 Internal Server Error", "randomness_unavailable"),
     };
-    let invitation_secret = match random_base64(32) {
+    let invitation_secret_raw = match random_base64(32) {
         Ok(value) => value,
         Err(_) => return invitation_error("500 Internal Server Error", "randomness_unavailable"),
     };
-    if HostInvitation::new(&request.node_id, &onion_endpoint, &invitation_secret).is_err() {
+    if HostInvitation::new(&request.node_id, &onion_endpoint, &invitation_secret_raw).is_err() {
         return invitation_error("400 Bad Request", "invalid_invitation_request");
     }
     let expires_at = match now.checked_add(request.ttl_seconds) {
         Some(value) => value,
         None => return invitation_error("400 Bad Request", "invalid_invitation_ttl"),
     };
+
+    // The Host's own address is assigned once, the first time it ever
+    // generates an invitation (`.1` in its network prefix) — every
+    // subsequently invited Cliente draws a *different* free address from
+    // the same registry (see `HostPeerRegistry::next_free_virtual_ip`), so
+    // two devices can never end up sharing one.
+    let network_prefix = host_network_prefix(state);
+    if let Some(local_ip_store) = &state.host_local_virtual_ip {
+        let mut local_ip_store = lock_recover(local_ip_store);
+        if local_ip_store.get().is_none() {
+            let own_ip = request
+                .virtual_ip
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("{network_prefix}.1"));
+            if local_ip_store.set(&own_ip).is_ok() {
+                state.peer_transport_status.set_local_virtual_ip(own_ip.clone());
+                let mut peer = lock_recover(&state.peer);
+                peer.virtual_ip = Some(own_ip);
+            }
+        }
+    }
+    // The device's own display name (what the wizard's "name this
+    // computer" step collected) — purely local bookkeeping now, since a
+    // Host's remote-peer identities live in the registry instead of the
+    // legacy singular `peer` record.
+    {
+        let mut peer = lock_recover(&state.peer);
+        peer.configured = true;
+        peer.node_id = Some(request.node_id.clone());
+    }
+
+    let assigned_ip = lock_recover(registry).next_free_virtual_ip(&network_prefix);
+    let invitation_secret = stored_transport_key_from_invitation_secret(&invitation_secret_raw);
+    if lock_recover(registry)
+        .add_pending(invitation_id.clone(), invitation_secret, assigned_ip, now)
+        .is_err()
+    {
+        return invitation_error("503 Service Unavailable", "peer_store_unavailable");
+    }
+
     let envelope = InvitationEnvelopeV1 {
         version: 1,
         invitation_id,
-        host_node_id: request.node_id.clone(),
-        onion_endpoint: onion_endpoint.clone(),
-        invitation_secret: invitation_secret.clone(),
+        host_node_id: request.node_id,
+        onion_endpoint,
+        invitation_secret: invitation_secret_raw,
         issued_at: now,
         expires_at,
     };
@@ -2320,19 +2578,12 @@ fn generate_invitation(body: &str, state: &AgentState) -> String {
         Ok(json) => format!("{INVITATION_PREFIX}{}", URL_SAFE_NO_PAD.encode(json)),
         Err(_) => return invitation_error("500 Internal Server Error", "encoding_failed"),
     };
-    let record = PeerRecord {
-        role: "host".into(),
-        node_id: request.node_id,
-        host_node_id: None,
-        endpoint: onion_endpoint,
-        invitation_secret,
-        virtual_ip: request.virtual_ip.filter(|value| !value.trim().is_empty()),
-        approved: false,
-        revoked: false,
-    };
-    if mark_peer_changed(record, state).is_err() {
-        return invitation_error("503 Service Unavailable", "peer_store_unavailable");
-    }
+    // Unlike the original single-peer design, adding a new invitation never
+    // needs a restart: the Host's accept loop already reads the registry
+    // live (via the shared `Arc<Mutex<..>>`) on every handshake, so a
+    // pending invitation generated while already running is immediately
+    // usable. A restart is only ever needed for a genuine role/config
+    // change (see `mark_peer_changed`, still used by the Cliente role).
     http_response(
         "200 OK",
         "application/json",

@@ -5,13 +5,14 @@ mod tun_macos;
 
 use localscale_agent::tor_runtime::{resolve_bundled_tor, TorMode, TorProcess, TorRuntime};
 use localscale_agent::{
-    log_event, serve_with_auth_and_peer_transport, AuthHandler, PeerStore, PeerTransportStatus,
-    RoleStore, TransportState,
+    log_event, serve_with_auth_and_peer_transport_and_host_registry,
+    serve_with_peer_transport_and_host_registry, AuthHandler, HostPeerRegistry, LocalVirtualIpStore,
+    PeerStore, PeerTransportStatus, RoleStore, TransportState,
 };
-use localscale_agent_protocol::{ClientConfig, HostInvitation};
+use localscale_agent_protocol::{ClientConfig, CryptoKey, HostInvitation};
 use localscale_agent_transport::{
-    key_from_stored_transport_key, ClienteTransport, FileNonceAllocator, HostTransport,
-    PacketChannel, TorRuntime as PeerTorRuntime,
+    key_from_stored_transport_key, ClienteTransport, FileNonceAllocator, HostKeyResolver,
+    HostTransport, PacketChannel, TorRuntime as PeerTorRuntime,
 };
 use localscale_control_plane::{
     google_oidc::{
@@ -20,13 +21,14 @@ use localscale_control_plane::{
     },
     AuthService,
 };
+use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
 use std::time::Duration;
@@ -651,11 +653,38 @@ fn spawn_tun_bridge(_status: &PeerTransportStatus, packets: PacketChannel) {
     });
 }
 
+/// Looks up decryption-key candidates for an incoming Host handshake
+/// against the live, shared multi-peer registry (see `host_registry`
+/// module docs in the library crate, and `HostKeyResolver` in the
+/// transport crate). A thin adapter: all the actual pending/bound lookup
+/// logic lives in `HostPeerRegistry::candidates_for`, this just converts
+/// its stored-secret strings into real `CryptoKey`s.
+struct RegistryKeyResolver {
+    registry: Arc<Mutex<HostPeerRegistry>>,
+}
+impl HostKeyResolver for RegistryKeyResolver {
+    fn candidates(&self, claimed_node_id: &str) -> Vec<(String, CryptoKey)> {
+        let registry = match self.registry.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        registry
+            .candidates_for(claimed_node_id)
+            .into_iter()
+            .filter_map(|(tag, secret)| {
+                key_from_stored_transport_key(&secret).ok().map(|key| (tag, key))
+            })
+            .collect()
+    }
+}
+
 fn start_peer_transport(
     config: &RuntimeConfig,
     tor: &RunningTor,
     gate: Arc<AtomicBool>,
     status: PeerTransportStatus,
+    host_registry: Arc<Mutex<HostPeerRegistry>>,
+    host_peer_live: Arc<Mutex<HashMap<String, PeerTransportStatus>>>,
 ) -> Result<(), String> {
     let store_path = env::var_os("LOCALSCALE_PEER_STORE")
         .map(std::path::PathBuf::from)
@@ -663,17 +692,6 @@ fn start_peer_transport(
     if env::var_os("LOCALSCALE_PEER_STORE").is_none() {
         env::set_var("LOCALSCALE_PEER_STORE", &store_path);
     }
-    let store = PeerStore::open(&store_path).map_err(|e| format!("peer store unavailable: {e}"))?;
-    let record = store
-        .record()
-        .ok_or("peer is not configured; refusing transport startup")?;
-    let expected_role = match &config.mode {
-        TorMode::Host { .. } => "host",
-        TorMode::Client { .. } => "cliente",
-    };
-    validate_approved_peer_record(record, expected_role)?;
-    let key = key_from_stored_transport_key(&record.invitation_secret)
-        .map_err(|_| "peer record contains an invalid transport key".to_string())?;
     let nonce_path = config.data_dir.join("handshake-nonce");
     // On by default: this is the actual product (a real virtual network
     // between paired devices, not just informational virtual IPs), and it
@@ -683,52 +701,109 @@ fn start_peer_transport(
     // to force it off (e.g. a sandboxed CI environment).
     let tun_enabled = env::var("LOCALSCALE_ENABLE_TUN").as_deref() != Ok("0");
     match &config.mode {
+        // A Host never needs a legacy single-peer `PeerRecord` to start
+        // listening at all — unlike the Cliente branch below, which is
+        // still exactly the original 1:1 design (a Cliente only ever has
+        // one Host to dial). Its own identity is the same stable
+        // process-wide id used everywhere else (`local_device_id`); its
+        // own virtual IP lives in `status.local_virtual_ip()`, updated
+        // live by the HTTP handlers (`generate_invitation`,
+        // `set_virtual_ip_handler`) with no restart needed to pick it up;
+        // and which *Clientes* it will accept lives entirely in
+        // `host_registry`, checked fresh on every single handshake — so
+        // generating a brand new invitation, or removing a device, takes
+        // effect immediately on an already-running Host too.
         TorMode::Host { upstream, .. } => {
             let address: std::net::SocketAddr = upstream
                 .parse()
                 .map_err(|_| "host upstream must be a socket address".to_string())?;
             let allocator = FileNonceAllocator::open(nonce_path).map_err(|e| e.to_string())?;
-            let mut host =
-                HostTransport::bind(address, key, record.node_id.clone(), Box::new(allocator))
-                    .map_err(|e| e.to_string())?;
+            let resolver = RegistryKeyResolver {
+                registry: host_registry.clone(),
+            };
+            let local_node_id = localscale_agent::local_device_id().to_string();
+            let mut host = HostTransport::bind(address, resolver, local_node_id.clone(), Box::new(allocator))
+                .map_err(|e| e.to_string())?;
             host.set_acceptance_gate(gate.clone());
-            let host_status = status.clone();
-            let local_node_id = record.node_id.clone();
-            host_status.set_local_virtual_ip(record.virtual_ip.clone().unwrap_or_default());
+            let accept_status = status.clone();
             std::thread::spawn(move || loop {
-                host_status.set(TransportState::Connecting);
+                accept_status.set(TransportState::Connecting);
                 match host.accept() {
                     Ok(stream) => {
-                        // The handshake authenticates the connecting Cliente's real
-                        // node id (see `AuthenticatedStream::peer_node_id`); record it
-                        // so `devices_status()` can show it instead of a generic
-                        // "remote-client" placeholder that never changed.
-                        host_status.set_remote_node_id(stream.peer_node_id().to_string());
-                        let (heartbeat, packets) = stream.into_multiplexed();
-                        if tun_enabled {
-                            spawn_tun_bridge(&host_status, packets);
+                        let peer_node_id = stream.peer_node_id().to_string();
+                        // The first successful handshake using a pending
+                        // invitation's secret permanently binds that
+                        // registry entry to whatever node id the device
+                        // claimed — every reconnect after that is looked
+                        // up by this id directly (see `HostPeerRegistry`).
+                        if let Some(tag) = stream.matched_key_tag() {
+                            let mut registry = match host_registry.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            let _ = registry.bind(tag, &peer_node_id);
                         }
-                        while gate.load(Ordering::Acquire) {
-                            match heartbeat.receive_ping(localscale_agent_transport::DEFAULT_TIMEOUT) {
-                                Ok((sequence, peer_virtual_ip)) => {
-                                    host_status.set_remote_virtual_ip(peer_virtual_ip);
-                                    let local_virtual_ip = host_status.local_virtual_ip();
-                                    if heartbeat
-                                        .send_pong(&local_node_id, sequence, &local_virtual_ip)
-                                        .is_err()
-                                    {
+                        // One connection = its own live status entry and
+                        // its own heartbeat thread, so multiple Clientes
+                        // can be connected at the same time — the accept
+                        // loop above returns to `host.accept()` again
+                        // immediately instead of blocking on this
+                        // connection's heartbeat loop first.
+                        let peer_status = PeerTransportStatus::default();
+                        {
+                            let mut live = match host_peer_live.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            live.insert(peer_node_id.clone(), peer_status.clone());
+                        }
+                        let host_shared_status = status.clone();
+                        let host_peer_live = host_peer_live.clone();
+                        let gate = gate.clone();
+                        let local_node_id = local_node_id.clone();
+                        std::thread::spawn(move || {
+                            let (heartbeat, packets) = stream.into_multiplexed();
+                            if tun_enabled {
+                                spawn_tun_bridge(&peer_status, packets);
+                            }
+                            while gate.load(Ordering::Acquire) {
+                                match heartbeat
+                                    .receive_ping(localscale_agent_transport::DEFAULT_TIMEOUT)
+                                {
+                                    Ok((sequence, peer_virtual_ip)) => {
+                                        peer_status.set_remote_virtual_ip(peer_virtual_ip);
+                                        // Each connection's own virtual IP comes from the
+                                        // one shared `status` (kept live-updated by the
+                                        // HTTP handlers) rather than a value captured once
+                                        // when this thread started.
+                                        let local_virtual_ip = host_shared_status.local_virtual_ip();
+                                        if heartbeat
+                                            .send_pong(&local_node_id, sequence, &local_virtual_ip)
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                        // One authenticated ping received and one matching pong sent.
+                                        peer_status.record_peer_activity(2);
+                                    }
+                                    Err(error) => {
+                                        eprintln!("LocalScale peer heartbeat failed: {error}");
+                                        log_event(&format!(
+                                            "host: peer '{peer_node_id}' heartbeat failed: {error}"
+                                        ));
                                         break;
                                     }
-                                    // One authenticated ping received and one matching pong sent.
-                                    host_status.record_peer_activity(2);
-                                }
-                                Err(error) => {
-                                    eprintln!("LocalScale peer heartbeat failed: {error}");
-                                    log_event(&format!("host: peer heartbeat failed: {error}"));
-                                    break;
                                 }
                             }
-                        }
+                            // Deliberately does NOT remove this peer's entry from
+                            // `host_peer_live` on disconnect: `PeerTransportStatus::
+                            // is_connected()` already reports false once its activity
+                            // goes stale, which is exactly what lets `devices_status()`
+                            // show "offline" instead of the device vanishing from the
+                            // list — removing the entry here would lose its last-seen
+                            // state instead.
+                            let _ = host_peer_live;
+                        });
                     }
                     Err(error) => {
                         eprintln!("LocalScale peer handshake failed: {error}");
@@ -736,11 +811,22 @@ fn start_peer_transport(
                         thread::sleep(Duration::from_secs(1));
                     }
                 }
-                host_status.set(TransportState::Retrying);
             });
             Ok(())
         }
         TorMode::Client { hostname } => {
+            // Unchanged from the original single-peer design: a Cliente
+            // only ever dials one Host, so it still needs the legacy
+            // `PeerStore`/`PeerRecord` (the Host's onion address and the
+            // one shared secret from whatever invitation was imported).
+            let store =
+                PeerStore::open(&store_path).map_err(|e| format!("peer store unavailable: {e}"))?;
+            let record = store
+                .record()
+                .ok_or("peer is not configured; refusing transport startup")?;
+            validate_approved_peer_record(record, "cliente")?;
+            let key = key_from_stored_transport_key(&record.invitation_secret)
+                .map_err(|_| "peer record contains an invalid transport key".to_string())?;
             let host_node_id = record
                 .host_node_id
                 .clone()
@@ -978,6 +1064,31 @@ fn main() -> std::io::Result<()> {
     }
     let peer_transport_enabled = Arc::new(AtomicBool::new(true));
     let peer_transport_status = PeerTransportStatus::default();
+    // Host-role multi-peer state, shared for real (not just a common file
+    // path — see `serve_with_auth_and_peer_transport_and_host_registry`'s
+    // docs) between the accept loop spawned by `start_peer_transport` below
+    // and the HTTP API server started later in this same function/process.
+    let peer_store_path = env::var_os("LOCALSCALE_PEER_STORE")
+        .map(std::path::PathBuf::from)
+        .expect("LOCALSCALE_PEER_STORE initialized above");
+    let host_registry = Arc::new(Mutex::new(
+        HostPeerRegistry::open(peer_store_path.with_file_name("host-peers.json"))
+            .map_err(std::io::Error::other)?,
+    ));
+    let host_local_virtual_ip = Arc::new(Mutex::new(
+        LocalVirtualIpStore::open(peer_store_path.with_file_name("host-local-virtual-ip"))
+            .map_err(std::io::Error::other)?,
+    ));
+    let host_peer_live: Arc<Mutex<HashMap<String, PeerTransportStatus>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    // The Host's own virtual IP is tracked live on `peer_transport_status`
+    // (see `start_peer_transport`'s Host branch) — seed it from whatever
+    // was already persisted, so a restarted Host doesn't briefly report an
+    // empty address to already-registered Clientes before its first
+    // `generate_invitation` call of this run.
+    if let Some(existing) = host_local_virtual_ip.lock().unwrap().get() {
+        peer_transport_status.set_local_virtual_ip(existing.to_string());
+    }
     let listener = TcpListener::bind(("127.0.0.1", options.port))?;
     let running_tor = match RuntimeConfig::from_environment().map_err(std::io::Error::other)? {
         Some(runtime_config) => {
@@ -1008,6 +1119,8 @@ fn main() -> std::io::Result<()> {
                 &running,
                 peer_transport_enabled.clone(),
                 peer_transport_status.clone(),
+                host_registry.clone(),
+                host_peer_live.clone(),
             ) {
                 Ok(()) => Some(running),
                 Err(error) => {
@@ -1034,16 +1147,22 @@ fn main() -> std::io::Result<()> {
 
     let auth = auth_provider(address.port());
     let server = thread::spawn(move || match auth {
-        Some(auth) => serve_with_auth_and_peer_transport(
+        Some(auth) => serve_with_auth_and_peer_transport_and_host_registry(
             listener,
             auth,
             peer_transport_enabled,
             peer_transport_status,
+            host_registry,
+            host_local_virtual_ip,
+            host_peer_live,
         ),
-        None => localscale_agent::serve_with_peer_transport(
+        None => serve_with_peer_transport_and_host_registry(
             listener,
             peer_transport_enabled,
             peer_transport_status,
+            host_registry,
+            host_local_virtual_ip,
+            host_peer_live,
         ),
     });
     let result = wait_until_healthy(address).and_then(|_| {
