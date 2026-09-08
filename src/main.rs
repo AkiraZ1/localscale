@@ -313,8 +313,37 @@ impl PeerTorRuntime for ProcessTorRuntime {
     }
 }
 
+/// A prior run of this exact daemon can leave its bundled Tor child behind
+/// still running — not from an ordinary quit (SIGTERM/SIGINT/SIGHUP are
+/// caught above and kill the Tor child first), but from anything that
+/// can't be caught at all: `kill -9`, Activity Monitor's "Force Quit", an
+/// OOM kill, a power loss. That orphan keeps holding Tor's own lock on
+/// `config.data_dir`, so the next `TorRuntime::spawn` here waits out the
+/// full `TOR_READY_TIMEOUT` and fails with an opaque "readiness timed out"
+/// — with no indication that a stale process, not a real Tor/network
+/// problem, is the actual cause. Clear it first every time, unconditionally
+/// — safe because this only ever matches our own bundled Tor binary at its
+/// exact resolved path, never a system Tor install.
+fn kill_stale_bundled_tor(executable: &std::path::Path) {
+    let Some(path) = executable.to_str() else {
+        return;
+    };
+    let _ = Command::new("pkill")
+        .args(["-9", "-f"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    // Give the OS a moment to actually release the SOCKS/control ports and
+    // the data directory's lock before the fresh Tor process tries to bind
+    // and lock them itself.
+    thread::sleep(Duration::from_millis(300));
+}
+
 fn start_tor(bundle_root: &std::path::Path, config: &RuntimeConfig) -> Result<RunningTor, String> {
     let executable = resolve_bundled_tor(bundle_root).map_err(|e| e.to_string())?;
+    kill_stale_bundled_tor(&executable);
     let mut process = TorRuntime::new(executable, config.data_dir.clone())
         .map_err(|e| e.to_string())?
         .spawn(&config.mode)
