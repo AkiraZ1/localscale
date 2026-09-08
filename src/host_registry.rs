@@ -96,9 +96,28 @@ impl HostPeerRegistry {
         Ok(())
     }
 
-    pub fn remove(&mut self, node_id: &str) -> std::io::Result<()> {
+    /// Removes the entry matching `id` — either a bound Cliente's real
+    /// `node_id`, or (for an invitation nobody has connected with yet,
+    /// which has no `node_id` at all) the same
+    /// `"convite-pendente-<invitation_id prefix>"` display form that
+    /// `devices_status` hands the UI for that entry, so removing a still-
+    /// pending invitation from the device list actually works instead of
+    /// silently matching nothing.
+    pub fn remove(&mut self, id: &str) -> std::io::Result<()> {
         let before = self.entries.len();
-        self.entries.retain(|entry| entry.node_id.as_deref() != Some(node_id));
+        self.entries.retain(|entry| {
+            if entry.node_id.as_deref() == Some(id) {
+                return false;
+            }
+            if entry.node_id.is_none() {
+                if let Some(prefix) = id.strip_prefix("convite-pendente-") {
+                    if !prefix.is_empty() && entry.invitation_id.starts_with(prefix) {
+                        return false;
+                    }
+                }
+            }
+            true
+        });
         if self.entries.len() != before {
             self.persist()?;
         }
@@ -260,6 +279,29 @@ mod tests {
         registry.bind("a", "device-a").unwrap();
         registry.remove("device-a").unwrap();
         assert_eq!(registry.next_free_virtual_ip("10.0.0"), "10.0.0.2");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pending_invitation_can_be_removed_by_its_display_id() {
+        let path = temp_path("remove-pending");
+        let mut registry = HostPeerRegistry::open(&path).unwrap();
+        registry
+            .add_pending(
+                "inv-abcdefgh12345".into(),
+                "secret".into(),
+                "10.0.0.2".into(),
+                0,
+            )
+            .unwrap();
+        assert_eq!(registry.entries().len(), 1);
+
+        // The exact form `devices_status` hands the UI for a still-pending
+        // entry: "convite-pendente-" followed by the first 8 chars of the
+        // invitation id.
+        registry.remove("convite-pendente-inv-abcd").unwrap();
+        assert_eq!(registry.entries().len(), 0);
 
         let _ = std::fs::remove_file(&path);
     }
