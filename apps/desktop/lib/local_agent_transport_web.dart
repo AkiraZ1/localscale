@@ -5,6 +5,8 @@ import 'dart:html' as html;
 
 import 'local_agent_api.dart';
 
+String? lastAgentStartupError;
+
 Future<bool> ensureLocalAgentRunning() async => true;
 
 Future<bool> ensureLocalAgentRestarted() async => true;

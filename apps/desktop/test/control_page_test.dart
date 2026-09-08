@@ -66,7 +66,8 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(
-        find.text('Unable to read LocalScale agent: Bad state: status failed'),
+        find.text(
+            'Não foi possível conectar ao serviço local. Tentando novamente…'),
         findsOneWidget);
     expect(find.text('Stopped'), findsNothing);
   });
