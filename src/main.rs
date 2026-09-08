@@ -5,21 +5,13 @@ mod tun_macos;
 
 use localscale_agent::tor_runtime::{resolve_bundled_tor, TorMode, TorProcess, TorRuntime};
 use localscale_agent::{
-    log_event, serve_with_auth_and_peer_transport_and_host_registry,
-    serve_with_peer_transport_and_host_registry, AuthHandler, HostPeerRegistry, LocalVirtualIpStore,
+    log_event, serve_with_peer_transport_and_host_registry, HostPeerRegistry, LocalVirtualIpStore,
     PeerStore, PeerTransportStatus, RoleStore, TransportState,
 };
 use localscale_agent_protocol::{ClientConfig, CryptoKey, HostInvitation};
 use localscale_agent_transport::{
     key_from_stored_transport_key, ClienteTransport, FileNonceAllocator, HostKeyResolver,
     HostTransport, PacketChannel, TorRuntime as PeerTorRuntime,
-};
-use localscale_control_plane::{
-    google_oidc::{
-        ClientSecretRef, GoogleOidcConfig, GoogleOidcProvider, HttpRequest, HttpResponse,
-        HttpTransport, TransportError,
-    },
-    AuthService,
 };
 use std::collections::HashMap;
 use std::env;
@@ -79,8 +71,6 @@ fn install_shutdown_signal_handlers() {
 #[cfg(not(unix))]
 fn install_shutdown_signal_handlers() {}
 
-const CURL_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-const CURL_TIMEOUT_SECONDS: u64 = 5;
 const TOR_READY_TIMEOUT: Duration = Duration::from_secs(300);
 /// A supervisor can distinguish a requested configuration reload from an
 /// ordinary failure. Standalone desktop startup observes the health drop and
@@ -944,110 +934,6 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     Ok(Options { port, no_open })
 }
 
-/// A deliberately small HTTPS-only adapter around the system curl binary.
-/// The request body, including the client secret during token exchange, is
-/// always written to curl's stdin and never appears in its argument list.
-struct CurlTransport;
-
-fn curl_args(request: &HttpRequest, timeout_seconds: &str) -> Vec<String> {
-    let mut args = vec![
-        "--silent".into(),
-        "--show-error".into(),
-        "--request".into(),
-        request.method.clone(),
-        "--connect-timeout".into(),
-        timeout_seconds.into(),
-        "--max-time".into(),
-        timeout_seconds.into(),
-        "--header".into(),
-        "content-type: application/x-www-form-urlencoded".into(),
-        "--write-out".into(),
-        "\n%{http_code}".into(),
-    ];
-    if request.method != "GET" && !request.body.is_empty() {
-        args.extend(["--data-binary".into(), "@-".into()]);
-    }
-    args.extend(["--url".into(), request.url.clone()]);
-    args
-}
-
-impl HttpTransport for CurlTransport {
-    fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
-        let timeout = request
-            .timeout
-            .min(Duration::from_secs(CURL_TIMEOUT_SECONDS));
-        let timeout_seconds = timeout.as_secs_f64().max(0.001).to_string();
-        let mut child = Command::new("curl")
-            .args(curl_args(&request, &timeout_seconds))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| TransportError::Network)?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(request.body.as_bytes())
-                .map_err(|_| TransportError::Network)?;
-        }
-        let mut output = Vec::new();
-        let Some(mut stdout) = child.stdout.take() else {
-            return Err(TransportError::Network);
-        };
-        let mut buffer = [0_u8; 8192];
-        while output.len() <= CURL_MAX_RESPONSE_BYTES + 32 {
-            let read = stdout
-                .read(&mut buffer)
-                .map_err(|_| TransportError::Network)?;
-            if read == 0 {
-                break;
-            }
-            output.extend_from_slice(&buffer[..read]);
-        }
-        if output.len() > CURL_MAX_RESPONSE_BYTES + 32 {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(TransportError::Network);
-        }
-        let _ = child.wait();
-        parse_curl_output(&output).ok_or(TransportError::Network)
-    }
-}
-
-fn parse_curl_output(output: &[u8]) -> Option<HttpResponse> {
-    let split = output.iter().rposition(|byte| *byte == b'\n')?;
-    let status = std::str::from_utf8(&output[split + 1..])
-        .ok()?
-        .trim()
-        .parse::<u16>()
-        .ok()?;
-    if !(100..=599).contains(&status) {
-        return None;
-    }
-    let body = std::str::from_utf8(&output[..split]).ok()?.to_owned();
-    (body.len() <= CURL_MAX_RESPONSE_BYTES).then_some(HttpResponse { status, body })
-}
-
-fn redirect_uri_matches_port(redirect_uri: &str, port: u16) -> bool {
-    redirect_uri == format!("http://127.0.0.1:{port}/oauth/google/callback")
-}
-
-fn auth_provider(port: u16) -> Option<Box<dyn AuthHandler>> {
-    let secret = env::var("LOCALSCALE_GOOGLE_CLIENT_SECRET")
-        .ok()
-        .filter(|v| !v.is_empty())?;
-    let redirect = env::var("LOCALSCALE_GOOGLE_REDIRECT_URI").ok()?;
-    if !redirect_uri_matches_port(&redirect, port) {
-        return None;
-    }
-    let config = GoogleOidcConfig::from_env(ClientSecretRef::new(secret)).ok()?;
-    Some(Box::new(AuthService::new(
-        GoogleOidcProvider::new(config, CurlTransport),
-        Duration::from_secs(300),
-        &redirect,
-    )))
-}
-
 fn main() -> std::io::Result<()> {
     install_shutdown_signal_handlers();
     let args: Vec<String> = env::args().collect();
@@ -1065,7 +951,7 @@ fn main() -> std::io::Result<()> {
     let peer_transport_enabled = Arc::new(AtomicBool::new(true));
     let peer_transport_status = PeerTransportStatus::default();
     // Host-role multi-peer state, shared for real (not just a common file
-    // path — see `serve_with_auth_and_peer_transport_and_host_registry`'s
+    // path — see `serve_with_peer_transport_and_host_registry`'s
     // docs) between the accept loop spawned by `start_peer_transport` below
     // and the HTTP API server started later in this same function/process.
     let peer_store_path = env::var_os("LOCALSCALE_PEER_STORE")
@@ -1145,25 +1031,15 @@ fn main() -> std::io::Result<()> {
     let url = format!("http://{address}/");
     println!("LocalScale web: {url}");
 
-    let auth = auth_provider(address.port());
-    let server = thread::spawn(move || match auth {
-        Some(auth) => serve_with_auth_and_peer_transport_and_host_registry(
-            listener,
-            auth,
-            peer_transport_enabled,
-            peer_transport_status,
-            host_registry,
-            host_local_virtual_ip,
-            host_peer_live,
-        ),
-        None => serve_with_peer_transport_and_host_registry(
+    let server = thread::spawn(move || {
+        serve_with_peer_transport_and_host_registry(
             listener,
             peer_transport_enabled,
             peer_transport_status,
             host_registry,
             host_local_virtual_ip,
             host_peer_live,
-        ),
+        )
     });
     let result = wait_until_healthy(address).and_then(|_| {
         if !options.no_open {
@@ -1236,19 +1112,6 @@ mod tests {
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
-
-    fn clear_auth_env() {
-        for name in [
-            "LOCALSCALE_GOOGLE_CLIENT_SECRET",
-            "LOCALSCALE_GOOGLE_CLIENT_ID",
-            "LOCALSCALE_OIDC_AUDIENCE",
-            "LOCALSCALE_OIDC_ISSUER",
-            "LOCALSCALE_GOOGLE_REDIRECT_URI",
-            "LOCALSCALE_OIDC_SCOPES",
-        ] {
-            env::remove_var(name);
-        }
     }
 
     fn test_temp(name: &str) -> std::path::PathBuf {
@@ -1617,103 +1480,6 @@ mod tests {
         .unwrap();
         assert_eq!(options.port, 9123);
         assert!(options.no_open);
-    }
-
-    #[test]
-    fn missing_auth_config_keeps_auth_disabled() {
-        let _guard = env_lock();
-        clear_auth_env();
-        assert!(auth_provider(8765).is_none());
-    }
-
-    #[test]
-    fn complete_auth_config_bootstraps_provider() {
-        let _guard = env_lock();
-        clear_auth_env();
-        env::set_var("LOCALSCALE_GOOGLE_CLIENT_SECRET", "test-placeholder-only");
-        env::set_var("LOCALSCALE_GOOGLE_CLIENT_ID", "client-id");
-        env::set_var("LOCALSCALE_OIDC_ISSUER", "https://accounts.google.com");
-        env::set_var(
-            "LOCALSCALE_GOOGLE_REDIRECT_URI",
-            "http://127.0.0.1:8765/oauth/google/callback",
-        );
-        env::set_var("LOCALSCALE_OIDC_SCOPES", "openid email");
-        assert!(auth_provider(8765).is_some());
-        clear_auth_env();
-    }
-
-    #[test]
-    fn runtime_redirect_must_be_exact_bound_loopback_callback() {
-        assert!(redirect_uri_matches_port(
-            "http://127.0.0.1:8765/oauth/google/callback",
-            8765
-        ));
-        for redirect in [
-            "http://127.0.0.1:9999/oauth/google/callback",
-            "http://127.0.0.1:8765/oauth/callback",
-            "http://localhost:8765/oauth/google/callback",
-            "https://127.0.0.1:8765/oauth/google/callback",
-            "https://login.example.test/callback",
-        ] {
-            assert!(
-                !redirect_uri_matches_port(redirect, 8765),
-                "accepted invalid redirect {redirect}"
-            );
-        }
-    }
-
-    #[test]
-    fn auth_bootstrap_rejects_non_loopback_and_wrong_path_redirects() {
-        let _guard = env_lock();
-        for redirect in [
-            "https://login.example.test/callback",
-            "http://127.0.0.1:8765/oauth/callback",
-            "http://127.0.0.1:8765/",
-        ] {
-            clear_auth_env();
-            env::set_var("LOCALSCALE_GOOGLE_CLIENT_SECRET", "test-placeholder-only");
-            env::set_var("LOCALSCALE_GOOGLE_CLIENT_ID", "client-id");
-            env::set_var("LOCALSCALE_OIDC_ISSUER", "https://accounts.google.com");
-            env::set_var("LOCALSCALE_GOOGLE_REDIRECT_URI", redirect);
-            assert!(
-                auth_provider(8765).is_none(),
-                "bootstrapped invalid redirect {redirect}"
-            );
-        }
-        clear_auth_env();
-    }
-
-    #[test]
-    fn post_curl_arguments_read_body_from_stdin_without_exposing_it() {
-        let request = HttpRequest {
-            method: "POST".into(),
-            url: "https://oauth2.googleapis.com/token".into(),
-            body: "client_secret=do-not-put-this-in-argv".into(),
-            timeout: Duration::from_secs(5),
-        };
-        let args = curl_args(&request, "5");
-
-        assert!(args.windows(2).any(|pair| pair == ["--data-binary", "@-"]));
-        assert!(!args.iter().any(|arg| arg.contains(&request.body)));
-
-        let get = HttpRequest {
-            method: "GET".into(),
-            body: String::new(),
-            ..request
-        };
-        let get_args = curl_args(&get, "5");
-        assert!(!get_args
-            .iter()
-            .any(|arg| arg == "--data-binary" || arg == "@-"));
-    }
-
-    #[test]
-    fn curl_output_parsing_is_bounded_and_preserves_status() {
-        let response = parse_curl_output(b"{\"error\":\"bad\"}\n401").unwrap();
-        assert_eq!(response.status, 401);
-        assert_eq!(response.body, "{\"error\":\"bad\"}");
-        assert!(parse_curl_output(b"not-a-response").is_none());
-        assert!(parse_curl_output(&vec![b'x'; CURL_MAX_RESPONSE_BYTES + 1]).is_none());
     }
 
     #[test]
