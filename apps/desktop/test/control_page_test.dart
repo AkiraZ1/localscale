@@ -289,7 +289,9 @@ void main() {
     // action, not two.
     expect(api.approveCalls, 1);
     expect(api.restartCalls, 1);
-    expect(find.byKey(const Key('activate-invitation')), findsOneWidget);
+    // Activation is automatic now — there is no separate "Ativar" step to
+    // find or tap; a Cliente can already complete pairing the instant the
+    // invitation is generated.
     // _approveAndRestart awaits the real ensureLocalAgentRestarted() —
     // several seconds of retries against an always-failing HTTP probe in
     // this test environment — drain it so no timer is left pending.
