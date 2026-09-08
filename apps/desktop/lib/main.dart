@@ -224,6 +224,11 @@ class _ControlPageState extends State<ControlPage> {
   bool _permissionSkipped = false;
   bool _permissionBusy = false;
   bool get _isPaired => networkDevices?.remotePeers.isNotEmpty ?? false;
+  // Lets the dashboard's "Adicionar dispositivo"/"Mudar modo" buttons jump
+  // back into the wizard even though a device is already paired — without
+  // this, _isPaired alone would keep the user locked on the dashboard with
+  // no way back to those steps, which is exactly the gap the user reported.
+  bool _forceWizard = false;
 
   // Rolling event log so status/port/restart/transport transitions and
   // unexpected agent behavior can be reported back here, instead of only
@@ -453,6 +458,14 @@ class _ControlPageState extends State<ControlPage> {
       _pairingMessage('Informe o identificador deste computador.');
       return;
     }
+    // First-time setup (no device paired yet) needs the daemon restart
+    // below to actually start listening as Host. Once a device is already
+    // paired, generating another invitation from the dashboard's "Adicionar
+    // dispositivo" is adding one more device to an already-multi-peer
+    // registry the accept loop reads live — restarting here would
+    // disconnect every other Cliente already talking to this Host for no
+    // reason.
+    final isFirstTimeSetup = !_isPaired;
     setState(() => _pairingBusy = true);
     try {
       if (status?.mode != LocalScaleMode.host) {
@@ -470,15 +483,12 @@ class _ControlPageState extends State<ControlPage> {
         _generatedInvitation = generated;
         _invitationController.text = generated.invitation;
       });
-      // Generating an invitation already expresses the Host's intent to
-      // accept a peer; previously the Host still had to press a separate
-      // "Ativar Host" button before its accept loop actually started
-      // listening, so a generated-but-not-activated invite left the Cliente
-      // stuck showing "pending" forever with no indication anything was
-      // missing on the Host side. Auto-activate so Host and Cliente behave
-      // symmetrically (Cliente auto-approves right after import).
-      await _approveAndRestart(
-          'Convite criado e Host ativado. Copie o convite e envie ao Cliente.');
+      if (isFirstTimeSetup) {
+        await _approveAndRestart(
+            'Convite criado e Host ativado. Copie o convite e envie ao Cliente.');
+      } else {
+        _pairingMessage('Convite criado. Copie e envie ao novo dispositivo.');
+      }
     } catch (error) {
       _pairingMessage('Não foi possível gerar o convite: $error');
     } finally {
@@ -602,6 +612,28 @@ class _ControlPageState extends State<ControlPage> {
     }
   }
 
+  /// Host-only: re-enters the wizard straight at the invitation step so a
+  /// new device can be invited without disturbing the ones already paired
+  /// (the dashboard itself, and every other connected Cliente, stay as-is).
+  void _openAddDevice() {
+    _invitationController.clear();
+    setState(() {
+      _generatedInvitation = null;
+      _forceWizard = true;
+      _wizardStep = _stepInvitation;
+    });
+  }
+
+  /// Re-enters the wizard at the very first step, mirroring first-time setup
+  /// ("os mesmos dois botões do começo") — lets the user switch this device
+  /// between Host and Cliente, or reconfigure, from the dashboard.
+  void _openChangeMode() {
+    setState(() {
+      _forceWizard = true;
+      _wizardStep = _stepRole;
+    });
+  }
+
   Future<bool?> _confirmInvitation(InvitationPreview preview,
       {required String title, required String explanation}) {
     return showDialog<bool>(
@@ -641,7 +673,7 @@ class _ControlPageState extends State<ControlPage> {
 
   @override
   Widget build(BuildContext context) {
-    if (_isPaired) return _buildDashboard();
+    if (_isPaired && !_forceWizard) return _buildDashboard();
     return _buildWizard();
   }
 
@@ -761,8 +793,10 @@ class _ControlPageState extends State<ControlPage> {
                               ),
                             )
                           else
-                            ...devices.remotePeers.map((peer) =>
-                                _buildDeviceTile(peer, isLocal: false)),
+                            ...devices.remotePeers.map((peer) => _buildDeviceTile(
+                                peer,
+                                isLocal: false,
+                                isHost: current?.mode == LocalScaleMode.host)),
                         ] else ...[
                           const Text('Carregando dispositivos...',
                               style: TextStyle(color: Colors.grey)),
@@ -773,7 +807,19 @@ class _ControlPageState extends State<ControlPage> {
                               onPressed: () => _run(widget.api.sync, 'Sync'),
                               icon: const Icon(Icons.sync),
                               label: const Text('Sincronizar')),
-                          if (networkDevices?.remotePeers.isNotEmpty == true)
+                          if (current?.mode == LocalScaleMode.host)
+                            FilledButton.tonalIcon(
+                                key: const Key('add-device'),
+                                onPressed: _openAddDevice,
+                                icon: const Icon(Icons.person_add_alt_1),
+                                label: const Text('Adicionar dispositivo')),
+                          OutlinedButton.icon(
+                              key: const Key('change-mode'),
+                              onPressed: _openChangeMode,
+                              icon: const Icon(Icons.tune),
+                              label: const Text('Mudar modo')),
+                          if (current?.mode != LocalScaleMode.host &&
+                              networkDevices?.remotePeers.isNotEmpty == true)
                             OutlinedButton.icon(
                                 key: const Key('reset-peer'),
                                 onPressed: _pairingBusy ? null : _resetPeer,
@@ -799,7 +845,17 @@ class _ControlPageState extends State<ControlPage> {
   // ---------------------------------------------------------------------
   Widget _buildWizard() {
     return Scaffold(
-      appBar: AppBar(title: const Text('LocalScale')),
+      appBar: AppBar(
+        title: const Text('LocalScale'),
+        actions: [
+          if (_forceWizard && _isPaired)
+            TextButton(
+              key: const Key('wizard-cancel-to-dashboard'),
+              onPressed: () => setState(() => _forceWizard = false),
+              child: const Text('Cancelar'),
+            ),
+        ],
+      ),
       body: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 640),
@@ -1170,7 +1226,52 @@ class _ControlPageState extends State<ControlPage> {
     return isLocal ? 'preparando conexão' : 'não configurado';
   }
 
-  Widget _buildDeviceTile(NetworkDevice dev, {required bool isLocal}) {
+  Color _deviceStatusColor(String status) {
+    switch (status) {
+      case 'active':
+      case 'connected':
+        return Colors.green;
+      case 'offline':
+        return Colors.grey;
+      default:
+        return Colors.orange;
+    }
+  }
+
+  Future<void> _removeHostPeer(String nodeId) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Remover dispositivo?'),
+        content: Text(
+            'O dispositivo "$nodeId" perderá acesso a esta rede. Ele precisará de um novo convite para se conectar novamente.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Cancelar')),
+          FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              style:
+                  FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+              child: const Text('Remover')),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _pairingBusy = true);
+    try {
+      await widget.api.removeHostPeer(nodeId);
+      await _refresh();
+      _pairingMessage('Dispositivo "$nodeId" removido.');
+    } catch (error) {
+      _pairingMessage('Falha ao remover dispositivo: $error');
+    } finally {
+      if (mounted) setState(() => _pairingBusy = false);
+    }
+  }
+
+  Widget _buildDeviceTile(NetworkDevice dev,
+      {required bool isLocal, bool isHost = false}) {
     return Container(
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(12),
@@ -1241,20 +1342,14 @@ class _ControlPageState extends State<ControlPage> {
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
             decoration: BoxDecoration(
-              color: dev.status == 'active' ||
-                      dev.status == 'connected'
-                  ? Colors.green.withValues(alpha: 0.15)
-                  : Colors.orange.withValues(alpha: 0.15),
+              color: _deviceStatusColor(dev.status).withValues(alpha: 0.15),
               borderRadius: BorderRadius.circular(12),
             ),
             child: Text(
-              dev.status,
+              dev.status == 'offline' ? 'offline' : dev.status,
               style: TextStyle(
                 fontSize: 11,
-                color: dev.status == 'active' ||
-                        dev.status == 'connected'
-                    ? Colors.green
-                    : Colors.orange,
+                color: _deviceStatusColor(dev.status),
               ),
             ),
           ),
@@ -1263,7 +1358,9 @@ class _ControlPageState extends State<ControlPage> {
             IconButton(
               key: const Key('remove-device-tile'),
               tooltip: 'Remover dispositivo',
-              onPressed: _pairingBusy ? null : _resetPeer,
+              onPressed: _pairingBusy
+                  ? null
+                  : () => isHost ? _removeHostPeer(dev.nodeId) : _resetPeer(),
               icon: const Icon(Icons.link_off, size: 18),
               color: Colors.redAccent,
             ),

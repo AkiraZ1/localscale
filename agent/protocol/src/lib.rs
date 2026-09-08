@@ -512,6 +512,17 @@ impl CryptoKey {
     pub fn to_bytes(&self) -> [u8; KEY_LEN] {
         *self.secret
     }
+    /// An opening-only copy of this key's secret, with its own empty
+    /// nonce-tracking set and sealing disabled — for callers (like a
+    /// multi-peer `HostKeyResolver`) that need to hold and try several keys
+    /// concurrently but only ever call `HandshakeEnvelope::open` with them,
+    /// never `seal`/`seal_with_allocator`. A real `Clone` impl would be the
+    /// wrong shape here: sharing one key's nonce-tracking set across
+    /// multiple in-flight uses is exactly the invariant this type exists to
+    /// prevent.
+    pub fn clone_for_resolver(&self) -> Self {
+        Self::from_secret(*self.secret, false)
+    }
     fn from_secret(secret: [u8; KEY_LEN], sealing_allowed: bool) -> Self {
         Self {
             secret: Zeroizing::new(secret),
