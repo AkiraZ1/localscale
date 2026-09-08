@@ -35,61 +35,22 @@ Future<bool> ensureLocalAgentRunning({
   if (await probe(agentBase)) {
     return true;
   }
+  final agentExecutable = await _resolveAgentExecutable(resolvedExecutable);
+  if (agentExecutable == null) return false;
 
-  final desktopExecutable = resolvedExecutable ?? Platform.resolvedExecutable;
-  var agentExecutable = File(
-      '${File(desktopExecutable).parent.path}${Platform.pathSeparator}localscaled');
-  
-  if (!await agentExecutable.exists() && Platform.isLinux) {
-    const standardPaths = [
-      '/usr/local/bin/localscaled',
-      '/usr/bin/localscaled',
-      '/opt/localscale/bin/localscaled',
-    ];
-    for (final path in standardPaths) {
-      final file = File(path);
-      if (await file.exists()) {
-        agentExecutable = file;
-        break;
-      }
-    }
-    if (!await agentExecutable.exists()) {
-      final home = Platform.environment['HOME'];
-      if (home != null) {
-        agentExecutable = File('$home/.local/opt/localscale-agent/localscaled');
-      }
-    }
-  }
-
-  if (!await agentExecutable.exists()) return false;
-
-  // This app isn't notarized (ad-hoc signed only), so a real user who
-  // downloaded it — as opposed to one built and run locally like this
-  // during development — gets it under Gatekeeper quarantine. Approving
-  // the *main* app to open (the one-time "cannot verify the developer,
-  // open anyway" flow) does not necessarily clear quarantine on bundled
-  // child executables it spawns itself, like this agent binary: Gatekeeper
-  // can still refuse to exec it, and Process.start then fails with no
-  // dialog or visible explanation at all — just a silent, permanent
-  // "can't reach the agent" from the app's point of view. Since the
-  // already-running, already-approved app is the one about to spawn it,
-  // clearing quarantine on its own bundled binary here is reasonable
-  // self-healing, not a security bypass of anything the user hasn't
-  // already approved by opening this app in the first place.
-  if (Platform.isMacOS) {
-    try {
-      await Process.run(
-          'xattr', ['-d', '-r', 'com.apple.quarantine', agentExecutable.path]);
-      final torDir = Directory('${agentExecutable.parent.path}/tor');
-      if (await torDir.exists()) {
-        await Process.run(
-            'xattr', ['-d', '-r', 'com.apple.quarantine', torDir.path]);
-      }
-    } on Object {
-      // Best-effort only — xattr missing, nothing to clear, or already
-      // clear are all fine; never block startup on this.
-    }
-  }
+  // A previous version of this function shelled out to `xattr -d -r
+  // com.apple.quarantine` here to strip Gatekeeper quarantine from the
+  // bundled agent before spawning it. That turned out to hang
+  // indefinitely when invoked as a child of this app's own process — the
+  // identical command runs instantly from a plain shell, so the cause was
+  // never fully pinned down, but the effect was a total, silent startup
+  // stall on every launch. Removed rather than patched further: the actual
+  // root cause of the ad-hoc-signed child being refused at exec time was
+  // hardened runtime Library Validation, not quarantine (see
+  // Release.entitlements — com.apple.security.cs.disable-library-
+  // validation), and approving this main app to open already clears
+  // quarantine recursively across the whole bundle in practice, so this
+  // extra step wasn't actually doing anything useful to begin with.
 
   // The health probe above failed, meaning either nothing is listening on
   // this port, or something is listening but not answering as our own
@@ -100,16 +61,10 @@ Future<bool> ensureLocalAgentRunning({
   // never silently fails to bind or ends up talking to a dead process.
   await _killStaleAgentProcesses(agentExecutable);
 
-  if (Platform.isMacOS) {
-    // Fire-and-forget: this shows a native admin-password dialog the first
-    // time (or after a binary update), which must never block the app's
-    // own startup or ordinary (non-TUN) pairing — those work with no
-    // privilege at all. If the user approves it, the *next* restart of the
-    // peer transport (which already retries on its own) picks up the
-    // newly-privileged binary and the TUN bridge starts working; if they
-    // dismiss it, everything else keeps working without a virtual network.
-    unawaited(_ensureMacOSTunPrivilege(agentExecutable));
-  }
+  // Virtual-network privilege (macOS setuid grant) is requested explicitly
+  // by the UI, on its own dedicated screen, only after the user chooses to
+  // enable that feature and understands why — never automatically here.
+  // Starting the agent itself needs no privilege at all.
 
   final start = processStarter ?? _startAgentDetached;
   try {
@@ -210,6 +165,52 @@ Future<void> _killStaleAgentProcesses(File agentExecutable) async {
   }
 }
 
+/// Finds the bundled `localscaled` binary next to this desktop executable
+/// (or, on Linux, at a handful of standard install locations) — shared by
+/// every function in this file that needs to locate or act on it, so the
+/// search logic exists exactly once. Returns `null` if nothing was found.
+Future<File?> _resolveAgentExecutable(String? resolvedExecutable) async {
+  final desktopExecutable = resolvedExecutable ?? Platform.resolvedExecutable;
+  var agentExecutable = File(
+      '${File(desktopExecutable).parent.path}${Platform.pathSeparator}localscaled');
+
+  if (!await agentExecutable.exists() && Platform.isLinux) {
+    const standardPaths = [
+      '/usr/local/bin/localscaled',
+      '/usr/bin/localscaled',
+      '/opt/localscale/bin/localscaled',
+    ];
+    for (final path in standardPaths) {
+      final file = File(path);
+      if (await file.exists()) {
+        agentExecutable = file;
+        break;
+      }
+    }
+    if (!await agentExecutable.exists()) {
+      final home = Platform.environment['HOME'];
+      if (home != null) {
+        agentExecutable = File('$home/.local/opt/localscale-agent/localscaled');
+      }
+    }
+  }
+
+  return await agentExecutable.exists() ? agentExecutable : null;
+}
+
+/// Whether the virtual-network feature's one-time macOS privilege grant
+/// (setuid on the bundled agent) is already in place — read-only, prompts
+/// nothing. The UI uses this to skip straight past the explanation/request
+/// screen on every launch after the first.
+Future<bool> hasVirtualNetworkPrivilege() async {
+  if (!Platform.isMacOS) return true; // Linux grants this at install time.
+  final agentExecutable = await _resolveAgentExecutable(null);
+  if (agentExecutable == null) return false;
+  const setuidBit = 0x800; // POSIX S_ISUID
+  final stat = await agentExecutable.stat();
+  return (stat.mode & setuidBit) != 0;
+}
+
 /// macOS has no per-binary capability grant like Linux's `setcap` — opening
 /// a `utun` control socket (see `tun_macos.rs`, used by the opt-in virtual
 /// network bridge) requires root. Rather than ask the user to run a
@@ -218,12 +219,21 @@ Future<void> _killStaleAgentProcesses(File agentExecutable) async {
 /// via the same native "app wants to make changes" dialog macOS shows for
 /// any admin-privileged action. Every launch after that is a no-op: the
 /// setuid bit is already there, so no further dialog appears.
-Future<void> _ensureMacOSTunPrivilege(File executable) async {
+///
+/// Called only when the user explicitly asks for the virtual-network
+/// feature on its own dedicated, explained screen — never automatically at
+/// startup, so the password prompt never appears out of context. Returns
+/// whether the privilege ends up granted (true if it was already granted,
+/// or the user approved it just now).
+Future<bool> requestVirtualNetworkPrivilege() async {
+  if (!Platform.isMacOS) return true;
+  final agentExecutable = await _resolveAgentExecutable(null);
+  if (agentExecutable == null) return false;
   try {
     const setuidBit = 0x800; // POSIX S_ISUID
-    final stat = await executable.stat();
-    if ((stat.mode & setuidBit) != 0) return;
-    final path = executable.path;
+    final stat = await agentExecutable.stat();
+    if ((stat.mode & setuidBit) != 0) return true;
+    final path = agentExecutable.path;
     final shellCommand =
         "chown root:wheel '${path.replaceAll("'", "'\\''")}' && chmod u+s '${path.replaceAll("'", "'\\''")}'";
     final appleScriptSafeCommand =
@@ -231,13 +241,16 @@ Future<void> _ensureMacOSTunPrivilege(File executable) async {
     final result = await Process.run('osascript', [
       '-e',
       'do shell script "$appleScriptSafeCommand" with administrator privileges '
-          'with prompt "LocalScale precisa de uma permissão única para habilitar a rede virtual entre seus dispositivos."',
+          'with prompt "LocalScale precisa de uma permissão única para habilitar a rede privada entre seus dispositivos."',
     ]);
     if (result.exitCode != 0) {
-      print('LocalScale: could not grant TUN privilege: ${result.stderr}');
+      print('LocalScale: could not grant virtual network privilege: ${result.stderr}');
+      return false;
     }
+    return true;
   } catch (error) {
-    print('LocalScale: TUN privilege check failed: $error');
+    print('LocalScale: virtual network privilege request failed: $error');
+    return false;
   }
 }
 

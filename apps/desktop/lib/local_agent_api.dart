@@ -342,12 +342,14 @@ class FakeLocalAgentTransport implements LocalAgentTransport {
   FakeLocalAgentTransport(
       {this.initial = const ServiceStatus(
           mode: LocalScaleMode.cliente, state: ServiceState.stopped),
-      this.initialVirtualIp = '10.42.0.1'})
+      this.initialVirtualIp = '10.42.0.1',
+      this.includeRemotePeer = true})
       : current = initial,
         virtualIp = initialVirtualIp;
 
   final ServiceStatus initial;
   final String? initialVirtualIp;
+  final bool includeRemotePeer;
   ServiceStatus current;
   String? virtualIp;
 
@@ -370,17 +372,21 @@ class FakeLocalAgentTransport implements LocalAgentTransport {
           'virtual_ip': virtualIp,
           'status': 'active',
         },
-        'remote_peers': [
-          {
-            'node_id': 'remote-node-test',
-            'role': current.mode == LocalScaleMode.host ? 'cliente' : 'host',
-            'onion_endpoint': 'remotetest.onion',
-            'virtual_ip': virtualIp == '10.42.0.1' ? '10.42.0.2' : '10.42.0.1',
-            'status': 'connected',
-            'approved': true,
-            'revoked': false,
-          }
-        ],
+        'remote_peers': includeRemotePeer
+            ? [
+                {
+                  'node_id': 'remote-node-test',
+                  'role':
+                      current.mode == LocalScaleMode.host ? 'cliente' : 'host',
+                  'onion_endpoint': 'remotetest.onion',
+                  'virtual_ip':
+                      virtualIp == '10.42.0.1' ? '10.42.0.2' : '10.42.0.1',
+                  'status': 'connected',
+                  'approved': true,
+                  'revoked': false,
+                }
+              ]
+            : <Object>[],
       });
     }
     return _encode();

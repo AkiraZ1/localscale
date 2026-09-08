@@ -7,6 +7,10 @@ import 'local_agent_api.dart';
 
 String? lastAgentStartupError;
 
+Future<bool> hasVirtualNetworkPrivilege() async => true;
+
+Future<bool> requestVirtualNetworkPrivilege() async => true;
+
 Future<bool> ensureLocalAgentRunning() async => true;
 
 Future<bool> ensureLocalAgentRestarted() async => true;

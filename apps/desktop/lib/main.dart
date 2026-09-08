@@ -202,12 +202,27 @@ class _ControlPageState extends State<ControlPage> {
   GeneratedInvitation? _generatedInvitation;
   bool _pairingBusy = false;
 
-  // First-time setup walks through one decision at a time instead of a
-  // single form with every field visible at once — chosen role isn't
-  // committed to the agent (setMode) until the user actually advances past
-  // step 0, so backing out costs nothing.
-  int _wizardStep = 0;
-  LocalScaleMode? _wizardRole;
+  // First-time setup is a sequence of full pages, one decision at a time —
+  // not a single form with every field visible at once. Once actually
+  // paired (_isPaired), none of this shows again: the app becomes the
+  // devices dashboard instead. Step indices are fixed regardless of
+  // platform (some platforms just skip the permission step when
+  // advancing), so the numbers below are meaningful across the file.
+  static const int _stepRole = 0;
+  static const int _stepName = 1;
+  static const int _stepPermission = 2;
+  static const int _stepInvitation = 3;
+  static const List<String> _stepTitles = [
+    'Tipo de conexão',
+    'Nome do dispositivo',
+    'Permissão',
+    'Convite',
+  ];
+  int _wizardStep = _stepRole;
+  bool get _needsPermissionStep => defaultTargetPlatform == TargetPlatform.macOS;
+  bool _permissionGranted = false;
+  bool _permissionSkipped = false;
+  bool _permissionBusy = false;
   bool get _isPaired => networkDevices?.remotePeers.isNotEmpty ?? false;
 
   // Rolling event log so status/port/restart/transport transitions and
@@ -244,6 +259,11 @@ class _ControlPageState extends State<ControlPage> {
     _pollTimer = Timer.periodic(_pollInterval, (_) {
       if (mounted) _refresh();
     });
+    if (_needsPermissionStep) {
+      hasVirtualNetworkPrivilege().then((granted) {
+        if (mounted) setState(() => _permissionGranted = granted);
+      });
+    }
   }
 
   @override
@@ -621,148 +641,45 @@ class _ControlPageState extends State<ControlPage> {
 
   @override
   Widget build(BuildContext context) {
+    if (_isPaired) return _buildDashboard();
+    return _buildWizard();
+  }
+
+  // ---------------------------------------------------------------------
+  // Dashboard — the only screen that persists once a device is actually
+  // paired. Everything before that point is a one-time setup sequence
+  // (see _buildWizard) and never shows again afterward.
+  // ---------------------------------------------------------------------
+  Widget _buildDashboard() {
     final current = status;
     final devices = networkDevices;
-
     return Scaffold(
       appBar: AppBar(title: const Text('LocalScale'), actions: [
         IconButton(
             onPressed: _refresh,
             icon: const Icon(Icons.refresh),
-            tooltip: 'Refresh'),
+            tooltip: 'Atualizar'),
         if (widget.onLogout != null)
           IconButton(
               onPressed: widget.onLogout,
               icon: const Icon(Icons.logout),
-              tooltip: 'Sign out'),
+              tooltip: 'Sair'),
       ]),
       body: Center(
           child: ConstrainedBox(
               constraints: const BoxConstraints(maxWidth: 900),
               child: ListView(padding: const EdgeInsets.all(24), children: [
-                Text('Control center',
-                    style: Theme.of(context).textTheme.headlineMedium),
-                const SizedBox(height: 8),
-                const Text('Manage the local LocalScale service.'),
-                const SizedBox(height: 24),
-                Card(
-                    child: Padding(
-                        padding: const EdgeInsets.all(20),
-                        child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text('Mode',
-                                  style:
-                                      Theme.of(context).textTheme.titleLarge),
-                              const SizedBox(height: 12),
-                              SegmentedButton<LocalScaleMode>(
-                                  segments: const [
-                                    ButtonSegment(
-                                        value: LocalScaleMode.host,
-                                        label: Text('Host'),
-                                        icon: Icon(Icons.hub)),
-                                    ButtonSegment(
-                                        value: LocalScaleMode.cliente,
-                                        label: Text('Cliente'),
-                                        icon: Icon(Icons.devices))
-                                  ],
-                                  selected: {
-                                    current?.mode ?? LocalScaleMode.cliente
-                                  },
-                                  onSelectionChanged: (s) {
-                                    _vipController.clear();
-                                    _onionController.clear();
-                                    _nodeIdController.clear();
-                                    _invitationController.clear();
-                                    setState(() {
-                                      _generatedInvitation = null;
-                                      _wizardStep = 0;
-                                    });
-                                    _run(() => widget.api.setMode(s.first),
-                                        'Mode update');
-                                  }),
-                              const SizedBox(height: 8),
-                              const Text(
-                                  'Host: cria a rede e gera o convite. Cliente: entra em uma rede existente com um convite.'),
-                            ]))),
-                const SizedBox(height: 16),
-                Card(
-                    child: Padding(
-                        padding: const EdgeInsets.all(20),
-                        child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text('Service status',
-                                  style:
-                                      Theme.of(context).textTheme.titleLarge),
-                              const SizedBox(height: 12),
-                              Row(children: [
-                                Icon(Icons.circle,
-                                    size: 14,
-                                    color: _stateColor(current?.state)),
-                                const SizedBox(width: 8),
-                                Text(_stateLabel(current?.state))
-                              ]),
-                              const SizedBox(height: 16),
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: TextField(
-                                      controller: _onionController,
-                                      readOnly: true,
-                                      decoration: InputDecoration(
-                                        labelText: 'Endereço de conexão',
-                                        hintText: current?.mode ==
-                                                LocalScaleMode.host
-                                            ? 'Preparando endereço de conexão...'
-                                            : 'Disponível no modo Host ou ao parear',
-                                        border: const OutlineInputBorder(),
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  IconButton.filledTonal(
-                                    tooltip: 'Copiar endereço',
-                                    onPressed: () {
-                                      if (_onionController.text.isNotEmpty) {
-                                        Clipboard.setData(ClipboardData(
-                                            text: _onionController.text));
-                                        ScaffoldMessenger.of(context)
-                                            .showSnackBar(
-                                          const SnackBar(
-                                              content: Text(
-                                                  'Endereço copiado!')),
-                                        );
-                                      }
-                                    },
-                                    icon: const Icon(Icons.copy),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 16),
-                              Wrap(spacing: 12, runSpacing: 8, children: [
-                                FilledButton.icon(
-                                    onPressed: () =>
-                                        _run(widget.api.start, 'Start'),
-                                    icon: const Icon(Icons.play_arrow),
-                                    label: const Text('Start')),
-                                OutlinedButton.icon(
-                                    onPressed: () =>
-                                        _run(widget.api.stop, 'Stop'),
-                                    icon: const Icon(Icons.stop),
-                                    label: const Text('Stop')),
-                                OutlinedButton.icon(
-                                    onPressed: () =>
-                                        _run(widget.api.sync, 'Sync'),
-                                    icon: const Icon(Icons.sync),
-                                    label: const Text('Sync'))
-                              ]),
-                              if (message != null) ...[
-                                const SizedBox(height: 12),
-                                Text(message!, key: const Key('status-message'))
-                              ],
-                            ]))),
-                const SizedBox(height: 16),
+                Row(children: [
+                  Icon(Icons.circle, size: 14, color: _stateColor(current?.state)),
+                  const SizedBox(width: 8),
+                  Text(_stateLabel(current?.state),
+                      style: Theme.of(context).textTheme.titleMedium),
+                ]),
+                if (message != null) ...[
+                  const SizedBox(height: 8),
+                  Text(message!, key: const Key('status-message')),
+                ],
+                const SizedBox(height: 20),
                 Card(
                   child: Padding(
                     padding: const EdgeInsets.all(20),
@@ -850,16 +767,336 @@ class _ControlPageState extends State<ControlPage> {
                           const Text('Carregando dispositivos...',
                               style: TextStyle(color: Colors.grey)),
                         ],
+                        const SizedBox(height: 12),
+                        Wrap(spacing: 12, runSpacing: 8, children: [
+                          OutlinedButton.icon(
+                              onPressed: () => _run(widget.api.sync, 'Sync'),
+                              icon: const Icon(Icons.sync),
+                              label: const Text('Sincronizar')),
+                          if (networkDevices?.remotePeers.isNotEmpty == true)
+                            OutlinedButton.icon(
+                                key: const Key('reset-peer'),
+                                onPressed: _pairingBusy ? null : _resetPeer,
+                                icon: const Icon(Icons.link_off),
+                                style: OutlinedButton.styleFrom(
+                                    foregroundColor: Colors.redAccent),
+                                label: const Text('Remover dispositivo')),
+                        ]),
                       ],
                     ),
                   ),
                 ),
                 const SizedBox(height: 16),
-                _buildInvitationCard(current),
-                const SizedBox(height: 16),
                 _buildEventLogCard(),
               ]))),
     );
+  }
+
+  // ---------------------------------------------------------------------
+  // Setup wizard — one full page per decision, a slim progress header
+  // pinned at the top, and Back/Continue navigation. Nothing here is
+  // reachable again once _isPaired becomes true.
+  // ---------------------------------------------------------------------
+  Widget _buildWizard() {
+    return Scaffold(
+      appBar: AppBar(title: const Text('LocalScale')),
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 640),
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _buildWizardHeader(),
+                const SizedBox(height: 28),
+                Expanded(
+                  child: SingleChildScrollView(
+                    child: switch (_wizardStep) {
+                      _stepRole => _pageRole(),
+                      _stepName => _pageName(),
+                      _stepPermission => _pagePermission(),
+                      _ => _pageInvitation(),
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWizardHeader() {
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Icon(Icons.circle, size: 10, color: _stateColor(status?.state)),
+        const SizedBox(width: 6),
+        Text(_stateLabel(status?.state),
+            style: const TextStyle(fontSize: 12, color: Colors.grey)),
+      ]),
+      const SizedBox(height: 12),
+      Text(_stepTitles[_wizardStep],
+          style: Theme.of(context).textTheme.headlineSmall),
+      const SizedBox(height: 10),
+      Row(
+        children: List.generate(_stepTitles.length, (i) {
+          final active = i == _wizardStep;
+          final done = i < _wizardStep;
+          return Expanded(
+            child: Container(
+              margin: EdgeInsets.only(right: i == _stepTitles.length - 1 ? 0 : 6),
+              height: 4,
+              decoration: BoxDecoration(
+                color: done || active
+                    ? Theme.of(context).colorScheme.primary
+                    : Colors.grey.withValues(alpha: 0.3),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+          );
+        }),
+      ),
+    ]);
+  }
+
+  Widget _pageRole() {
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      const Text(
+          'Como este computador vai participar da sua rede privada?'),
+      const SizedBox(height: 20),
+      _roleOptionCard(
+        icon: Icons.hub,
+        title: 'Criar uma rede nova',
+        subtitle: 'Este computador gera o convite para os outros entrarem.',
+        onTap: () => _chooseRole(LocalScaleMode.host),
+      ),
+      const SizedBox(height: 12),
+      _roleOptionCard(
+        icon: Icons.devices,
+        title: 'Entrar em uma rede existente',
+        subtitle: 'Você recebeu um convite de outro computador.',
+        onTap: () => _chooseRole(LocalScaleMode.cliente),
+      ),
+    ]);
+  }
+
+  Widget _roleOptionCard({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+  }) {
+    return Card(
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Row(children: [
+            Icon(icon, size: 32, color: Theme.of(context).colorScheme.primary),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title,
+                      style: const TextStyle(
+                          fontSize: 16, fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 4),
+                  Text(subtitle,
+                      style: const TextStyle(color: Colors.grey, fontSize: 13)),
+                ],
+              ),
+            ),
+            const Icon(Icons.arrow_forward_ios, size: 16, color: Colors.grey),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  void _chooseRole(LocalScaleMode mode) {
+    _vipController.clear();
+    _onionController.clear();
+    _nodeIdController.clear();
+    _invitationController.clear();
+    setState(() {
+      _generatedInvitation = null;
+      _wizardStep = _stepName;
+    });
+    _run(() => widget.api.setMode(mode), 'Mode update');
+  }
+
+  Widget _pageName() {
+    final canContinue = _nodeIdController.text.trim().isNotEmpty;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      const Text('Escolha um nome para identificar este computador na sua rede.'),
+      const SizedBox(height: 20),
+      TextField(
+        key: const Key('pairing-node-id'),
+        controller: _nodeIdController,
+        autofocus: true,
+        onChanged: (_) => setState(() {}),
+        decoration: const InputDecoration(
+            labelText: 'Nome deste computador',
+            hintText: 'Ex: notebook-trabalho',
+            border: OutlineInputBorder()),
+      ),
+      const SizedBox(height: 24),
+      Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+        OutlinedButton.icon(
+            onPressed: () => setState(() => _wizardStep = _stepRole),
+            icon: const Icon(Icons.arrow_back),
+            label: const Text('Voltar')),
+        FilledButton.icon(
+          key: const Key('wizard-step-name-continue'),
+          onPressed: canContinue
+              ? () => setState(() => _wizardStep =
+                  (_needsPermissionStep && !_permissionGranted && !_permissionSkipped)
+                      ? _stepPermission
+                      : _stepInvitation)
+              : null,
+          icon: const Icon(Icons.arrow_forward),
+          label: const Text('Continuar'),
+        ),
+      ]),
+    ]);
+  }
+
+  Widget _pagePermission() {
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      const Text(
+          'Para que os dois computadores possam trocar dados diretamente (por exemplo, acessar arquivos ou telas um do outro), o LocalScale precisa criar uma rede privada entre eles.'),
+      const SizedBox(height: 12),
+      const Text(
+          'Isso exige uma permissão especial do sistema operacional. Ao continuar, o macOS vai pedir sua senha uma única vez — isso não vai acontecer de novo.'),
+      const SizedBox(height: 24),
+      if (_permissionBusy)
+        const Center(child: Padding(
+          padding: EdgeInsets.symmetric(vertical: 12),
+          child: CircularProgressIndicator(),
+        ))
+      else
+        Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+          OutlinedButton.icon(
+              onPressed: () => setState(() => _wizardStep = _stepName),
+              icon: const Icon(Icons.arrow_back),
+              label: const Text('Voltar')),
+          Wrap(spacing: 8, children: [
+            TextButton(
+              key: const Key('skip-permission'),
+              onPressed: () => setState(() {
+                _permissionSkipped = true;
+                _wizardStep = _stepInvitation;
+              }),
+              child: const Text('Pular por agora'),
+            ),
+            FilledButton.icon(
+              key: const Key('grant-permission'),
+              onPressed: () async {
+                setState(() => _permissionBusy = true);
+                final granted = await requestVirtualNetworkPrivilege();
+                if (!mounted) return;
+                setState(() {
+                  _permissionBusy = false;
+                  _permissionGranted = granted;
+                  _wizardStep = _stepInvitation;
+                });
+              },
+              icon: const Icon(Icons.lock_open),
+              label: const Text('Permitir'),
+            ),
+          ]),
+        ]),
+    ]);
+  }
+
+  Widget _pageInvitation() {
+    final current = status;
+    final isHost = current?.mode == LocalScaleMode.host;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text(isHost
+          ? 'Crie um convite de uso único e envie-o ao outro computador por um canal de sua confiança (mensagem, e-mail, etc).'
+          : 'Cole abaixo o convite recebido do outro computador para se conectar a ele.'),
+      const SizedBox(height: 20),
+      TextField(
+        key: const Key('pairing-invitation'),
+        controller: _invitationController,
+        minLines: 2,
+        maxLines: 4,
+        readOnly: isHost && _generatedInvitation != null,
+        decoration: InputDecoration(
+            labelText: isHost ? 'Convite gerado' : 'Convite recebido',
+            hintText: isHost ? 'Clique em "Gerar convite" abaixo' : 'Cole aqui…',
+            border: const OutlineInputBorder(),
+            suffixIcon: IconButton(
+              tooltip: 'Copiar convite',
+              onPressed: _invitationController.text.trim().isEmpty
+                  ? null
+                  : () {
+                      Clipboard.setData(ClipboardData(
+                          text: _invitationController.text.trim()));
+                      _pairingMessage('Convite copiado.');
+                    },
+              icon: const Icon(Icons.copy),
+            )),
+      ),
+      const SizedBox(height: 20),
+      Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          OutlinedButton.icon(
+              onPressed: _pairingBusy
+                  ? null
+                  : () => setState(() => _wizardStep = _stepName),
+              icon: const Icon(Icons.arrow_back),
+              label: const Text('Voltar')),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+            if (isHost)
+              FilledButton.icon(
+                  key: const Key('generate-invitation'),
+                  onPressed: _pairingBusy ? null : _generateInvitation,
+                  icon: const Icon(Icons.add_link),
+                  label: const Text('Gerar convite'))
+            else
+              FilledButton.icon(
+                  key: const Key('import-invitation'),
+                  onPressed: _pairingBusy ? null : _importInvitation,
+                  icon: const Icon(Icons.link),
+                  label: const Text('Revisar e conectar')),
+            if (isHost && _generatedInvitation != null)
+              OutlinedButton.icon(
+                  key: const Key('activate-invitation'),
+                  onPressed: _pairingBusy ? null : _activateGeneratedInvitation,
+                  icon: const Icon(Icons.verified_user),
+                  label: const Text('Ativar')),
+          ]),
+        ],
+      ),
+      if (_generatedInvitation != null && isHost) ...[
+        const SizedBox(height: 12),
+        Text(
+            'Expira em ${_generatedInvitation!.expiresAt.toLocal()}. Gerar outro convite invalida a configuração pendente anterior.'),
+      ],
+      if (_pairingBusy) ...[
+        const SizedBox(height: 20),
+        const Row(children: [
+          SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(strokeWidth: 2)),
+          SizedBox(width: 12),
+          Text('Conectando…'),
+        ]),
+      ],
+      const SizedBox(height: 16),
+      const Text(
+        'A conta Google autoriza somente o painel local. O convite é a credencial de pareamento; não é sincronizado pelo Google e deve permanecer privado.',
+        style: TextStyle(fontSize: 12, color: Colors.grey),
+      ),
+    ]);
   }
 
   Widget _buildEventLogCard() {
@@ -919,192 +1156,6 @@ class _ControlPageState extends State<ControlPage> {
   String _formatLogTime(DateTime time) {
     String two(int value) => value.toString().padLeft(2, '0');
     return '${two(time.hour)}:${two(time.minute)}:${two(time.second)}';
-  }
-
-  Widget _stepLabel(String number, String text) => Padding(
-        padding: const EdgeInsets.only(bottom: 6),
-        child: Row(children: [
-          Container(
-            width: 22,
-            height: 22,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              color: Theme.of(context).colorScheme.primary,
-              shape: BoxShape.circle,
-            ),
-            child: Text(number,
-                style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
-                    fontWeight: FontWeight.bold)),
-          ),
-          const SizedBox(width: 8),
-          Text(text, style: const TextStyle(fontWeight: FontWeight.w600)),
-        ]),
-      );
-
-  // Two visible steps: name this computer, then handle the invitation.
-  // Kept as an int (not an enum) so it stays trivial to reset alongside the
-  // other pairing fields whenever mode changes or the peer is removed.
-  static const int _wizardStepCount = 2;
-
-  Widget _wizardProgressDots() => Row(
-        mainAxisSize: MainAxisSize.min,
-        children: List.generate(_wizardStepCount, (i) {
-          final active = i == _wizardStep;
-          final done = i < _wizardStep;
-          return Padding(
-            padding: const EdgeInsets.only(right: 6),
-            child: Container(
-              width: active ? 22 : 8,
-              height: 8,
-              decoration: BoxDecoration(
-                color: done || active
-                    ? Theme.of(context).colorScheme.primary
-                    : Colors.grey.withValues(alpha: 0.35),
-                borderRadius: BorderRadius.circular(4),
-              ),
-            ),
-          );
-        }),
-      );
-
-  Widget _buildInvitationCard(ServiceStatus? current) {
-    final isHost = current?.mode == LocalScaleMode.host;
-    final hasRemovableDevice = networkDevices?.remotePeers.isNotEmpty == true;
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text('Conectar dispositivos',
-                  style: Theme.of(context).textTheme.titleLarge),
-              _wizardProgressDots(),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Text(isHost
-              ? 'Crie um convite de uso único e envie-o ao outro computador por um canal de sua confiança (mensagem, e-mail, etc).'
-              : 'Cole abaixo o convite recebido do outro computador para se conectar a ele.'),
-          const SizedBox(height: 16),
-          if (_wizardStep == 0)
-            _buildWizardStepName()
-          else
-            _buildWizardStepInvitation(isHost),
-          if (hasRemovableDevice) ...[
-            const SizedBox(height: 16),
-            const Divider(),
-            const SizedBox(height: 8),
-            OutlinedButton.icon(
-                key: const Key('reset-peer'),
-                onPressed: _pairingBusy ? null : _resetPeer,
-                icon: const Icon(Icons.link_off),
-                style:
-                    OutlinedButton.styleFrom(foregroundColor: Colors.redAccent),
-                label: const Text('Remover dispositivo')),
-          ],
-          const SizedBox(height: 8),
-          const Text(
-            'A conta Google autoriza somente o painel local. O convite é a credencial de pareamento; não é sincronizado pelo Google e deve permanecer privado.',
-            style: TextStyle(fontSize: 12, color: Colors.grey),
-          ),
-        ]),
-      ),
-    );
-  }
-
-  Widget _buildWizardStepName() {
-    final canContinue = _nodeIdController.text.trim().isNotEmpty;
-    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      _stepLabel('1', 'Dê um nome a este computador'),
-      TextField(
-        key: const Key('pairing-node-id'),
-        controller: _nodeIdController,
-        onChanged: (_) => setState(() {}),
-        decoration: const InputDecoration(
-            labelText: 'Nome deste computador',
-            hintText: 'Ex: notebook-trabalho',
-            border: OutlineInputBorder()),
-      ),
-      const SizedBox(height: 16),
-      Align(
-        alignment: Alignment.centerRight,
-        child: FilledButton.icon(
-          key: const Key('wizard-step-name-continue'),
-          onPressed: canContinue ? () => setState(() => _wizardStep = 1) : null,
-          icon: const Icon(Icons.arrow_forward),
-          label: const Text('Continuar'),
-        ),
-      ),
-    ]);
-  }
-
-  Widget _buildWizardStepInvitation(bool isHost) {
-    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      _stepLabel(
-          '2', isHost ? 'Gere o convite' : 'Cole o convite recebido'),
-      TextField(
-        key: const Key('pairing-invitation'),
-        controller: _invitationController,
-        minLines: 2,
-        maxLines: 4,
-        readOnly: isHost && _generatedInvitation != null,
-        decoration: InputDecoration(
-            labelText: isHost ? 'Convite gerado' : 'Convite recebido',
-            hintText: isHost ? 'Clique em "Gerar convite" abaixo' : 'Cole aqui…',
-            border: const OutlineInputBorder(),
-            suffixIcon: IconButton(
-              tooltip: 'Copiar convite',
-              onPressed: _invitationController.text.trim().isEmpty
-                  ? null
-                  : () {
-                      Clipboard.setData(ClipboardData(
-                          text: _invitationController.text.trim()));
-                      _pairingMessage('Convite copiado.');
-                    },
-              icon: const Icon(Icons.copy),
-            )),
-      ),
-      const SizedBox(height: 16),
-      Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          OutlinedButton.icon(
-              onPressed: _pairingBusy
-                  ? null
-                  : () => setState(() => _wizardStep = 0),
-              icon: const Icon(Icons.arrow_back),
-              label: const Text('Voltar')),
-          Wrap(spacing: 8, runSpacing: 8, children: [
-            if (isHost)
-              FilledButton.icon(
-                  key: const Key('generate-invitation'),
-                  onPressed: _pairingBusy ? null : _generateInvitation,
-                  icon: const Icon(Icons.add_link),
-                  label: const Text('Gerar convite'))
-            else
-              FilledButton.icon(
-                  key: const Key('import-invitation'),
-                  onPressed: _pairingBusy ? null : _importInvitation,
-                  icon: const Icon(Icons.link),
-                  label: const Text('Revisar e conectar')),
-            if (isHost && _generatedInvitation != null)
-              OutlinedButton.icon(
-                  key: const Key('activate-invitation'),
-                  onPressed: _pairingBusy ? null : _activateGeneratedInvitation,
-                  icon: const Icon(Icons.verified_user),
-                  label: const Text('Ativar Host')),
-          ]),
-        ],
-      ),
-      if (_generatedInvitation != null && isHost) ...[
-        const SizedBox(height: 8),
-        Text(
-            'Expira em ${_generatedInvitation!.expiresAt.toLocal()}. Gerar outro convite invalida a configuração pendente anterior.'),
-      ],
-    ]);
   }
 
   /// A Cliente never runs a hidden service — only a Host publishes one — so
